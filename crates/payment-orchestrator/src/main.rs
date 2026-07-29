@@ -18,13 +18,17 @@ async fn main() {
         .expect("connect postgres");
     sqlx::migrate!("./migrations").run(&pool).await.expect("migrations");
 
-    let adapter = Arc::new(BitcartAdapter {
+    let adapter: Arc<dyn payment_orchestrator::adapter::PaymentAdapter> = Arc::new(BitcartAdapter {
         http: reqwest::Client::new(),
         base_url: config.bitcart_url.clone(),
         token: config.bitcart_token.clone(),
         store_id: config.bitcart_store_id.clone(),
         deposit_ttl_minutes: config.deposit_ttl_minutes,
     });
+
+    // The poller is the reliability path (Bitcart's IPN is unsigned and never retried) — every
+    // state the webhook can reach must also be reachable here alone, on a plain timer.
+    tokio::spawn(payment_orchestrator::poller::run(pool.clone(), adapter.clone(), config.poll_interval_secs));
 
     let app = api::router(pool, config.clone(), adapter);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");

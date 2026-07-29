@@ -283,6 +283,40 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<DepositIntent>
         .await
 }
 
+/// The webhook/poller lookup key (T4): Bitcart's IPN and `get_invoice` both key on
+/// `invoice_id`, never on our own `id`. An invoice_id no row holds returns `None` — the
+/// caller's job (spam resistance: store nothing, call nothing for an unknown id).
+pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Option<DepositIntent>, sqlx::Error> {
+    sqlx::query_as::<_, DepositIntent>(&format!("SELECT {INTENT_COLS} FROM deposit_intents WHERE invoice_id = $1"))
+        .bind(invoice_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Sets `bitcart_terminal = TRUE` — the ONLY thing that frees the discriminator slot
+/// (`uq_active_pay_amount`'s `WHERE ... AND NOT bitcart_terminal` clause). Deliberately
+/// unconditional (no status guard): terminality is a fact about the Bitcart invoice, not
+/// about our own state machine, and setting it twice is harmless.
+pub async fn mark_bitcart_terminal(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE deposit_intents SET bitcart_terminal = TRUE, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Records the on-chain tx id once Bitcart's refetch surfaces one (`Confirmed`/`PaidOver`).
+/// `WHERE tron_tx_id IS NULL` keeps the first-seen hash rather than letting a later refetch
+/// (e.g. the poller re-confirming an already-confirmed intent) overwrite it.
+pub async fn set_tron_tx_id(pool: &PgPool, id: Uuid, tron_tx_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE deposit_intents SET tron_tx_id = $1, updated_at = now() WHERE id = $2 AND tron_tx_id IS NULL")
+        .bind(tron_tx_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Guarded status transition. Out-of-order webhook events are absorbed here by construction:
 /// a `failed` arriving after `confirmed` simply doesn't match any `from` set that includes
 /// `confirmed`'s current value the way this call names it, so it's a no-op `Ok(false)`, not

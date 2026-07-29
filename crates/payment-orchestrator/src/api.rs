@@ -14,6 +14,7 @@ use crate::adapter::PaymentAdapter;
 use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::deposits::{self, DepositOutcome};
+use crate::webhook;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -114,11 +115,29 @@ async fn get_deposit_handler(
     })))
 }
 
+#[derive(Deserialize)]
+struct BitcartIpn {
+    id: String,
+    status: String,
+}
+
+/// `POST /webhooks/bitcart` — deliberately NO auth (Bitcart cannot sign its IPN). The route
+/// itself does nothing trusting: it hands the raw `{id, status}` straight to
+/// `webhook::handle_webhook`, which does the indexed lookup BEFORE any DB write or Bitcart
+/// call (T4 brief's spam-resistance requirement) and refetches through the adapter rather
+/// than trusting anything in this body beyond the id. Always 200 — Bitcart doesn't retry, so
+/// there's no failure code worth sending back; processing continues async either way.
+async fn bitcart_webhook_handler(State(state): State<AppState>, Json(body): Json<BitcartIpn>) -> StatusCode {
+    tokio::spawn(webhook::handle_webhook(state.pool, state.adapter, body.id, body.status));
+    StatusCode::OK
+}
+
 pub fn router(pool: PgPool, config: OrchConfig, adapter: Arc<dyn PaymentAdapter>) -> Router {
     let state = AppState { pool, config, adapter };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler))
         .route("/api/v1/deposits/:id", get(get_deposit_handler))
+        .route("/webhooks/bitcart", post(bitcart_webhook_handler))
         .with_state(state)
 }
