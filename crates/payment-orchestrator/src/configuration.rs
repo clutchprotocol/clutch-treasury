@@ -10,6 +10,10 @@ pub struct OrchConfig {
     pub bitcart_url: String,
     pub bitcart_token: String,
     pub bitcart_store_id: String,
+    /// This service's own externally-reachable base URL — used only to build the
+    /// `notification_url` passed to `adapter.create_invoice` (Bitcart's IPN webhook
+    /// target, T4's handler). Not a secret.
+    pub public_base_url: String,
     pub treasury_url: String,
     pub treasury_initiator_token: String,
     pub treasury_readonly_token: String,

@@ -1,16 +1,21 @@
 //! Deposit intents: the record of "a user intends to pay us USDT" and the idempotency
 //! that keeps one payment from being credited twice. This module owns the row-level
-//! mechanics only — no HTTP, no Bitcart adapter (T3), no treasury calls. T2b's route
-//! handler wires this together with `adapter.create_invoice` and the daily-headroom check.
+//! mechanics and (below, `create_and_invoice`) the create-flow orchestration — no HTTP
+//! itself (that's `api.rs`), but it does call the `PaymentAdapter` (T3) to turn a fresh
+//! intent into a live Bitcart invoice. No treasury calls: the daily-headroom check needs
+//! the treasury's `reserve-status` to expose `daily_headroom_clt`, which doesn't exist yet
+//! (lands in T5, which already touches treasury-service) — bounds checks only for now.
 //!
 //! At par (1 USD = 1,000,000 CLT, USDT also 6 decimals) amount_usdt == amount_clt is an
 //! integer identity — no rate arithmetic anywhere in this file.
 
 use rand::seq::SliceRandom;
 use serde::Serialize;
+use serde_json::json;
 use sqlx::{Acquire, PgPool};
 use uuid::Uuid;
 
+use crate::adapter::PaymentAdapter;
 use crate::configuration::OrchConfig;
 
 const DISCRIMINATOR_RANGE_END: i64 = 999;
@@ -310,4 +315,99 @@ pub async fn transition(pool: &PgPool, id: Uuid, from: &[&str], to: &str) -> Res
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// HTTP-shaped result of the create-flow (T2b): `api.rs` matches this directly onto a
+/// status code + optional header, keeping this module free of any `axum` dependency.
+#[derive(Debug)]
+pub enum DepositOutcome {
+    /// Status + body to return VERBATIM — either a genuine 201 just created, or an
+    /// idempotent replay of an earlier attempt's stored response (spec §6: replay must
+    /// return the ORIGINAL status, not a fresh 201).
+    Respond { status: u16, body: serde_json::Value },
+    /// Same key, different body — 409, no `Retry-After` (the client's confusion isn't a
+    /// timing issue, it needs a new key or the same body it used before).
+    Conflict,
+    /// Key exists and a concurrent create holds its lock — 409 + `Retry-After: 2`.
+    StillProcessing,
+    /// amount_usdt outside configured bounds.
+    OutOfBounds { min: i64, max: i64 },
+    /// Bitcart call or DB write failed — caller 5xx's without leaking internals.
+    Failed(String),
+}
+
+/// The create-flow orchestration (T2b): routes `deposits::create`'s outcome (idempotency
+/// layer 1 + the discriminator, Task 2) through `adapter.create_invoice` and the
+/// compare-and-set store (idempotency layer 4) — the two mechanisms meeting the wire.
+///
+/// Ordering that keeps money safe: the intent row is created BEFORE calling Bitcart, and
+/// `store_invoice`'s compare-and-set runs AFTER — so a crash between the two leaves an
+/// orphan invoice (accepted; see `deposits::create`'s resume branch), never a lost intent
+/// row with no corresponding invoice attempt recorded.
+pub async fn create_and_invoice(
+    pool: &PgPool,
+    config: &OrchConfig,
+    adapter: &dyn PaymentAdapter,
+    user_pk: &str,
+    clt_address: &str,
+    amount_usdt: i64,
+    client_key: &str,
+    notification_url: &str,
+) -> DepositOutcome {
+    // ponytail: daily-headroom check omitted here — it needs the treasury's
+    // reserve-status to expose daily_headroom_clt, which treasury-service doesn't
+    // implement yet (lands in T5, which already touches that service). Bounds checks
+    // (min_deposit_usdt..=max_deposit_usdt, enforced inside deposits::create) are the
+    // only cap for now.
+    let outcome = match create(pool, config, user_pk, clt_address, amount_usdt, client_key).await {
+        Ok(o) => o,
+        Err(ApiError::OutOfBounds { min, max }) => return DepositOutcome::OutOfBounds { min, max },
+        Err(ApiError::NoDiscriminatorSlot) => {
+            return DepositOutcome::Failed("no discriminator slot available for this amount".into())
+        }
+        Err(ApiError::Db(e)) => return DepositOutcome::Failed(e.to_string()),
+    };
+
+    let intent = match outcome {
+        CreateOutcome::Replay { status, body } => return DepositOutcome::Respond { status: status as u16, body },
+        CreateOutcome::Conflict => return DepositOutcome::Conflict,
+        CreateOutcome::StillProcessing => return DepositOutcome::StillProcessing,
+        CreateOutcome::Created(intent) => intent,
+    };
+
+    // Bitcart has no server-side order_id dedup (module docs, adapter.rs module docs) —
+    // the intent id is unique per row regardless of how many times this call is retried,
+    // so passing it as order_id is informational only; store_invoice's CAS below is what
+    // actually makes this exactly-once, not Bitcart's own idempotency.
+    let instructions = match adapter
+        .create_invoice(&intent.id.to_string(), intent.pay_amount_usdt, notification_url)
+        .await
+    {
+        Ok(i) => i,
+        Err(e) => return DepositOutcome::Failed(e),
+    };
+
+    let body = json!({
+        "id": intent.id,
+        "pay_address": instructions.pay_address,
+        "pay_amount_usdt": instructions.pay_amount_usdt,
+        "expires_at": instructions.expires_at,
+        "status": "invoiced",
+    });
+
+    match store_invoice(pool, intent.id, &instructions.invoice_id, 201, &body).await {
+        Ok(true) => DepositOutcome::Respond { status: 201, body },
+        // Lost the compare-and-set: another writer already stored a (possibly different)
+        // invoice for this same intent row first. Their invoice is canonical — re-fetch
+        // and replay it rather than pretend ours won.
+        Ok(false) => match find_by_id(pool, intent.id).await {
+            Ok(Some(row)) => match (row.response_status, row.response_body) {
+                (Some(status), Some(body)) => DepositOutcome::Respond { status: status as u16, body },
+                _ => DepositOutcome::Failed("lost invoice CAS but winner has no stored response".into()),
+            },
+            Ok(None) => DepositOutcome::Failed("intent vanished after losing invoice CAS".into()),
+            Err(e) => DepositOutcome::Failed(e.to_string()),
+        },
+        Err(e) => DepositOutcome::Failed(e.to_string()),
+    }
 }

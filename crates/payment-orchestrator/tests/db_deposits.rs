@@ -44,6 +44,7 @@ fn test_config() -> OrchConfig {
         bitcart_url: "http://unused".into(),
         bitcart_token: "t".into(),
         bitcart_store_id: "s".into(),
+        public_base_url: "http://unused".into(),
         treasury_url: "http://unused".into(),
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
