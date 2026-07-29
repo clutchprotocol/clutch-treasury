@@ -26,3 +26,6 @@ tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

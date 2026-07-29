@@ -33,6 +33,40 @@ async fn main() {
         });
     }
 
+    // Serial single worker: node enforces one tx per sender per block, so one mint per
+    // block cadence is the ceiling anyway — fine at pilot volume.
+    // ponytail: batch Mint tx submission if volume ever demands more than one per block.
+    let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&config.mint_authority_secret)
+        .expect("mint authority secret must decode to a valid secp256k1 key");
+    {
+        let pool = pool.clone();
+        let node = node.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            loop {
+                match treasury_service::outbox::drain_once(&pool, &node, &signer, &cfg).await {
+                    Ok(n) if n > 0 => tracing::info!("outbox: submitted {} mint(s)", n),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("outbox drain failed: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
+            }
+        });
+    }
+    {
+        let pool = pool.clone();
+        let node = node.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = treasury_service::watcher::poll_once(&pool, &node, cfg.confirmations).await {
+                    tracing::error!("watcher poll failed: {}", e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
+            }
+        });
+    }
+
     let app = api::router(pool.clone(), config.clone());
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("treasury-service listening on {}", config.http_addr);
