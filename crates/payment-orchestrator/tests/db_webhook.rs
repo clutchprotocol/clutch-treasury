@@ -237,6 +237,72 @@ async fn slot_reserved_while_expired_not_terminal_then_frees_on_bitcart_terminal
     assert!(now_free.is_ok(), "once bitcart_terminal = TRUE, the slot must be free for a new user to claim");
 }
 
+/// An underpaid deposit (`paid_partial`) goes to `needs_manual`, but Bitcart's invoice is STILL
+/// LIVE and can still take the remainder at that amount — so the slot must stay reserved
+/// (migration 0003). Freeing it on status alone would hand a stranger's live partially-paid
+/// amount to a later user, the same defect class as a32a101.
+///
+/// Second property, same test because it's the other half of one invariant: the poller keeps
+/// refetching such a row so terminality eventually releases the slot, but the refetch must NOT
+/// resolve the row off `needs_manual` — a human was asked to look at money that may be sitting
+/// in custody, and Bitcart calling the invoice invalid is not that human answering.
+#[tokio::test]
+async fn paid_partial_holds_slot_and_is_not_auto_resolved_off_needs_manual() {
+    let pool = pool().await;
+    let cfg = test_config();
+    let adapter = std::sync::Arc::new(FakeAdapter::new());
+    let id = invoiced_intent(&pool, &cfg, "user-pp", 7_000_000, "key-pp", "inv-pp").await;
+    let claimed_amount = deposits::find_by_id(&pool, id).await.unwrap().unwrap().pay_amount_usdt;
+
+    adapter.script("inv-pp", InvoiceState::PaidPartial, None);
+    webhook::apply_invoice_update(&pool, adapter.as_ref(), "inv-pp").await;
+    assert_eq!(status_of(&pool, id).await, "needs_manual");
+
+    let claim = |amount: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO deposit_intents
+                    (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
+                 VALUES ($1, 'other-user', 'clt-other', 7000000, $2, 7000000, 'other-key', now() + interval '30 minutes')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(amount)
+            .execute(&pool)
+            .await
+        }
+    };
+
+    let blocked = claim(claimed_amount).await;
+    assert_eq!(
+        blocked.unwrap_err().as_database_error().and_then(|e| e.constraint()),
+        Some("uq_active_pay_amount"),
+        "a partially-paid invoice is still live at this amount — the slot must stay reserved"
+    );
+
+    // The poller must still pick this row up, purely to reach terminality.
+    let due: Vec<String> = sqlx::query_scalar(
+        "SELECT invoice_id FROM deposit_intents
+         WHERE invoice_id IS NOT NULL AND status IN ('expired','needs_manual','failed') AND NOT bitcart_terminal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(due.contains(&"inv-pp".to_string()), "poller must keep refetching needs_manual until terminal");
+
+    // Bitcart finally calls it invalid: terminality releases the slot, the flag survives.
+    adapter.script("inv-pp", InvoiceState::Invalid, None);
+    webhook::apply_invoice_update(&pool, adapter.as_ref(), "inv-pp").await;
+
+    assert!(deposits::find_by_id(&pool, id).await.unwrap().unwrap().bitcart_terminal);
+    assert_eq!(
+        status_of(&pool, id).await,
+        "needs_manual",
+        "a Bitcart refetch must not auto-resolve a row a human was asked to review"
+    );
+    assert!(claim(claimed_amount).await.is_ok(), "terminality must release the slot");
+}
+
 /// PaidOver must credit the INTENDED amount (par rate — crediting what arrived would mint CLT
 /// the user's intended deposit didn't back) and raise an alert for the surplus, never silently
 /// treat the overpayment as an exact match.

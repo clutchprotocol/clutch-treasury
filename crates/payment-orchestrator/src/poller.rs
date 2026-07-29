@@ -37,13 +37,18 @@ pub async fn poll_once(pool: &PgPool, adapter: &dyn PaymentAdapter) {
 /// - `expired` with `bitcart_terminal = FALSE`: the late-payment window (Decisions block —
 ///   our soft expiry does not mean Bitcart's invoice is dead; refetch until Bitcart says so).
 /// - `created` older than `STUCK_CREATED_MINUTES` that somehow already has an invoice_id.
+/// - `needs_manual` / `failed` with `bitcart_terminal = FALSE`: NOT to change their status —
+///   `apply_invoice_update`'s from-sets deliberately never move a `needs_manual` row, so the
+///   human's flag stands. These are polled purely so `bitcart_terminal` eventually gets set,
+///   which is what releases the discriminator slot those rows are holding (migration 0003).
+///   Without this, an underpaid deposit would reserve its amount forever.
 async fn due_invoice_ids(pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT invoice_id FROM deposit_intents
          WHERE invoice_id IS NOT NULL
            AND (
              status IN ('invoiced', 'paying')
-             OR (status = 'expired' AND NOT bitcart_terminal)
+             OR (status IN ('expired', 'needs_manual', 'failed') AND NOT bitcart_terminal)
              OR (status = 'created' AND created_at < now() - ($1 || ' minutes')::interval)
            )",
     )

@@ -126,9 +126,18 @@ struct BitcartIpn {
 /// `webhook::handle_webhook`, which does the indexed lookup BEFORE any DB write or Bitcart
 /// call (T4 brief's spam-resistance requirement) and refetches through the adapter rather
 /// than trusting anything in this body beyond the id. Always 200 — Bitcart doesn't retry, so
-/// there's no failure code worth sending back; processing continues async either way.
+/// there's no failure code worth sending back.
+///
+/// The known-invoice lookup is AWAITED here rather than inside the spawned task, and only real
+/// work is backgrounded. It's one indexed SELECT, so 200 is still effectively immediate, but a
+/// spammer now has to hold a TCP connection for each in-flight lookup instead of firing and
+/// disconnecting. Spawning first would let unauthenticated traffic grow detached tasks that each
+/// take a connection from a 5-connection pool — starving the deposit routes through the one
+/// route on this service that has no auth in front of it.
 async fn bitcart_webhook_handler(State(state): State<AppState>, Json(body): Json<BitcartIpn>) -> StatusCode {
-    tokio::spawn(webhook::handle_webhook(state.pool, state.adapter, body.id, body.status));
+    if webhook::is_known_invoice(&state.pool, &body.id).await {
+        tokio::spawn(webhook::process_known_webhook(state.pool, state.adapter, body.id, body.status));
+    }
     StatusCode::OK
 }
 

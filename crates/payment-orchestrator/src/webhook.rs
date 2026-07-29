@@ -29,6 +29,15 @@ use crate::deposits;
 const NON_TERMINAL_EXCEPT_CREDITED: &[&str] =
     &["created", "invoiced", "paying", "confirmed", "mint_requested", "expired", "failed", "needs_manual"];
 
+/// The same set minus `needs_manual`: once a human has been asked to look at a row, a later
+/// Bitcart refetch must not quietly resolve it to `failed` on their behalf. The poller keeps
+/// refetching these rows — to set `bitcart_terminal` and so release the discriminator slot they
+/// hold (migration 0003) — so without this exclusion an underpaid deposit would auto-close
+/// itself the moment Bitcart called the invoice invalid, dropping the flag on money that may
+/// still be sitting in custody.
+const NON_TERMINAL_EXCEPT_CREDITED_AND_FLAGGED: &[&str] =
+    &["created", "invoiced", "paying", "confirmed", "mint_requested", "expired", "failed"];
+
 /// Refetch `invoice_id` through the adapter (never trust the webhook payload beyond the id
 /// itself) and drive the intent's guarded `transition` from the result. Called from both the
 /// webhook processing task and the poller — this is the single place Bitcart state becomes our
@@ -105,7 +114,8 @@ pub async fn apply_invoice_update(pool: &PgPool, adapter: &dyn PaymentAdapter, i
         // later "refunded" cannot walk the row backwards; spec money-safety rule).
         InvoiceState::Invalid | InvoiceState::Refunded => {
             mark_bitcart_terminal(pool, intent.id).await;
-            let _ = deposits::transition(pool, intent.id, NON_TERMINAL_EXCEPT_CREDITED, "failed").await;
+            let _ =
+                deposits::transition(pool, intent.id, NON_TERMINAL_EXCEPT_CREDITED_AND_FLAGGED, "failed").await;
         }
 
         // Money may have moved; a human decides. Never a benign path — Unknown especially,
@@ -162,21 +172,38 @@ async fn mark_bitcart_terminal(pool: &PgPool, id: uuid::Uuid) {
 /// payment processor. That case is Task 5's TronGrid verifier, which scans on-chain transfers
 /// and matches by amount — off the attacker's path entirely.
 ///
-/// The route handler (`api.rs`) spawns this whole function so the HTTP response returns 200
-/// immediately either way — this function itself runs the lookup, dedup insert, and refetch
-/// straight through (no further spawn needed once the caller has already backgrounded it).
-pub async fn handle_webhook(pool: PgPool, adapter: std::sync::Arc<dyn PaymentAdapter>, id: String, status: String) {
-    let known = match deposits::find_by_invoice_id(&pool, &id).await {
+/// The gate: is this id one of ours? Awaited by the route handler BEFORE it spawns anything, so
+/// unauthenticated traffic can't leave detached tasks behind (see `api.rs`). A DB error answers
+/// "not known" — failing closed here costs at most one webhook's latency, since the poller
+/// refetches every in-flight invoice anyway.
+pub async fn is_known_invoice(pool: &PgPool, id: &str) -> bool {
+    match deposits::find_by_invoice_id(pool, id).await {
         Ok(intent) => intent.is_some(),
         Err(e) => {
             tracing::error!("webhook lookup failed for invoice {id}: {e}");
-            return;
+            false
         }
-    };
-    if !known {
-        return; // Unknown invoice id: no storage, no upstream call.
     }
+}
 
+/// The whole intake path in one call: gate, then process. The route splits these two so it can
+/// await the gate and background only the work (`api.rs`); this composition is what tests drive,
+/// so the unknown-id case stays covered end to end rather than only in the half the route keeps.
+pub async fn handle_webhook(pool: PgPool, adapter: std::sync::Arc<dyn PaymentAdapter>, id: String, status: String) {
+    if is_known_invoice(&pool, &id).await {
+        process_known_webhook(pool, adapter, id, status).await;
+    }
+    // Unknown invoice id: no storage, no upstream call.
+}
+
+/// Runs only for an id `is_known_invoice` already vouched for: record the event for
+/// layer-2 dedup, and on a genuinely new `(invoice_id, status)` pair, refetch and apply.
+pub async fn process_known_webhook(
+    pool: PgPool,
+    adapter: std::sync::Arc<dyn PaymentAdapter>,
+    id: String,
+    status: String,
+) {
     let event_key = format!("{id}:{status}");
     let inserted = sqlx::query(
         "INSERT INTO webhook_events (provider, event_key, payload) VALUES ('bitcart', $1, $2) ON CONFLICT DO NOTHING",
