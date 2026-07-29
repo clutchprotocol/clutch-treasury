@@ -58,23 +58,37 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         custody_tron_address: CUSTODY.into(),
         usdt_contract: USDT.into(),
         deposit_confirmations: 19,
+        deposit_match_window_hours: 24,
     }
 }
 
 /// Inserts a deposit-backed `created` mint intent directly (bypassing the API, since these
 /// tests drive `verify_once` at the module level) with a given `deposit_tx_id` (or NULL for
 /// the fallback-match path).
-async fn seed_deposit_intent(pool: &PgPool, amount_clt: i64, client_ref: &str, deposit_tx_id: Option<&str>) -> Uuid {
+///
+/// `expected_amount_usdt` is the DISCRIMINATED pay amount and is what the verifier matches
+/// against; `amount_clt` is the intended (undiscriminated) figure and is deliberately never used
+/// for matching. Keeping them distinct in every fixture is what makes these tests able to catch a
+/// regression back to matching on `amount_clt`.
+async fn seed_deposit_intent(
+    pool: &PgPool,
+    amount_clt: i64,
+    expected_amount_usdt: i64,
+    client_ref: &str,
+    deposit_tx_id: Option<&str>,
+) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id)
-         VALUES ($1, 'TBeneficiary1111111111111111111111', $2, $3, 'orchestrator', $4, $5)",
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', $2, $3, 'orchestrator', $4, $5, $6)",
     )
     .bind(id)
     .bind(amount_clt)
     .bind(format!("ref-{id}"))
     .bind(client_ref)
     .bind(deposit_tx_id)
+    .bind(expected_amount_usdt)
     .execute(pool)
     .await
     .unwrap();
@@ -90,7 +104,21 @@ async fn status_of(pool: &PgPool, id: Uuid) -> String {
 }
 
 fn trc20_transfer_json(tx_id: &str, to: &str, contract: &str, value: &str) -> serde_json::Value {
-    json!({"transaction_id": tx_id, "to": to, "value": value, "token_info": {"address": contract}})
+    trc20_transfer_json_at(tx_id, to, contract, value, chrono::Utc::now().timestamp_millis())
+}
+
+/// `block_timestamp` matters because the fallback (no-tx-hash) match is time-bounded: discriminator
+/// amounts get recycled once an invoice goes terminal, so an old unclaimed transfer at the same
+/// amount must not be swept up to back a stranger's later intent.
+fn trc20_transfer_json_at(
+    tx_id: &str,
+    to: &str,
+    contract: &str,
+    value: &str,
+    block_timestamp: i64,
+) -> serde_json::Value {
+    json!({"transaction_id": tx_id, "to": to, "value": value,
+           "token_info": {"address": contract}, "block_timestamp": block_timestamp})
 }
 
 async fn mount_trc20_list(server: &MockServer, transfers: Vec<serde_json::Value>) {
@@ -122,7 +150,7 @@ async fn happy_path_approves_and_ledgers_custody_exactly_once_across_a_rerun() {
     mount_transaction_confirmed(&server, "tx-happy", true).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-happy", Some("tx-happy")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_173, "client-ref-happy", Some("tx-happy")).await;
 
     let approved_first = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
     assert_eq!(approved_first, 1);
@@ -171,7 +199,7 @@ async fn fallback_match_backfills_deposit_tx_id_and_approves() {
     mount_trc20_list(&server, vec![trc20_transfer_json("tx-fallback", CUSTODY, USDT, "2000042")]).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 2_000_000, "client-ref-fallback", None).await;
+    let id = seed_deposit_intent(&pool, 2_000_000, 2_000_042, "client-ref-fallback", None).await;
 
     let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
     assert_eq!(approved, 1);
@@ -180,6 +208,61 @@ async fn fallback_match_backfills_deposit_tx_id_and_approves() {
     let (deposit_tx_id,): (Option<String>,) =
         sqlx::query_as("SELECT deposit_tx_id FROM mint_intents WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
     assert_eq!(deposit_tx_id.as_deref(), Some("tx-fallback"), "fallback match must backfill the tx id it found");
+}
+
+/// The fallback must match the DISCRIMINATED amount exactly, never `>=` and never `amount_clt`.
+///
+/// This is the defect this test exists for: on the shared static custody address the discriminated
+/// amount is the only thing separating one payer from another. A `>=` match (or matching on
+/// `amount_clt`, which every depositor of the same round number shares) approves this intent on
+/// somebody else's larger transfer, ledgers that stranger's full amount as this deposit's custody,
+/// and locks the rightful depositor out of their own transfer via uq_mint_intents_deposit_tx.
+///
+/// A stranger's 50 USDT transfer is on-chain; our intent expects 2.000042. Nothing may be approved.
+#[tokio::test]
+async fn fallback_must_not_claim_a_larger_transfer_from_another_payer() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-someone-elses", CUSTODY, USDT, "50000000")]).await;
+    let config = test_config(server.uri());
+
+    let id = seed_deposit_intent(&pool, 2_000_000, 2_000_042, "client-ref-bigger", None).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 0, "a larger transfer from another payer must not satisfy this intent");
+    assert_eq!(
+        status_of(&pool, id).await,
+        "created",
+        "unmatched is transient (deposit not yet observed), never rejected and never approved"
+    );
+    let (events,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM treasury_events WHERE kind = 'custody_deposit'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0, "no custody must be ledgered off a stranger's transfer");
+}
+
+/// Same amount, but the transfer predates the match window: discriminator slots are recycled once
+/// an invoice goes terminal, so an old unclaimed transfer at a reused amount must not back a later
+/// intent. Only the fallback path is time-bounded — a known tx hash is identity enough.
+#[tokio::test]
+async fn fallback_must_not_claim_a_transfer_older_than_the_match_window() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = test_config(server.uri());
+    let stale_ms = (chrono::Utc::now() - chrono::Duration::hours(config.deposit_match_window_hours + 1))
+        .timestamp_millis();
+    mount_trc20_list(
+        &server,
+        vec![trc20_transfer_json_at("tx-stale", CUSTODY, USDT, "4000077", stale_ms)],
+    )
+    .await;
+
+    let id = seed_deposit_intent(&pool, 4_000_000, 4_000_077, "client-ref-stale", None).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 0, "a transfer older than the window must not be claimed");
+    assert_eq!(status_of(&pool, id).await, "created");
 }
 
 /// Wrong recipient: a confirmed transfer of the right amount and token, but to some other
@@ -192,7 +275,7 @@ async fn wrong_recipient_rejects() {
     mount_transaction_confirmed(&server, "tx-wrong-to", true).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-wrong-to", Some("tx-wrong-to")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-wrong-to", Some("tx-wrong-to")).await;
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
     assert_eq!(status_of(&pool, id).await, "rejected");
@@ -210,7 +293,7 @@ async fn wrong_token_contract_rejects() {
     mount_transaction_confirmed(&server, "tx-wrong-token", true).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-wrong-token", Some("tx-wrong-token")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-wrong-token", Some("tx-wrong-token")).await;
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
     assert_eq!(status_of(&pool, id).await, "rejected");
@@ -226,7 +309,7 @@ async fn insufficient_amount_rejects() {
     mount_transaction_confirmed(&server, "tx-short", true).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-short", Some("tx-short")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-short", Some("tx-short")).await;
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
     assert_eq!(status_of(&pool, id).await, "rejected");
@@ -247,7 +330,7 @@ async fn transient_trongrid_failure_never_rejects() {
         .await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-outage", Some("tx-during-outage")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-outage", Some("tx-during-outage")).await;
     let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
     assert_eq!(approved, 0);
@@ -267,7 +350,7 @@ async fn not_yet_confirmed_is_transient_not_a_rejection() {
     mount_transaction_confirmed(&server, "tx-pending", false).await;
     let config = test_config(server.uri());
 
-    let id = seed_deposit_intent(&pool, 1_000_000, "client-ref-pending", Some("tx-pending")).await;
+    let id = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-pending", Some("tx-pending")).await;
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
     assert_eq!(status_of(&pool, id).await, "created", "not-yet-confirmed must retry, never reject");
@@ -288,8 +371,8 @@ async fn stuck_intent_past_24h_pages_p1() {
 
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, created_at)
-         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, $2, 'orchestrator', 'client-ref-stuck', 'tx-stuck', now() - interval '25 hours')",
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt, created_at)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, $2, 'orchestrator', 'client-ref-stuck', 'tx-stuck', 1000000, now() - interval '25 hours')",
     )
     .bind(id)
     .bind(format!("ref-{id}"))
@@ -312,13 +395,13 @@ async fn stuck_intent_past_24h_pages_p1() {
 #[tokio::test]
 async fn unique_index_refuses_a_second_intent_claiming_the_same_deposit_tx() {
     let pool = pool().await;
-    let first = seed_deposit_intent(&pool, 1_000_000, "client-ref-a", Some("tx-shared")).await;
+    let first = seed_deposit_intent(&pool, 1_000_000, 1_000_000, "client-ref-a", Some("tx-shared")).await;
     assert_eq!(status_of(&pool, first).await, "created");
 
     let second_id = Uuid::new_v4();
     let err = sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id)
-         VALUES ($1, 'TBeneficiary2222222222222222222222', 1000000, $2, 'orchestrator', 'client-ref-b', 'tx-shared')",
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt)
+         VALUES ($1, 'TBeneficiary2222222222222222222222', 1000000, $2, 'orchestrator', 'client-ref-b', 'tx-shared', 1000000)",
     )
     .bind(second_id)
     .bind(format!("ref-{second_id}"))
@@ -345,11 +428,11 @@ async fn fallback_backfill_losing_the_race_rejects_not_approves() {
     let config = test_config(server.uri());
 
     // Another intent already claimed this exact transfer.
-    let _already_claimed = seed_deposit_intent(&pool, 3_000_000, "client-ref-first-claim", Some("tx-claimed")).await;
+    let _already_claimed = seed_deposit_intent(&pool, 3_000_000, 3_000_000, "client-ref-first-claim", Some("tx-claimed")).await;
 
     // A second, different intent's fallback match finds the SAME transfer (e.g. two deposit
     // intents that happen to land on the same amount, or an operational duplicate).
-    let racer = seed_deposit_intent(&pool, 3_000_000, "client-ref-racer", None).await;
+    let racer = seed_deposit_intent(&pool, 3_000_000, 3_000_000, "client-ref-racer", None).await;
 
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
@@ -363,6 +446,40 @@ async fn fallback_backfill_losing_the_race_rejects_not_approves() {
         .await
         .unwrap();
     assert_eq!(custody_events, 0, "the racer must not have ledgered a custody event for a transfer it lost the claim on");
+}
+
+/// A deposit-backed intent with no `expected_amount_usdt` is unverifiable — the verifier would
+/// have nothing to match on-chain transfers against except `amount_clt`, which every depositor of
+/// the same round number shares. Refuse at the door rather than create a row that can only ever
+/// age into manual review.
+#[tokio::test]
+async fn deposit_backed_create_without_expected_amount_is_refused() {
+    let pool = pool().await;
+    let mut config = test_config("http://unused".to_string());
+    config.initiator_token = "test-initiator".to_string();
+    let app = treasury_service::api::router(pool.clone(), config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mint-intents")
+                .header("authorization", "Bearer test-initiator")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"client_ref":"deposit-no-expected"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mint_intents WHERE client_ref = 'deposit-no-expected'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "no intent row may be created for an unverifiable deposit-backed request");
 }
 
 /// The API-level requirement: a duplicate `client_ref` on POST /internal/mint-intents replays
@@ -381,7 +498,7 @@ async fn duplicate_client_ref_create_replays_instead_of_duplicating() {
             .header("authorization", "Bearer test-initiator")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"client_ref":"deposit-intent-abc","deposit_tx_id":"tx-abc"}"#,
+                r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000291,"client_ref":"deposit-intent-abc","deposit_tx_id":"tx-abc"}"#,
             ))
             .unwrap()
     };

@@ -20,3 +20,4 @@ trongrid_api_key = ""
 custody_tron_address = ""
 usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 deposit_confirmations = 19
+deposit_match_window_hours = 24

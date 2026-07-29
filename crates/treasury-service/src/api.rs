@@ -69,6 +69,12 @@ struct CreateMintIntentBody {
     /// The Tron transfer the tron_verifier should check first (may be absent — Bitcart
     /// sometimes returns no hash; the verifier's fallback match then backfills this).
     deposit_tx_id: Option<String>,
+    /// What the depositor was told to PAY: `amount_clt` plus the orchestrator's discriminator.
+    /// Mandatory whenever `client_ref` is set — the verifier matches on-chain transfers against
+    /// this, and on a shared custody address it is the only thing separating one user's payment
+    /// from another's. Rejected with 400 rather than defaulted, so a bridge that forgets to send
+    /// it fails loudly instead of silently widening the verifier's match to `amount_clt`.
+    expected_amount_usdt: Option<i64>,
 }
 
 /// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
@@ -102,6 +108,13 @@ async fn create_mint_intent_handler(
         {
             return Ok((StatusCode::OK, Json(intent_json(&existing))));
         }
+        // A deposit-backed intent without the discriminated pay amount is unverifiable: the
+        // verifier would have nothing to match on-chain transfers against but `amount_clt`,
+        // which every user depositing the same round number shares. The DB CHECK also refuses
+        // this; failing here makes the reason legible instead of a 500.
+        if body.expected_amount_usdt.is_none_or(|a| a <= 0) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
     }
     let intent = intents::create_mint_intent(
         &state.pool,
@@ -110,6 +123,7 @@ async fn create_mint_intent_handler(
         actor_name(role),
         body.client_ref.as_deref(),
         body.deposit_tx_id.as_deref(),
+        body.expected_amount_usdt,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

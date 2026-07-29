@@ -40,6 +40,11 @@ struct Trc20Transfer {
     to: String,
     value: String,
     token_info: TokenInfo,
+    /// ASSUMED: TronGrid's trc20 list returns this as epoch milliseconds. Only the fallback
+    /// match reads it, to bound how far back an unclaimed transfer can be swept up; a missing
+    /// field defaults to 0, which puts the transfer outside every window and so fails closed.
+    #[serde(default)]
+    block_timestamp: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,7 +217,11 @@ fn check_transfer(
 
 struct DepositBackedIntent {
     id: Uuid,
-    amount_clt: i64,
+    /// The discriminated pay amount, NOT `amount_clt`. `amount_clt` is deliberately absent from
+    /// this struct: every user depositing the same round number shares it, so matching a transfer
+    /// against it approves an intent on whoever's money happened to land first. Keeping it out of
+    /// reach means no code path here can make that mistake again.
+    expected_amount_usdt: Option<i64>,
     deposit_tx_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -228,6 +237,17 @@ async fn evaluate(
     config: &AppConfig,
     intent: &DepositBackedIntent,
 ) -> Evidence {
+    // A deposit-backed intent with no expected pay amount cannot be verified against anything
+    // trustworthy (migration 0003's CHECK plus api.rs's 400 should make this unreachable).
+    // Transient, not HardMismatch: this is our own data missing, not evidence against the user's
+    // deposit — the stuck sweep escalates it to a human rather than rejecting real money.
+    let Some(expected_amount_usdt) = intent.expected_amount_usdt else {
+        return Evidence::Transient(format!(
+            "intent {} is deposit-backed but has no expected_amount_usdt — unverifiable",
+            intent.id
+        ));
+    };
+
     let transfers = match client.trc20_transfers(&config.custody_tron_address, &config.usdt_contract).await {
         Ok(t) => t,
         Err(e) => return Evidence::Transient(format!("trongrid trc20 list: {e}")),
@@ -249,26 +269,39 @@ async fn evaluate(
                 Ok(c) => c,
                 Err(e) => return Evidence::Transient(format!("trongrid get_transaction: {e}")),
             };
-            match check_transfer(transfer, confirmed, &config.custody_tron_address, &config.usdt_contract, intent.amount_clt) {
+            match check_transfer(transfer, confirmed, &config.custody_tron_address, &config.usdt_contract, expected_amount_usdt) {
                 Ok(observed) => Evidence::Pass { tx_id: tx_id.clone(), observed_amount_usdt: observed },
                 Err(reason) if reason == "not yet confirmed" => Evidence::Transient(reason),
                 Err(reason) => Evidence::HardMismatch(reason),
             }
         }
         None => {
-            // Fallback: any transfer to custody at or above the expected amount. The
-            // `only_confirmed=true` query param already restricts this list to confirmed
-            // transfers, so there is no separate confirmed-depth call to make here.
+            // Fallback, used only when Bitcart gave us no tx hash. This is the WEAKER evidence
+            // path: with no hash, the discriminated amount is all we have to identify the
+            // payment by, so the match is EXACT (not >=) and bounded in time.
+            //
+            // Exact, because >= matches a different user's larger deposit — the amount is the
+            // only thing separating payers on the shared custody address. Time-bounded, because
+            // discriminator slots are recycled once an invoice goes terminal, so an old unclaimed
+            // transfer at the same amount could otherwise be swept up to back a stranger's later
+            // intent. An overpayment with no hash therefore does NOT auto-verify; it ages into
+            // the stuck sweep and a human, which is the right side to fail on.
+            //
+            // `only_confirmed=true` already restricts this list to confirmed transfers, so no
+            // separate depth call is needed here.
+            let window = chrono::Duration::hours(config.deposit_match_window_hours);
+            let earliest_ms = (intent.created_at - window).timestamp_millis();
             let candidate = transfers.iter().find(|t| {
                 t.to == config.custody_tron_address
                     && t.token_info.address == config.usdt_contract
-                    && t.value.parse::<i64>().unwrap_or(0) >= intent.amount_clt
+                    && t.value.parse::<i64>().ok() == Some(expected_amount_usdt)
+                    && t.block_timestamp >= earliest_ms
             });
             match candidate {
-                Some(transfer) => {
-                    let observed = transfer.value.parse().unwrap_or(0);
-                    Evidence::Pass { tx_id: transfer.transaction_id.clone(), observed_amount_usdt: observed }
-                }
+                Some(transfer) => Evidence::Pass {
+                    tx_id: transfer.transaction_id.clone(),
+                    observed_amount_usdt: expected_amount_usdt,
+                },
                 // No matching transfer yet is exactly "the deposit hasn't been observed
                 // on-chain yet" — transient by construction, not a mismatch. Nothing here
                 // is real evidence against the deposit; it is absence of evidence so far.
@@ -414,8 +447,8 @@ async fn stuck_intent_sweep(pool: &PgPool, intents: &[DepositBackedIntent]) {
 /// evaluating or acting on ONE intent are alerted and skipped rather than aborting the batch.
 pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, String> {
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
-    let rows: Vec<(Uuid, i64, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT id, amount_clt, deposit_tx_id, created_at FROM mint_intents
+    let rows: Vec<(Uuid, Option<i64>, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, expected_amount_usdt, deposit_tx_id, created_at FROM mint_intents
          WHERE status = 'created' AND client_ref IS NOT NULL
          ORDER BY created_at",
     )
@@ -425,7 +458,12 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
-        .map(|(id, amount_clt, deposit_tx_id, created_at)| DepositBackedIntent { id, amount_clt, deposit_tx_id, created_at })
+        .map(|(id, expected_amount_usdt, deposit_tx_id, created_at)| DepositBackedIntent {
+            id,
+            expected_amount_usdt,
+            deposit_tx_id,
+            created_at,
+        })
         .collect();
 
     stuck_intent_sweep(pool, &intents).await;
@@ -439,13 +477,32 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 // another intent already claimed.
                 let may_approve = match &intent.deposit_tx_id {
                     Some(_) => true,
-                    None => match backfill_deposit_tx_id(pool, intent.id, &tx_id).await {
-                        Ok(ok) => ok,
-                        Err(e) => {
-                            alert(pool, "warn", "tron_verifier", &format!("intent {}: backfill error: {e}", intent.id)).await;
-                            false
+                    None => {
+                        // Approving off the fallback match means we never got a tx hash from the
+                        // payment processor and identified the payment by amount and timing
+                        // alone. That is sound but strictly weaker than a hash, so it is worth an
+                        // operator seeing every time it happens — a run of these means Bitcart
+                        // stopped returning hashes, which is worth knowing before it is the only
+                        // evidence behind a large share of the reserve.
+                        alert(
+                            pool,
+                            "warn",
+                            "tron_verifier",
+                            &format!(
+                                "intent {} verified via fallback amount match (no tx hash from processor); \
+                                 claimed transfer {tx_id}",
+                                intent.id
+                            ),
+                        )
+                        .await;
+                        match backfill_deposit_tx_id(pool, intent.id, &tx_id).await {
+                            Ok(ok) => ok,
+                            Err(e) => {
+                                alert(pool, "warn", "tron_verifier", &format!("intent {}: backfill error: {e}", intent.id)).await;
+                                false
+                            }
                         }
-                    },
+                    }
                 };
                 if !may_approve {
                     continue;
@@ -486,6 +543,9 @@ mod tests {
             to: to.to_string(),
             value: value.to_string(),
             token_info: TokenInfo { address: contract.to_string() },
+            // Only the fallback match reads this; these unit tests exercise check_transfer,
+            // which is the known-hash path.
+            block_timestamp: 0,
         }
     }
 

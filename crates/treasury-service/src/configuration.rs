@@ -26,6 +26,11 @@ pub struct AppConfig {
     pub custody_tron_address: String,
     pub usdt_contract: String,
     pub deposit_confirmations: u32,
+    /// How far back the verifier's fallback (no-tx-hash) match may reach for a transfer, relative
+    /// to the intent's creation. Bounded because discriminator slots are recycled after an invoice
+    /// goes terminal, so without a limit an old unclaimed transfer at the same amount could be
+    /// swept up to back a stranger's later deposit.
+    pub deposit_match_window_hours: i64,
 }
 
 impl AppConfig {

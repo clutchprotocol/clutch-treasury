@@ -37,6 +37,7 @@ fn test_config() -> AppConfig {
         custody_tron_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".into(),
         usdt_contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".into(),
         deposit_confirmations: 19,
+        deposit_match_window_hours: 24,
     }
 }
 
