@@ -371,11 +371,16 @@ async fn treasury_unreachable_neither_loses_nor_advances_the_deposit() {
     assert!(row.treasury_intent_id.is_none(), "no treasury intent id can exist for a call that never succeeded");
 }
 
-/// The brief's explicit threshold: only after the 10th CONSECUTIVE treasury-unreachable failure
-/// does a P1 fire — not on the first, and not on every one after the 10th either (a prolonged
-/// outage must not spam pages beyond the first crossing).
+/// The threshold: no P1 before the 10th consecutive failure, one at the 10th, and — crucially —
+/// another at the 20th.
+///
+/// Re-paging every 10th rather than only at the first crossing is deliberate. The state being
+/// reported is "the user's USDT is in custody and no CLT has been minted against it", which does
+/// not resolve itself. A single edge-triggered page can be missed, acked, or lost while the row
+/// retries in silence forever, so the signal has to stay alive. Every tick would be spam; every
+/// 10th is not.
 #[tokio::test]
-async fn p1_alert_fires_at_exactly_ten_consecutive_failures_not_before_or_repeatedly() {
+async fn p1_alert_fires_at_ten_consecutive_failures_and_again_at_twenty() {
     let pool = pool().await;
     let server = MockServer::start().await; // no routes mounted: every call is a 404 ("unreachable")
     let deposit_id = seed_confirmed_deposit(&pool, 1_000_000, 1_000_321, Some("tron-tx-flaky")).await;
@@ -399,14 +404,28 @@ async fn p1_alert_fires_at_exactly_ten_consecutive_failures_not_before_or_repeat
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
     assert_eq!(n, 1, "the 10th consecutive failure must page p1");
 
+    // 11th through 19th: still one page — the signal repeats, it doesn't spam every tick.
+    for i in 11..=19 {
+        sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1")
+            .bind(deposit_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        treasury_bridge::run_once(&pool, &config).await;
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "failure {i} must not page again between thresholds");
+    }
+
+    // 20th: page again. A deposit stuck this long has real money behind it and the page must not
+    // have gone quiet permanently after the first one.
     sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1")
         .bind(deposit_id)
         .execute(&pool)
         .await
         .unwrap();
-    treasury_bridge::run_once(&pool, &config).await; // 11th: must not page again
+    treasury_bridge::run_once(&pool, &config).await;
     let (n_after,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
-    assert_eq!(n_after, 1, "an 11th consecutive failure must not page a second p1");
+    assert_eq!(n_after, 2, "a still-stuck deposit must page again at the 20th failure, not fall silent");
 }
 
 /// A treasury call that DOES succeed after prior failures must reset the streak — proven by

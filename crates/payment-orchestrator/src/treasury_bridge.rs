@@ -84,20 +84,21 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            // A non-2xx here (e.g. the treasury's 400 for a missing expected_amount_usdt) is
-            // not "unreachable" — it is the treasury telling us this request is malformed, and
-            // retrying it unchanged would just fail identically forever. Treat it the same as a
-            // transport failure for backoff/alerting purposes (this bridge has no way to fix the
-            // request itself), but log the body so a human can see WHY.
+            // A non-2xx (e.g. the treasury's 400 for a missing expected_amount_usdt) is NOT
+            // "unreachable" — the treasury answered, and it is telling us this request is
+            // malformed. Retrying it unchanged fails identically forever, so it shares the
+            // backoff (this bridge cannot fix its own request) but is reported as `Rejected`:
+            // it needs a deploy or config change, and paging someone about a possible outage
+            // would send them to the wrong system.
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
             tracing::error!("treasury_bridge: create for deposit {} rejected: {status} {text}", intent.id);
-            record_failure_and_maybe_alert(pool, intent.id, "create").await;
+            record_failure_and_maybe_alert(pool, intent.id, "create", FailureCause::Rejected).await;
             return;
         }
         Err(e) => {
             tracing::warn!("treasury_bridge: create for deposit {} unreachable: {e}", intent.id);
-            record_failure_and_maybe_alert(pool, intent.id, "create").await;
+            record_failure_and_maybe_alert(pool, intent.id, "create", FailureCause::Unreachable).await;
             return;
         }
     };
@@ -106,20 +107,20 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
         Ok(v) => v,
         Err(e) => {
             tracing::error!("treasury_bridge: create response for deposit {} unparseable: {e}", intent.id);
-            record_failure_and_maybe_alert(pool, intent.id, "create").await;
+            record_failure_and_maybe_alert(pool, intent.id, "create", FailureCause::Rejected).await;
             return;
         }
     };
     let Some(treasury_id) = treasury_intent.get("id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok())
     else {
         tracing::error!("treasury_bridge: create response for deposit {} had no parseable id: {treasury_intent}", intent.id);
-        record_failure_and_maybe_alert(pool, intent.id, "create").await;
+        record_failure_and_maybe_alert(pool, intent.id, "create", FailureCause::Rejected).await;
         return;
     };
 
     if let Err(e) = deposits::set_treasury_intent_id(pool, intent.id, treasury_id).await {
         tracing::error!("treasury_bridge: failed to store treasury_intent_id for deposit {}: {e}", intent.id);
-        record_failure_and_maybe_alert(pool, intent.id, "create").await;
+        record_failure_and_maybe_alert(pool, intent.id, "create", FailureCause::Local).await;
         return;
     }
     let _ = deposits::reset_attempts(pool, intent.id).await;
@@ -152,12 +153,12 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::warn!("treasury_bridge: poll for deposit {} (treasury intent {treasury_id}) returned {}", intent.id, r.status());
-            record_failure_and_maybe_alert(pool, intent.id, "poll").await;
+            record_failure_and_maybe_alert(pool, intent.id, "poll", FailureCause::Rejected).await;
             return;
         }
         Err(e) => {
             tracing::warn!("treasury_bridge: poll for deposit {} (treasury intent {treasury_id}) unreachable: {e}", intent.id);
-            record_failure_and_maybe_alert(pool, intent.id, "poll").await;
+            record_failure_and_maybe_alert(pool, intent.id, "poll", FailureCause::Unreachable).await;
             return;
         }
     };
@@ -166,7 +167,7 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
         Ok(v) => v,
         Err(e) => {
             tracing::error!("treasury_bridge: poll response for deposit {} unparseable: {e}", intent.id);
-            record_failure_and_maybe_alert(pool, intent.id, "poll").await;
+            record_failure_and_maybe_alert(pool, intent.id, "poll", FailureCause::Rejected).await;
             return;
         }
     };
@@ -205,17 +206,49 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
 /// brief's 10-consecutive-failures threshold, page a P1 naming which step is stuck. Firing once
 /// per crossing (not on every subsequent failure) keeps a prolonged outage from spamming pages
 /// beyond the first one across the threshold.
-async fn record_failure_and_maybe_alert(pool: &PgPool, id: Uuid, step: &str) {
+/// Why a step failed. Worth distinguishing in the alert, not just the log: `Rejected` means the
+/// treasury answered and refused the request, so retrying it unchanged will fail identically
+/// forever — a deploy/config fault that needs a human. `Unreachable` plausibly clears on its own.
+/// Paging someone with "treasury may be down" when the real cause was a 400 sends them to the
+/// wrong system at 3am.
+enum FailureCause {
+    Unreachable,
+    Rejected,
+    /// Our own database refused the write. Neither of the above: pointing a responder at the
+    /// treasury for a local fault is exactly the wrong-system page this enum exists to avoid.
+    Local,
+}
+
+/// Records the failure (which also sets the jittered backoff) and pages on every Nth consecutive
+/// one — NOT only the Nth.
+///
+/// Edge-triggering a single alert at exactly N was the original behaviour and it is the wrong shape
+/// here: the state being reported is "the user's USDT is in custody and no CLT has been minted
+/// against it". That does not resolve itself, and one page can be missed, acked, or lost while the
+/// row retries in silence forever. Re-paging every N failures keeps the signal alive without
+/// alerting on every tick.
+async fn record_failure_and_maybe_alert(pool: &PgPool, id: Uuid, step: &str, cause: FailureCause) {
     match deposits::record_attempt_failure(pool, id).await {
-        Ok(attempts) if attempts == ALERT_AFTER_CONSECUTIVE_FAILURES => {
+        Ok(attempts) if attempts > 0 && attempts % ALERT_AFTER_CONSECUTIVE_FAILURES == 0 => {
+            let diagnosis = match cause {
+                FailureCause::Unreachable => "treasury unreachable — it may be down; this can clear on its own",
+                FailureCause::Rejected => {
+                    "treasury REFUSED the request or answered unintelligibly (see logs for the \
+                     response body) — retrying will not fix this; it needs a deploy or config change"
+                }
+                FailureCause::Local => {
+                    "OUR OWN database write failed — the treasury is not the problem; check this \
+                     service's database"
+                }
+            };
             alert(
                 pool,
                 "p1",
                 "treasury_bridge",
                 &format!(
-                    "deposit {id}: {ALERT_AFTER_CONSECUTIVE_FAILURES} consecutive treasury-unreachable \
-                     failures on the {step} step — treasury may be down. Deposit is untouched (still \
-                     at its prior status) and will keep retrying with backoff."
+                    "deposit {id}: {attempts} consecutive failures on the {step} step. {diagnosis}. \
+                     The user's USDT is in custody with no CLT minted against it. The deposit is \
+                     untouched at its prior status and will keep retrying with backoff."
                 ),
             )
             .await;
