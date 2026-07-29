@@ -22,6 +22,15 @@ pub struct OrchConfig {
     pub min_deposit_usdt: i64,
     pub max_deposit_usdt: i64,
     pub poll_interval_secs: u64,
+    /// Plan C T6 gate, default `false`: the treasury's payout rail is still `payout::StubRail`
+    /// (fabricates `payout_ref = "stub:<uuid>"`, sends nothing — spec §7.6 wants a working
+    /// off-ramp before real deposits). While this is `false` both redemption routes 503 rather
+    /// than accept a request, because a burn is irreversible: a user who is allowed to redeem
+    /// destroys their CLT claim on the reserve and gets a `redemption_ref` for a payout that
+    /// cannot happen. Flip only after a real TRC-20 payout rail replaces the stub.
+    pub redemptions_enabled: bool,
+    pub min_redemption_clt: i64,
+    pub max_redemption_clt: i64,
 }
 
 impl OrchConfig {

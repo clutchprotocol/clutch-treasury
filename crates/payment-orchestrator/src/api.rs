@@ -14,6 +14,7 @@ use crate::adapter::PaymentAdapter;
 use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::deposits::{self, DepositOutcome};
+use crate::redemptions::{self, RedemptionOutcome};
 use crate::webhook;
 
 #[derive(Clone)]
@@ -129,6 +130,117 @@ async fn get_deposit_handler(
     })))
 }
 
+/// Deliberately has NO `redeemer_address` field — see `redemptions.rs` module docs. The
+/// redeemer is always the caller's authenticated `user_pk`; there is nothing in this struct
+/// a client could set to name someone else's balance.
+#[derive(Deserialize)]
+struct CreateRedemptionBody {
+    payout_tron_address: String,
+    amount_clt: i64,
+}
+
+/// `POST /api/v1/redemptions` — validates the payout address (base58check checksum + Tron
+/// version byte, `redemptions::is_valid_tron_address` — NOT a shape regex) and bounds, then
+/// forwards to the treasury with `redeemer_address` = the JWT's `pk`, never the request body.
+/// 503s while `config.redemptions_enabled` is false (default) — the treasury's payout rail is
+/// still `payout::StubRail`; see `OrchConfig::redemptions_enabled`'s doc comment for why this
+/// gate exists before anything else in this handler runs.
+async fn create_redemption_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateRedemptionBody>,
+) -> Result<(StatusCode, HeaderMap, Json<serde_json::Value>), StatusCode> {
+    // Gated before auth, same ordering as get_redemption_handler below: a disabled feature
+    // 503s uniformly regardless of whether the caller's JWT would otherwise have been valid.
+    if !state.config.redemptions_enabled {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            Json(json!({"error": "redemptions are not yet available — the treasury payout rail is not live"})),
+        ));
+    }
+    let user_pk = authenticated_pk(&headers, &state.config)?;
+
+    let outcome = redemptions::create_redemption(
+        &state.pool,
+        &state.config,
+        &user_pk,
+        &body.payout_tron_address,
+        body.amount_clt,
+    )
+    .await;
+
+    let mut resp_headers = HeaderMap::new();
+    let (status, payload) = match outcome {
+        RedemptionOutcome::Created { id, redemption_ref, amount_clt, status } => (
+            StatusCode::CREATED,
+            json!({"id": id, "redemption_ref": redemption_ref, "amount_clt": amount_clt, "status": status}),
+        ),
+        // 503, not 400: this isn't a malformed request, it's a feature that isn't live yet —
+        // the treasury's payout rail is a stub (see OrchConfig::redemptions_enabled). Naming
+        // that plainly in the body keeps a caller from retrying forever thinking it's transient
+        // backpressure, or from concluding their address/amount was somehow invalid.
+        RedemptionOutcome::Disabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "redemptions are not yet available — the treasury payout rail is not live"}),
+        ),
+        RedemptionOutcome::InvalidAddress => (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "payout_tron_address failed base58check validation (bad checksum or version byte)"}),
+        ),
+        RedemptionOutcome::OutOfBounds { min, max } => (
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!("amount_clt must be between {min} and {max}")}),
+        ),
+        RedemptionOutcome::TreasuryUnavailable => {
+            resp_headers.insert("retry-after", "30".parse().unwrap());
+            (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "treasury unreachable, try again shortly"}))
+        }
+        RedemptionOutcome::TreasuryRejected => (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "treasury refused the redemption request"}),
+        ),
+        RedemptionOutcome::Failed(msg) => {
+            tracing::error!("create_redemption failed: {msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal error"}))
+        }
+    };
+    Ok((status, resp_headers, Json(payload)))
+}
+
+/// `GET /api/v1/redemptions/:id` — owner-checked exactly like `get_deposit_handler`: a caller
+/// whose `user_pk` does not match the mapping row's gets 404, not 403 (don't confirm a
+/// resource exists to someone not allowed to see it). Also 503s while `redemptions_enabled`
+/// is false, for the same reason creation does.
+///
+/// Serves the status captured at intent-creation time, not a live treasury re-fetch — the
+/// treasury has no `GET /internal/redemption-intents/:id` route to proxy (only the `POST`
+/// exists; confirmed against `treasury-service/src/api.rs`'s router). See the task report.
+async fn get_redemption_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !state.config.redemptions_enabled {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let user_pk = authenticated_pk(&headers, &state.config)?;
+    let mapping = redemptions::find_by_id(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if mapping.user_pk != user_pk {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({
+        "id": mapping.id,
+        "redemption_ref": mapping.redemption_ref,
+        "payout_tron_address": mapping.payout_tron_address,
+        "amount_clt": mapping.amount_clt,
+        "status": mapping.status,
+    })))
+}
+
 #[derive(Deserialize)]
 struct BitcartIpn {
     id: String,
@@ -161,6 +273,8 @@ pub fn router(pool: PgPool, config: OrchConfig, adapter: Arc<dyn PaymentAdapter>
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler))
         .route("/api/v1/deposits/:id", get(get_deposit_handler))
+        .route("/api/v1/redemptions", post(create_redemption_handler))
+        .route("/api/v1/redemptions/:id", get(get_redemption_handler))
         .route("/webhooks/bitcart", post(bitcart_webhook_handler))
         .with_state(state)
 }

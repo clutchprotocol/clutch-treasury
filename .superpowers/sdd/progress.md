@@ -422,3 +422,90 @@ mock_treasury_with_generous_headroom() wiremock helper (same convention bitcart_
 uses) and threaded treasury_url through test_config(); db_deposits.rs/db_webhook.rs call
 deposits::create directly and never touch create_and_invoice, so they were unaffected and left
 alone.
+
+## Plan C T5b deposit->mint bridge — 3666ee8 + review fix 287ae02 (both pushed), 13/13 db_bridge, 74 workspace
+THE contract holds: create_step POSTs "expected_amount_usdt": intent.pay_amount_usdt (treasury_bridge.rs:72),
+proven on the wire by asserting the body wiremock received with amount_clt=1_000_000 vs
+expected=1_000_391 — deliberately DIFFERENT values, so a regression to amount_clt fails the test.
+Critical cb497e3's treasury-side fix is now actually fed the right value by its sole producer.
+Also good: headroom check fails closed both ways (TreasuryUnavailable = 503+Retry-After,
+InsufficientHeadroom = 422 since retrying now won't help); every status change via guarded
+transition; client_ref replay is the only idempotency layer, no second one stacked on top.
+Agent's flagged ambiguity #2 (create and poll both run each tick, so confirmed -> credited can
+happen within one tick) reviewed and ACCEPTED — matches outbox.rs/watcher.rs convention, guards hold.
+
+### Review fixes (287ae02) — alerting, not logic
+1. P1 was edge-triggered at EXACTLY 10 consecutive failures: `attempts == ALERT_AFTER`. Fired once,
+   then silence forever while the row retried. The reported state is "user's USDT in custody, no CLT
+   minted against it" — it does not self-resolve, and one page can be missed/acked/lost. Now
+   `attempts % ALERT_AFTER == 0`: repeated signal, not every tick. Test extended through the 20th
+   failure (one page at 10, still one through 19, second at 20).
+2. Every failure said "treasury may be down" regardless of cause — this was the agent's flagged
+   ambiguity #1 and it is worse than it looks: a non-2xx means the treasury ANSWERED and refused us
+   (deploy/config fault, never self-heals) and a failed local DB write means the treasury is fine
+   and OUR database isn't. Both sent the responder to the wrong system. Added FailureCause
+   {Unreachable, Rejected, Local}; alert text names which, and states funds are in custody unminted.
+   Local exists specifically because Rejected's text would have been an actively wrong diagnosis.
+- Kept the shared backoff for Rejected: the bridge genuinely cannot fix its own request, so
+  retry-with-backoff is right; only the DIAGNOSIS needed splitting, not the retry policy.
+
+## Plan C T6 brief written (.superpowers/sdd/planc-task-6-brief.md) — NOT yet dispatched
+Held back deliberately while 5b was running: T6 touches orchestrator api.rs / lib.rs /
+configuration.rs and the next migration number, all of which 5b was mid-edit on. Two agents in the
+same files means one silently overwrites the other. Dispatch now that 5b has landed.
+Three additions to the plan, recorded so the reasoning survives:
+1. Base58CHECK validation, not the plan's "T..., base58, 34 chars" shape check. One mistyped
+   character passes a shape check and sends USDT to an address nobody holds — unrecoverable, and the
+   user's CLT is already burned by then. Verify the 4-byte double-SHA256 checksum and the 0x41
+   version byte. Required test uses a ONE-CHARACTER CORRUPTION of a valid address: exactly the case
+   a regex passes and a checksum catches. Small bs58 dep beats hand-rolling base58.
+2. redemptions_enabled config flag, DEFAULT FALSE, 503 while off. payout.rs:22 still fabricates
+   payout_ref = "stub:<uuid>" and sends nothing. Spec §7.6 wants a working off-ramp before real
+   deposits; an endpoint handing out redemption_refs invites users to burn real CLT for a payout
+   that cannot happen, and the burn is irreversible. The flag is what stops a half-built off-ramp
+   being reachable in production by accident. Stays false until a real TRC-20 rail lands.
+3. redeemer_address from the JWT, never the body — same class as created_by. A body field lets a
+   caller redeem against someone else's balance and the treasury cannot detect the substitution.
+Deliberately NOT added: a client-key idempotency layer. A duplicate POST creates a second intent
+with its own redemption_ref, and payout requires a Burn carrying that specific ref — the user burns
+once, so only one can ever be fulfilled. Litter, not a money bug. Must be explained in a ponytail:
+comment so nobody "fixes" the absence later.
+
+## Plan C T6 redemption proxy endpoints — dispatched and landed, 10/10 db_redemptions, 24 workspace
+Real gap found and worked around rather than stopping the whole task: treasury-service's router
+(`crates/treasury-service/src/api.rs`) has `POST /internal/redemption-intents` but NO
+`GET /internal/redemption-intents/:id` — confirmed by reading the whole route table, not assuming.
+The brief's `GET /api/v1/redemptions/:id` says "proxy the treasury status", which is literally
+impossible with no treasury route to proxy from. Both plan and brief explicitly forbid touching
+treasury-service in this task, so the fix isn't to add one. Since only the GET side is blocked
+(POST matches the treasury's actual `{redeemer_address, payout_address, amount_clt}` shape exactly),
+built GET as an owner-checked read of `redemption_map`'s own stored snapshot (captured once, from
+the treasury's CREATE response) rather than a live re-fetch — documented as a concern in the task
+report, not silently papered over. Flagged for follow-up: add the treasury GET route, then swap
+this GET handler to a live proxy.
+
+Address validation: `bs58 = { version = "0.5", features = ["check"] }` added clean (not in the lock
+file before this task), resolves fine under the 1.86 pin — only new transitive dep is `sha2 0.10`.
+Read bs58 0.5.1's actual decode.rs from the cargo registry cache rather than trusting memory of the
+API shape: `with_check(Some(0x41))` verifies the double-SHA256 checksum AND the version byte, but
+NOT total payload length — independently constructed (via a throwaway Node script, no Python on this
+box) a base58check string with a genuinely valid checksum and the correct 0x41 version byte but only
+10 address bytes instead of Tron's 20, and confirmed `bs58` alone accepts it. Added an explicit
+`DECODED_LEN_WITH_VERSION == 21` check plus a regression test for exactly that case — the
+checksum/version check alone was NOT sufficient. Also independently verified (same Node script) that
+the "valid Tron address" and "one-character-corrupted" test fixtures actually have real/broken
+checksums rather than trusting a plausible-looking string.
+
+Flaky pre-existing test, not a regression: `db_bridge.rs`'s
+`p1_alert_fires_at_ten_consecutive_failures_and_again_at_twenty` (T5b's own test, untouched by this
+task) failed once in a full-workspace run (`left: 1, right: 2` on the 20th-failure repeat-alert
+assertion) and passed clean on an isolated `--test db_bridge` rerun and two subsequent full-workspace
+reruns. Nothing in this task touches `treasury_bridge.rs`, `deposits::record_attempt_failure`, or
+`alerts.rs`. Recorded here rather than silently re-run-until-green: it drives 20 sequential real HTTP
+calls against a MockServer with tight `next_attempt_at` resets between them, which is exactly the
+shape of test that flakes under container resource contention. Left as-is per the brief's scope
+(not this task's file), but worth someone's attention if it recurs.
+
+`redemptions_enabled` gated in front of auth in BOTH handlers (not just validation) — a disabled
+route 503s the same way regardless of whether the caller's JWT would otherwise have been valid, so
+there's no behavioral asymmetry between the two routes to notice or exploit.

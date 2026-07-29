@@ -25,6 +25,11 @@ async-trait = "0.1"
 # Cargo.lock via secp256k1's "rand" feature in clutch-chain, so this direct dep adds
 # no new version to pin.
 rand = "0.8"
+# Tron address validation (Plan C T6): base58check decode with the built-in double-SHA256
+# checksum verification ("check" feature) — a shape regex ("T…, 34 chars") passes a single
+# mistyped character; only the checksum catches it. Small, focused dep beats hand-rolling
+# base58 + double-SHA256 to avoid adding it.
+bs58 = { version = "0.5", features = ["check"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

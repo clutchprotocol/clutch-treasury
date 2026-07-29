@@ -5,5 +5,6 @@ pub mod auth;
 pub mod configuration;
 pub mod deposits;
 pub mod poller;
+pub mod redemptions;
 pub mod treasury_bridge;
 pub mod webhook;

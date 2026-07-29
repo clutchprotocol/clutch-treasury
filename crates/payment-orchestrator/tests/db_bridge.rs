@@ -54,6 +54,11 @@ fn test_config(treasury_url: String) -> OrchConfig {
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
         poll_interval_secs: 30,
+        // This file never exercises the redemption routes (Plan C T6) — off by default,
+        // same as production, and unused otherwise.
+        redemptions_enabled: false,
+        min_redemption_clt: 1_000_000,
+        max_redemption_clt: 50_000_000,
     }
 }
 

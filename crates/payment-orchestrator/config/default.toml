@@ -13,3 +13,8 @@ deposit_ttl_minutes = 30
 min_deposit_usdt = 1000000
 max_deposit_usdt = 50000000
 poll_interval_secs = 30
+# Plan C T6: stays false until a real TRC-20 payout rail replaces treasury-service's
+# payout::StubRail — see OrchConfig::redemptions_enabled doc comment.
+redemptions_enabled = false
+min_redemption_clt = 1000000
+max_redemption_clt = 50000000
