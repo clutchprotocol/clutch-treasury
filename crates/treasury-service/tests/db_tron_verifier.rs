@@ -126,8 +126,16 @@ fn trc20_transfer_json_at(
     value: &str,
     block_timestamp: i64,
 ) -> serde_json::Value {
-    json!({"transaction_id": tx_id, "to": to, "value": value,
+    json!({"transaction_id": tx_id, "to": to, "value": value, "type": "Transfer",
            "token_info": {"address": contract}, "block_timestamp": block_timestamp})
+}
+
+/// A non-Transfer TRC-20 event (e.g. `Approval`) carries a `value` and a `to` but moves no
+/// tokens — the verifier must not accept one as evidence.
+fn trc20_event_json(tx_id: &str, to: &str, contract: &str, value: &str, event_type: &str) -> serde_json::Value {
+    json!({"transaction_id": tx_id, "to": to, "value": value, "type": event_type,
+           "token_info": {"address": contract},
+           "block_timestamp": chrono::Utc::now().timestamp_millis()})
 }
 
 async fn mount_trc20_list(server: &MockServer, transfers: Vec<serde_json::Value>) {
@@ -272,6 +280,39 @@ async fn fallback_must_not_claim_a_transfer_older_than_the_match_window() {
     let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
     assert_eq!(approved, 0, "a transfer older than the window must not be claimed");
     assert_eq!(status_of(&pool, id).await, "created");
+}
+
+/// An `Approval` event to the custody address for exactly the expected amount must not back a
+/// mint. It carries a `to` and a `value` like a Transfer does, but no tokens moved — approving on
+/// one would mint CLT against a deposit that never arrived. Verified against a live TronGrid
+/// response that `type` is present and carries the event kind.
+#[tokio::test]
+async fn approval_event_never_backs_a_mint() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(
+        &server,
+        vec![trc20_event_json("tx-approval", CUSTODY, USDT, "6000088", "Approval")],
+    )
+    .await;
+    mount_transaction_confirmed(&server, "tx-approval", true).await;
+    let config = test_config(server.uri());
+
+    // Both paths: the known-hash path rejects it outright as hard evidence...
+    let known = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval", Some("tx-approval")).await;
+    // ...and the fallback path must not select it at all.
+    let fallback = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval-fb", None).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 0, "an Approval event must never approve a mint");
+    assert_eq!(status_of(&pool, known).await, "rejected", "a named Approval tx is hard evidence, not transient");
+    assert_eq!(status_of(&pool, fallback).await, "created", "the fallback must not select a non-Transfer event");
+
+    let (events,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM treasury_events WHERE kind = 'custody_deposit'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0, "no custody may be ledgered from an event that moved no tokens");
 }
 
 /// Wrong recipient: a confirmed transfer of the right amount and token, but to some other

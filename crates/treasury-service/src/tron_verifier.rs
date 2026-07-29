@@ -11,9 +11,11 @@
 //! `created` so the next poll tick retries it; never reject on an outage. Conflating these
 //! either mints unbacked CLT or throws away a real user's real money.
 //!
-//! TronGrid endpoint shapes below are ASSUMED from the plan doc and TronGrid's public,
-//! widely-documented v1 API, NOT verified against a live call — flagged in the report per the
-//! brief's instruction. The two calls:
+//! TronGrid shapes for the trc20 list are VERIFIED against a live call to
+//! `api.trongrid.io` (T7): `transaction_id`, `to`, `value` (decimal STRING in base units),
+//! `token_info.address`, `type`, and `block_timestamp` (epoch MILLISECONDS) all confirmed
+//! present with those exact names. `/v1/transactions/{id}`'s `confirmed` flag is still assumed.
+//! The two calls:
 //!   - `GET /v1/accounts/{address}/transactions/trc20?only_confirmed=true&contract_address={c}`
 //!     — TRC-20 transfer history for the custody address. Used for BOTH the has-tx_id path
 //!     (find and validate this specific transfer) and the fallback path (find any transfer
@@ -29,20 +31,25 @@ use uuid::Uuid;
 use crate::configuration::AppConfig;
 use crate::ledger::alert;
 
-/// A single TRC-20 transfer as TronGrid's trc20 endpoint reports it. Field names ASSUMED per
-/// TronGrid's public v1 docs (`transaction_id`, `token_info.address`, `to`, `value` as a
-/// decimal STRING in the token's base unit — USDT-TRC20 is 6 decimals, same scale as CLT at
-/// par, so `value` parses directly as micro-USDT with no rate conversion). Never verified
-/// against a live TronGrid call.
+/// A single TRC-20 transfer as TronGrid's trc20 endpoint reports it. Field names VERIFIED
+/// against a live response (T7), not inferred: `value` really is a decimal STRING in the
+/// token's base unit — USDT-TRC20 is 6 decimals, the same scale as CLT at par, so it parses
+/// directly as micro-USDT with no rate conversion.
 #[derive(Debug, Deserialize)]
 struct Trc20Transfer {
     transaction_id: String,
     to: String,
     value: String,
     token_info: TokenInfo,
-    /// ASSUMED: TronGrid's trc20 list returns this as epoch milliseconds. Only the fallback
-    /// match reads it, to bound how far back an unclaimed transfer can be swept up; a missing
-    /// field defaults to 0, which puts the transfer outside every window and so fails closed.
+    /// The TRC-20 event kind. Only `"Transfer"` moves value — an `Approval` event carries a
+    /// `value` and a `to` as well, so without this check one could satisfy the amount match
+    /// without a single token having moved. Empty (missing field) fails the check, closed.
+    #[serde(default, rename = "type")]
+    event_type: String,
+    /// VERIFIED against the live endpoint: epoch MILLISECONDS (e.g. 1785358407000), which is what
+    /// the fallback window compares against via `timestamp_millis()`. Only the fallback reads it,
+    /// to bound how far back an unclaimed transfer can be swept up; a missing field defaults to 0,
+    /// which puts the transfer outside every window and so fails closed.
     #[serde(default)]
     block_timestamp: i64,
 }
@@ -86,7 +93,16 @@ impl TronClient {
             .http
             .get(&url)
             .header("TRON-PRO-API-KEY", &self.api_key)
-            .query(&[("only_confirmed", "true"), ("contract_address", usdt_contract)])
+            .query(&[
+                ("only_confirmed", "true"),
+                ("contract_address", usdt_contract),
+                // TronGrid defaults `limit` to 20 (max 200). Leaving it unset meant a custody
+                // address with more than 20 recent USDT transfers could push a legitimate
+                // deposit off the only page we look at — the intent would then never find its
+                // evidence, stay Transient forever, and age into manual review. Verified against
+                // the live endpoint's documented parameters.
+                ("limit", TRC20_PAGE_LIMIT),
+            ])
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -96,6 +112,15 @@ impl TronClient {
             return Err(format!("trongrid trc20 list failed: {status} {text}"));
         }
         let parsed: Trc20TransfersResponse = resp.json().await.map_err(|e| e.to_string())?;
+        // ponytail: single page only. If it comes back FULL we may be truncating, so say so
+        // rather than let a missed deposit look like "not on chain yet". Paginating via
+        // `meta.links.next` is the fix if a busy custody address ever makes this routine.
+        if parsed.data.len() >= TRC20_PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX) {
+            tracing::warn!(
+                "trongrid trc20 list returned a full page ({TRC20_PAGE_LIMIT}) for {custody_address} — \
+                 older transfers in the window may be truncated; consider paginating"
+            );
+        }
         Ok(parsed.data)
     }
 
@@ -161,6 +186,12 @@ impl TronClient {
     }
 }
 
+/// TronGrid caps `limit` at 200 and defaults it to 20. Ask for the max.
+const TRC20_PAGE_LIMIT: &str = "200";
+
+/// Only this TRC-20 event kind actually moves value.
+const TRC20_TRANSFER_EVENT: &str = "Transfer";
+
 /// Why a hard mismatch rejects and a transient failure never does (module doc's central
 /// distinction, made into a type so the worker can't blur the two in a match arm).
 #[derive(Debug)]
@@ -193,7 +224,14 @@ fn check_transfer(
     let contract_ok = transfer.token_info.address == usdt_contract;
     let observed_amount: i64 = transfer.value.parse().unwrap_or(0);
     let amount_ok = observed_amount >= expected_amount_usdt;
+    let is_transfer = transfer.event_type == TRC20_TRANSFER_EVENT;
 
+    if !is_transfer {
+        return Err(format!(
+            "transfer {} is a '{}' event, not a {TRC20_TRANSFER_EVENT} — no value moved",
+            transfer.transaction_id, transfer.event_type
+        ));
+    }
     if !recipient_ok {
         return Err(format!("transfer {} recipient '{}' != custody '{custody_tron_address}'", transfer.transaction_id, transfer.to));
     }
@@ -292,7 +330,8 @@ async fn evaluate(
             let window = chrono::Duration::hours(config.deposit_match_window_hours);
             let earliest_ms = (intent.created_at - window).timestamp_millis();
             let candidate = transfers.iter().find(|t| {
-                t.to == config.custody_tron_address
+                t.event_type == TRC20_TRANSFER_EVENT
+                    && t.to == config.custody_tron_address
                     && t.token_info.address == config.usdt_contract
                     && t.value.parse::<i64>().ok() == Some(expected_amount_usdt)
                     && t.block_timestamp >= earliest_ms
@@ -543,10 +582,29 @@ mod tests {
             to: to.to_string(),
             value: value.to_string(),
             token_info: TokenInfo { address: contract.to_string() },
+            event_type: TRC20_TRANSFER_EVENT.to_string(),
             // Only the fallback match reads this; these unit tests exercise check_transfer,
             // which is the known-hash path.
             block_timestamp: 0,
         }
+    }
+
+    /// An `Approval` event carries a `value` and a `to` just like a Transfer does, but moves no
+    /// tokens. Accepting one would approve a mint against a deposit that never arrived.
+    #[test]
+    fn approval_event_is_rejected_even_with_perfect_recipient_token_and_amount() {
+        let mut t = transfer(CUSTODY, USDT, "1000000");
+        t.event_type = "Approval".to_string();
+        let err = check_transfer(&t, true, CUSTODY, USDT, 1_000_000).expect_err("an Approval must not pass");
+        assert!(err.contains("Approval"), "the rejection must name the event kind, got: {err}");
+    }
+
+    /// A missing `type` must fail closed rather than being treated as a Transfer.
+    #[test]
+    fn absent_event_type_is_rejected() {
+        let mut t = transfer(CUSTODY, USDT, "1000000");
+        t.event_type = String::new();
+        assert!(check_transfer(&t, true, CUSTODY, USDT, 1_000_000).is_err(), "an absent type must fail closed");
     }
 
     const CUSTODY: &str = "TCustodyAddressXXXXXXXXXXXXXXXXXXX";

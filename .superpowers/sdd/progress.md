@@ -554,3 +554,46 @@ rather than shrugging at — db_bridge covers the deposit->mint boundary, and a 
 signal on exactly the path three Criticals already came from. Candidate cause to check first: the
 alert-threshold tests drive run_once repeatedly and rewrite next_attempt_at, so a shared-clock/
 ordering assumption is the likeliest culprit.
+
+## UPDATE: T6 review fix + flake root-caused and FIXED — cacc6d2 pushed. 15/15 consecutive clean runs.
+Docker was restarted by the user; both items above are now verified and landed.
+
+Live redemption status: as described above. Mutation-checked by forcing fetch_treasury_status to
+return None — get_redemption_reports_live_treasury_status_not_the_creation_snapshot fails ("created"
+vs "paid"). db_redemptions now 12/12.
+
+### THE FLAKE HAD TWO INDEPENDENT REAL CAUSES — neither was "just a flaky test"
+Chased it properly instead of re-running until green. It moved between tests run to run, which was
+the clue that it was environmental rather than one bad assertion.
+
+CAUSE 1 — every test BINARY shared one database and TRUNCATEd it on every test.
+`--test-threads=1` only serialises tests WITHIN a binary; **cargo runs test binaries in PARALLEL**.
+So 5 orchestrator binaries were wiping each other's rows mid-test, and 6 treasury binaries likewise.
+EVERY green run before this was luck. Each binary now derives its own database (_orch_* / _tre_*),
+and the treasury files gained the create-if-absent logic the orchestrator ones already had.
+- This is worth remembering as a general fact about this repo's rig, not a one-off.
+
+CAUSE 2 — the fixture sat on a timestamp boundary.
+`next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()` and `due_for_mint_request` filters on
+`next_attempt_at <= now()`. A freshly seeded row therefore sits EXACTLY on that boundary and depends
+on the clock advancing between the INSERT and the SELECT. Under Docker Desktop on Windows it
+sometimes does not (VM clock steps), the row is silently skipped, the deposit never leaves
+`confirmed`, and the failure surfaces far from the cause. Fixtures now backdate by an hour.
+- The production `DEFAULT now()` is CORRECT and unchanged — a new row should be due immediately.
+  This was purely test determinism. Real-world impact of a backward clock step is one delayed tick,
+  self-correcting; not a money bug, so no production change made.
+- Also made the alert-threshold test assert `attempts` per tick, so a skipped tick now fails naming
+  the real cause instead of surfacing as a wrong page count. That is what turned a confusing
+  alert-count mismatch into an obvious "row wasn't selected as due".
+
+VERIFICATION: full workspace suite, 15 consecutive runs, 0 failures (was 1-in-6 to 1-in-8). One
+passing run would have proved nothing here — that is the whole lesson.
+
+### Plan C status: T1-T6 all COMPLETE and pushed. Only T7 remains.
+T7 must still: deploy wiring + Dockerfiles + compose fragment; pinned Bitcart doc (0.10.3.0,
+trx-only, watch-only); manual smoke; AND close the two standing verification debts —
+(a) Bitcart field names (payments[].tx_hash, expiration, payment_address, expiration_seconds),
+(b) TronGrid field names INCLUDING block_timestamp, which the T5a fallback window now depends on
+    (missing field defaults to 0 = outside every window = fails closed, so a wrong name degrades to
+    "fallback never matches" rather than a bad approval).
+Also confirm usdt_contract's network before any non-test deploy — the default is real MAINNET USDT.

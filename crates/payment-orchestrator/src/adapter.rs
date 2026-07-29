@@ -77,29 +77,35 @@ pub struct BitcartAdapter {
     pub deposit_ttl_minutes: i64,
 }
 
-/// Bitcart 0.10.x invoice response shape (pinned; re-verify against the deployed instance's
-/// Swagger per docs/bitcart.md before going live). Fields this adapter doesn't read are left
-/// off rather than modeled — `#[serde(default)]` / `Option` everywhere else so an unexpected
-/// absence deserializes instead of hard-failing.
+/// Bitcart invoice response shape, VERIFIED against `api/schemas/invoices.py`'s `DisplayInvoice`
+/// and `api/models.py` at tag `0.10.3.0` (not assumed — three of these field names were wrong
+/// before that check; see docs/bitcart.md).
+///
+/// Fields this adapter doesn't read are left off rather than modeled, and everything optional is
+/// `#[serde(default)]` so an unexpected absence deserializes instead of hard-failing.
 #[derive(Debug, Deserialize)]
 struct BitcartInvoice {
     id: String,
     status: String,
     #[serde(default)]
     exception_status: Option<String>,
+    /// `DisplayInvoice.payments` — each entry is `PaymentMethod::to_payment_dict`, i.e. every
+    /// PaymentMethod column. `payment_address` lives HERE, per-method; there is no top-level one.
     #[serde(default)]
     payments: Vec<BitcartPayment>,
-    // Present on create; not needed on get_invoice, but harmless to ignore if absent.
+    /// `DisplayInvoice.tx_hashes` — top-level, PLURAL, and an array. PaymentMethod has no
+    /// `tx_hash` column at all, so this is the only place an on-chain hash appears.
     #[serde(default)]
-    payment_address: Option<String>,
+    tx_hashes: Vec<String>,
     #[serde(default)]
     expiration_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BitcartPayment {
+    /// A `PaymentMethod` column, surfaced through `to_payment_dict`.
     #[serde(default)]
-    tx_hash: Option<String>,
+    payment_address: Option<String>,
 }
 
 #[async_trait]
@@ -115,11 +121,13 @@ impl PaymentAdapter for BitcartAdapter {
             "store_id": self.store_id,
             "order_id": order_id,
             "notification_url": notification_url,
-            // Explicit expiration in seconds, matching deposit_ttl_minutes — Bitcart's own
-            // default window must not diverge from our advertised pay-in window (see struct
-            // doc comment). Field name per the brief; pin against the deployed instance's
-            // Swagger in docs/bitcart.md (T7) before going live.
-            "expiration": self.deposit_ttl_minutes * 60,
+            // MINUTES, not seconds. Verified against 0.10.3.0: `CreateInvoice.expiration: int`
+            // and `Invoice.expiration_seconds` is a property returning `expiration * 60`.
+            // Sending seconds here made a 30-minute window into 30 HOURS — Bitcart would keep
+            // matching payments to a dead invoice long after our own expires_at, and hold the
+            // discriminator slot 60x longer than intended (slots only free on Bitcart
+            // terminality, and there are 999 per base amount).
+            "expiration": self.deposit_ttl_minutes,
         });
 
         let resp = self
@@ -138,9 +146,15 @@ impl PaymentAdapter for BitcartAdapter {
         }
 
         let invoice: BitcartInvoice = resp.json().await.map_err(|e| e.to_string())?;
+        // `payment_address` is per-payment-method, never top-level. With `BITCART_CRYPTOS=trx`
+        // there is exactly one method, so the first entry is the Tron custody address — but take
+        // it explicitly rather than assuming, and fail closed if the list is empty: no address
+        // means we have nothing to tell the user to pay, and inventing one loses their money.
         let pay_address = invoice
-            .payment_address
-            .ok_or_else(|| "bitcart response missing payment_address".to_string())?;
+            .payments
+            .into_iter()
+            .find_map(|p| p.payment_address)
+            .ok_or_else(|| "bitcart response had no payments[].payment_address".to_string())?;
 
         Ok(PaymentInstructions {
             invoice_id: invoice.id,
@@ -170,7 +184,16 @@ impl PaymentAdapter for BitcartAdapter {
         }
 
         let invoice: BitcartInvoice = resp.json().await.map_err(|e| e.to_string())?;
-        let tron_tx_id = invoice.payments.iter().find_map(|p| p.tx_hash.clone());
+        // Top-level `tx_hashes`, not `payments[].tx_hash` (PaymentMethod has no such column).
+        // Only take it when there is exactly ONE: with trx-only there is one payment method, so
+        // several hashes means several transfers landed against this invoice, and picking one
+        // would hand the verifier a hash that doesn't account for the full amount. Leaving it
+        // None routes the deposit through T5a's exact-amount fallback instead, which is the
+        // conservative path and alerts.
+        let tron_tx_id = match invoice.tx_hashes.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
 
         Ok(InvoiceStatus {
             state: map_status(&invoice.status, invoice.exception_status.as_deref()),
