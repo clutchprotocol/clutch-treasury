@@ -63,9 +63,13 @@ async fn create_deposit_handler(
 
     let mut resp_headers = HeaderMap::new();
     let (status, payload) = match outcome {
-        DepositOutcome::Respond { status, body } => {
-            (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), body)
-        }
+        // Fall back to 500, not 200: an unparseable stored status is a bug in whatever
+        // wrote it, and replaying it as success would tell the client their deposit is
+        // fine on the strength of a value we couldn't read.
+        DepositOutcome::Respond { status, body } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body,
+        ),
         DepositOutcome::Conflict => (StatusCode::CONFLICT, json!({"error": "idempotency key already used with a different request body"})),
         DepositOutcome::StillProcessing => {
             resp_headers.insert("retry-after", "2".parse().unwrap());

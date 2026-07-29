@@ -152,45 +152,27 @@ pub async fn create(
             Ok(CreateOutcome::Replay { status: *status, body: body.clone() })
         }
         _ => {
-            // response_body IS NULL: a previous attempt crashed mid-flow. It may have
-            // already created a Bitcart invoice we never recorded — reusing its
-            // pay_amount_usdt would risk two live invoices sharing one amount on the
-            // shared custody address, exactly what the discriminator exists to prevent.
-            // Take a fresh slot (full shuffled retry, same savepoint pattern as a brand
-            // new insert) and let the orphan expire.
-            let mut shuffled: Vec<i64> = (1..=DISCRIMINATOR_RANGE_END).collect();
-            shuffled.shuffle(&mut rand::thread_rng());
-
-            for d in shuffled {
-                let candidate = amount_usdt + d;
-                let mut attempt = tx.begin().await?;
-                let row = sqlx::query_as::<_, DepositIntent>(&format!(
-                    "UPDATE deposit_intents SET pay_amount_usdt = $1, updated_at = now()
-                     WHERE id = $2 RETURNING {INTENT_COLS}"
-                ))
-                .bind(candidate)
-                .bind(intent.id)
-                .fetch_one(&mut *attempt)
-                .await;
-
-                match row {
-                    Ok(resumed) => {
-                        attempt.commit().await?;
-                        tx.commit().await?;
-                        return Ok(CreateOutcome::Created(resumed));
-                    }
-                    // This UPDATE targets a single row by primary key (`id`), so it can
-                    // only ever collide with uq_active_pay_amount — the identity
-                    // constraint doesn't reference `id` and `id` isn't changing.
-                    Err(e) if unique_violation_constraint(&e).is_some() => {
-                        attempt.rollback().await?;
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            // response_body IS NULL: a previous attempt died between `create` and
+            // `store_invoice` (a crash, or an adapter error/timeout where Bitcart may
+            // still have created the invoice). Resume on the SAME pay_amount_usdt.
+            //
+            // Reusing the amount is what keeps this safe, not what makes it risky. This
+            // row is the only holder of that slot under uq_active_pay_amount, and the
+            // schema's invariant is that a slot stays reserved until Bitcart itself can
+            // no longer match a payment to it. Moving the row to a fresh slot would
+            // release the old amount while a possibly-live orphan invoice still carries
+            // it, letting a LATER, DIFFERENT intent be allocated that amount — the
+            // cross-user misattribution on the shared static custody address that the
+            // discriminator exists to prevent.
+            //
+            // Two live invoices at one amount for THIS SAME intent is not that hazard:
+            // both carry this intent's order_id, this user, this credit, and whichever
+            // one Bitcart matches, `store_invoice`'s compare-and-set plus the per-invoice
+            // webhook event key still credit exactly once. A second genuine payment at
+            // the same amount strands on the `transition` guards and lands in
+            // needs_manual — funds held and flagged, never paid to a stranger.
             tx.rollback().await?;
-            Err(ApiError::NoDiscriminatorSlot)
+            Ok(CreateOutcome::Created(intent))
         }
     }
 }

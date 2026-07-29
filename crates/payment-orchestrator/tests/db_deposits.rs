@@ -117,12 +117,17 @@ async fn same_key_different_body_is_conflict() {
     assert!(matches!(outcome2, CreateOutcome::Conflict));
 }
 
-/// Row with response_body IS NULL simulates a crash between INSERT and store_invoice.
-/// Resume must allocate a FRESH discriminator, never reuse the orphaned pay_amount_usdt —
-/// reusing it would let a second live invoice share an amount with the (possibly still
-/// live on Bitcart's side) orphan.
+/// Row with response_body IS NULL simulates dying between INSERT and store_invoice — a
+/// crash, or an adapter timeout where Bitcart may still hold a LIVE invoice at this
+/// amount that we never recorded the id of.
+///
+/// Resume must keep the SAME pay_amount_usdt. Moving to a fresh discriminator would
+/// release the old amount while that orphan invoice is still live, and the amount is the
+/// only thing Bitcart can match a payment by on the shared static custody address — so a
+/// later, DIFFERENT user allocated that amount would collide with a stranger's invoice.
+/// The second assertion is the one that matters: the slot stays reserved.
 #[tokio::test]
-async fn crash_resume_allocates_fresh_discriminator_not_the_orphan_amount() {
+async fn crash_resume_keeps_orphan_amount_reserved_against_other_users() {
     let pool = pool().await;
     let cfg = test_config();
     let key = "idem-key-3";
@@ -140,23 +145,29 @@ async fn crash_resume_allocates_fresh_discriminator_not_the_orphan_amount() {
         panic!("expected Created (resume) on NULL response_body, got {outcome:?}");
     };
     assert_eq!(resumed.id, first.id, "resume continues the SAME intent row, not a new one");
-    assert_ne!(
+    assert_eq!(
         resumed.pay_amount_usdt, orphan_amount,
-        "resume must allocate a fresh discriminator, never reuse the orphaned amount"
+        "resume must keep the orphan's amount reserved, not move to a fresh discriminator"
     );
 
-    // The orphan amount is now free (it was never anyone else's) — a DIFFERENT user can
-    // legitimately claim it. This is just confirming no lingering row still holds it,
-    // not that reuse across the SAME crash is fine.
-    let (still_reserved,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM deposit_intents WHERE pay_amount_usdt = $1
-         AND status IN ('created','invoiced','paying','expired') AND NOT bitcart_terminal",
+    // The property with the money in it: a DIFFERENT user must not be able to claim the
+    // amount a possibly-live orphan invoice still carries. Insert directly, so this tests
+    // uq_active_pay_amount itself rather than the allocator's willingness to pick it.
+    let err = sqlx::query(
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
+         VALUES ($1, 'other-user-pk', 'clt2address', 2000000, $2, 2000000, 'other-key', now() + interval '1 hour')",
     )
+    .bind(Uuid::new_v4())
     .bind(orphan_amount)
-    .fetch_one(&pool)
+    .execute(&pool)
     .await
-    .unwrap();
-    assert_eq!(still_reserved, 0, "orphan amount must not still be held by the resumed row");
+    .expect_err("a second user must not be able to claim the orphan's amount");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.constraint()),
+        Some("uq_active_pay_amount"),
+        "rejection must come from the discriminator index, not some incidental constraint"
+    );
 }
 
 /// Idempotency layer 4: two writers race to store an invoice_id on the SAME intent row.
