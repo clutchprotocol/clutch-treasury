@@ -18,7 +18,14 @@ services:
       - treasury-cargo-cache:/usr/local/cargo/registry
       - treasury-target-cache:/app/target
     environment:
+      # Both spellings are required and they are NOT redundant: integration tests read the plain
+      # DATABASE_URL via std::env::var, while AppConfig only sees APP_-prefixed vars (the `config`
+      # crate's Environment prefix). Setting only one produces a confusing failure in whichever
+      # half you forgot — the service can't connect, or every DB test panics on a missing var.
       DATABASE_URL: postgres://postgres:postgres@test-postgres:5432/treasury_test
+      APP_DATABASE_URL: postgres://postgres:postgres@test-postgres:5432/treasury_test
+      # The already-public node1 dev key — the one carve-out to this repo's env-only secret rule,
+      # scoped to the test rig. Never a real mint key.
       APP_MINT_AUTHORITY_SECRET: "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509"
       APP_INITIATOR_TOKEN: test-initiator
       APP_APPROVER_TOKEN: test-approver
