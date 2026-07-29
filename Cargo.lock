@@ -1487,6 +1487,7 @@ dependencies = [
  "dotenv",
  "hex",
  "jsonwebtoken",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",
