@@ -4,6 +4,8 @@ use clutch_chain::node_client::NodeClient;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::ledger::alert;
+
 /// Idempotent credit: the unique (intent_id, kind) index on treasury_events makes the
 /// ledger write exactly-once; ON CONFLICT DO NOTHING absorbs watcher replays.
 pub async fn credit_mint(
@@ -43,6 +45,82 @@ pub async fn credit_mint(
         .await
         .map_err(|e| e.to_string())?;
     db.commit().await.map_err(|e| e.to_string())
+}
+
+/// Matches a confirmed Burn to a `created` redemption intent by `redemption_ref`, then
+/// requires amount AND sender to agree before anything is paid (dossier §9 security
+/// boundary — a ref alone is not authorisation, since pending refs are visible in the
+/// mempool before inclusion). All three must match: ref, amount, sender.
+///
+/// - Ref matches, amount+sender match -> `burn_confirmed` + `payout_pending`, one
+///   `burn_redeemed` ledger event (idempotent via the same unique (intent_id, kind) index
+///   T6 established for `mint_executed` — ON CONFLICT DO NOTHING absorbs replays).
+/// - Ref matches, amount OR sender wrong -> `failed` + P1 alert. This is not a near-miss:
+///   someone burned against our ref with the wrong details, and paying out on it is exactly
+///   the loss this check exists to prevent. Never pay on a mismatched burn.
+/// - No intent for that ref (unknown ref, already-terminal intent, or a ref-less plain
+///   burn never reaches this function at all — see the watcher's Burn arm) -> no-op.
+///
+/// Status-guarded (`WHERE status = 'created'`) so a second delivery of the same confirmed
+/// burn (restart, reorg, cursor replay) is a no-op update, not a repeat transition.
+pub async fn confirm_burn(
+    pool: &PgPool,
+    redemption_ref: &str,
+    sender: &str,
+    amount_clt: i64,
+    burn_tx_hash: &str,
+) -> Result<(), String> {
+    let intent: Option<(Uuid, String, i64)> = sqlx::query_as(
+        "SELECT id, redeemer_address, amount_clt FROM redemption_intents
+         WHERE redemption_ref = $1 AND status = 'created'",
+    )
+    .bind(redemption_ref)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some((intent_id, redeemer_address, expected_amount)) = intent else {
+        return Ok(()); // Unknown ref or already past `created` — not this function's concern.
+    };
+
+    if redeemer_address != sender || expected_amount != amount_clt {
+        let r = format!(
+            "redemption {intent_id}: burn on ref '{redemption_ref}' mismatched \
+             (expected sender={redeemer_address} amount={expected_amount}, \
+             got sender={sender} amount={amount_clt}, tx={burn_tx_hash}) — failing intent, never paying out"
+        );
+        sqlx::query("UPDATE redemption_intents SET status = 'failed', updated_at = now() WHERE id = $1")
+            .bind(intent_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        alert(pool, "p1", "watcher", &r).await;
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO treasury_events (kind, amount_clt, amount_usdt, intent_id, chain_tx_hash, description)
+         VALUES ('burn_redeemed', $1, 0, $2, $3, 'burn confirmed on-chain')
+         ON CONFLICT (intent_id, kind) WHERE intent_id IS NOT NULL DO NOTHING",
+    )
+    .bind(amount_clt)
+    .bind(intent_id)
+    .bind(burn_tx_hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE redemption_intents
+         SET status = 'payout_pending', burn_tx_hash = $2, updated_at = now()
+         WHERE id = $1 AND status = 'created'",
+    )
+    .bind(intent_id)
+    .bind(burn_tx_hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 /// Processes confirmed blocks since the cursor, crediting Mints by `credit_ref` — never by
@@ -87,27 +165,54 @@ pub async fn poll_once(pool: &PgPool, node: &Arc<NodeClient>, confirmations: u64
         let txs = block.get("transactions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         for tx in &txs {
             let function_call_type = tx.get("data").and_then(|d| d.get("function_call_type")).and_then(|v| v.as_str());
-            if function_call_type != Some("Mint") {
-                continue; // Burn txs handled in Task 7.
-            }
-            let credit_ref = tx
-                .get("data")
-                .and_then(|d| d.get("arguments"))
-                .and_then(|a| a.get("credit_ref"))
-                .and_then(|v| v.as_str());
-            let Some(credit_ref) = credit_ref else { continue };
             let tx_hash = tx.get("hash").and_then(|v| v.as_str()).unwrap_or_default();
 
-            let intent: Option<(Uuid, i64)> = sqlx::query_as(
-                "SELECT id, amount_clt FROM mint_intents WHERE credit_ref = $1 AND status <> 'credited'",
-            )
-            .bind(credit_ref)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+            match function_call_type {
+                Some("Mint") => {
+                    let credit_ref = tx
+                        .get("data")
+                        .and_then(|d| d.get("arguments"))
+                        .and_then(|a| a.get("credit_ref"))
+                        .and_then(|v| v.as_str());
+                    let Some(credit_ref) = credit_ref else { continue };
 
-            if let Some((intent_id, amount_clt)) = intent {
-                credit_mint(pool, intent_id, amount_clt, tx_hash).await?;
+                    let intent: Option<(Uuid, i64)> = sqlx::query_as(
+                        "SELECT id, amount_clt FROM mint_intents WHERE credit_ref = $1 AND status <> 'credited'",
+                    )
+                    .bind(credit_ref)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    if let Some((intent_id, amount_clt)) = intent {
+                        credit_mint(pool, intent_id, amount_clt, tx_hash).await?;
+                    }
+                }
+                Some("Burn") => {
+                    // Field names read off clutch-node's actual JSON, not assumed: `Burn` (burn.rs)
+                    // serializes as `{amount: u64, redemption_ref: Option<String>}`, nested under
+                    // `FunctionCall`'s `#[serde(tag = "function_call_type", content = "arguments")]`
+                    // (function_call.rs) — same `arguments` envelope Mint uses. Sender is
+                    // `Transaction.from` (transaction.rs), plain field, no rename.
+                    let redemption_ref = tx
+                        .get("data")
+                        .and_then(|d| d.get("arguments"))
+                        .and_then(|a| a.get("redemption_ref"))
+                        .and_then(|v| v.as_str());
+                    // A ref-less burn is a legal plain destruction of CLT, not a redemption —
+                    // ignore it, do not treat absence as a mismatch.
+                    let Some(redemption_ref) = redemption_ref else { continue };
+                    let amount_clt = tx
+                        .get("data")
+                        .and_then(|d| d.get("arguments"))
+                        .and_then(|a| a.get("amount"))
+                        .and_then(|v| v.as_i64());
+                    let Some(amount_clt) = amount_clt else { continue };
+                    let sender = tx.get("from").and_then(|v| v.as_str()).unwrap_or_default();
+
+                    confirm_burn(pool, redemption_ref, sender, amount_clt, tx_hash).await?;
+                }
+                _ => continue,
             }
         }
 

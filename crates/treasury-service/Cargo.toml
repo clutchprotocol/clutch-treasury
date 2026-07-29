@@ -13,6 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 clutch-chain = { path = "../clutch-chain" }
+# Needed for `dyn PayoutRail` — native async-fn-in-traits is not dyn-compatible on stable
+# Rust; this is the standard one-annotation way to box the future instead of hand-writing
+# `Pin<Box<dyn Future<...>>>` signatures. Same trait-object shape as `ChainSigner`, which
+# stays sync and needs no boxing — PayoutRail's brief-specified signature is async.
+async-trait = "0.1"
 axum = { version = "0.7.5", features = ["macros"] }
 config = "0.14.0"
 dotenv = "0.15"

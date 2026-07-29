@@ -116,6 +116,37 @@ async fn approve_mint_intent_handler(
 }
 
 #[derive(Deserialize)]
+struct CreateRedemptionIntentBody {
+    redeemer_address: String,
+    payout_address: String,
+    amount_clt: i64,
+}
+
+/// Initiator only, same role shape as mint-intents — the orchestrator/SDK takes the
+/// returned `redemption_ref` and puts it in the user's on-chain Burn tx. The intent starts
+/// `created`; `watcher::confirm_burn` is the only path that advances it, once a matching
+/// on-chain burn is confirmed.
+async fn create_redemption_intent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateRedemptionIntentBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let role = caller_role(&headers, &state.config)?;
+    if role != Role::Initiator {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let intent = intents::create_redemption_intent(
+        &state.pool,
+        &body.redeemer_address,
+        &body.payout_address,
+        body.amount_clt,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(redemption_intent_json(&intent))))
+}
+
+#[derive(Deserialize)]
 struct HaltBody {
     reason: String,
 }
@@ -292,12 +323,25 @@ fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
     })
 }
 
+fn redemption_intent_json(intent: &intents::RedemptionIntent) -> serde_json::Value {
+    json!({
+        "id": intent.id,
+        "redeemer_address": intent.redeemer_address,
+        "payout_address": intent.payout_address,
+        "amount_clt": intent.amount_clt,
+        "status": intent.status,
+        "redemption_ref": intent.redemption_ref,
+        "burn_tx_hash": intent.burn_tx_hash,
+    })
+}
+
 pub fn router(pool: PgPool, config: AppConfig) -> Router {
     let state = AppState { pool, config };
     Router::new()
         .route("/health", get(health))
         .route("/internal/mint-intents", post(create_mint_intent_handler))
         .route("/internal/mint-intents/:id/approve", post(approve_mint_intent_handler))
+        .route("/internal/redemption-intents", post(create_redemption_intent_handler))
         .route("/internal/halt", post(halt_handler))
         .route("/internal/resume", post(resume_handler))
         .route("/internal/custody-deposits", post(custody_deposits_handler))

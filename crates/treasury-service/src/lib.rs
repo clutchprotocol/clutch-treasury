@@ -4,5 +4,6 @@ pub mod configuration;
 pub mod ledger;
 pub mod intents;
 pub mod outbox;
+pub mod payout;
 pub mod reconciliation;
 pub mod watcher;

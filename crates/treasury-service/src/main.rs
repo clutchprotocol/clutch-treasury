@@ -66,6 +66,24 @@ async fn main() {
             }
         });
     }
+    {
+        // StubRail only — the real Tron rail is Plan C follow-on (docs/keys.md: the payout
+        // key doesn't exist yet). Same poll cadence as the mint outbox/watcher; no dedicated
+        // interval justified for a stub.
+        let pool = pool.clone();
+        let rail = treasury_service::payout::StubRail;
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            loop {
+                match treasury_service::payout::drain_once(&pool, &rail).await {
+                    Ok(n) if n > 0 => tracing::info!("payout: paid {} redemption(s)", n),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("payout drain failed: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
+            }
+        });
+    }
 
     let app = api::router(pool.clone(), config.clone());
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
