@@ -30,6 +30,9 @@ services:
       APP_INITIATOR_TOKEN: test-initiator
       APP_APPROVER_TOKEN: test-approver
       APP_READONLY_TOKEN: test-readonly
+      # Plan C T5's TronGrid verifier — wiremock stands in for the real TronGrid host in
+      # tests, but AppConfig::load still panics on an empty key regardless.
+      APP_TRONGRID_API_KEY: test-trongrid-key
       # payment-orchestrator's own secrets, same test rig, same rule: OrchConfig::load
       # panics on an empty one, so all four must be present for `cargo test --workspace`
       # to even construct a config in orchestrator tests.

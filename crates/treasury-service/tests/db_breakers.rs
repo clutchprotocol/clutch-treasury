@@ -32,6 +32,11 @@ fn test_config() -> AppConfig {
         confirmations: 2,
         outbox_poll_ms: 2000,
         reconciliation_interval_secs: 86400,
+        trongrid_url: "http://unused".into(),
+        trongrid_api_key: "test-trongrid-key".into(),
+        custody_tron_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".into(),
+        usdt_contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".into(),
+        deposit_confirmations: 19,
     }
 }
 

@@ -23,12 +23,30 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 match treasury_service::reconciliation::run_once(
-                    &pool, &node, cfg.custody_stub_balance_usdt, cfg.genesis_allocation as u64,
+                    &pool, &node, cfg.custody_stub_balance_usdt, cfg.genesis_allocation as u64, &cfg,
                 ).await {
                     Ok(status) => tracing::info!("reconciliation run: {}", status),
                     Err(e) => tracing::error!("reconciliation failed to run: {}", e),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(cfg.reconciliation_interval_secs)).await;
+            }
+        });
+    }
+    // Plan C T5: the independent TronGrid verifier — scans `created` deposit-backed intents
+    // (client_ref IS NOT NULL) and auto-approves on confirmed on-chain evidence alone. Same
+    // poll-loop shape as the outbox/watcher below; "reschedule with backoff" for a transient
+    // TronGrid failure is exactly this loop leaving the intent untouched for the next tick.
+    {
+        let pool = pool.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            loop {
+                match treasury_service::tron_verifier::verify_once(&pool, &cfg).await {
+                    Ok(n) if n > 0 => tracing::info!("tron_verifier: approved {} deposit(s)", n),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("tron_verifier pass failed: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
             }
         });
     }

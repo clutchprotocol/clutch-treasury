@@ -201,3 +201,92 @@ STANDING RISK note above), get_invoice could surface it and this alert could quo
 `// ponytail: T5's bridge picks up confirmed intents from here (treasury_bridge.rs, out of this
 task's scope) — nothing to call, it polls this status itself.` — one-line marker per the brief's
 "leave a one-line comment, no stub function, no dead code" instruction for where T5 hooks in.
+
+## Plan C T4 review fixes (d903bae, pushed) — 13/13 db_webhook, 57 workspace tests green
+T4 itself (7cc44d9) is good: apply_invoice_update is the SINGLE place Bitcart state becomes ours
+and both the webhook and the poller call it, so "every state the webhook reaches is reachable by the
+poller alone" holds by construction rather than by keeping two paths in sync. Refetch-only, nothing
+read from the payload but the id.
+
+### CRITICAL #2 — same class as a32a101, from the other end
+uq_active_pay_amount's status list omitted needs_manual and failed, so reaching either freed the
+discriminator slot on STATUS ALONE, ignoring bitcart_terminal. Wrong exactly where it matters most:
+paid_partial (user underpaid) sends the intent to needs_manual while Bitcart's invoice is STILL LIVE
+and can still take the remainder at that amount. Freeing the slot hands a later, different user the
+amount a stranger's live invoice is waiting on.
+FIX (migration 0003): add needs_manual + failed to the index. confirmed/mint_requested/credited stay
+OUT — a completed invoice can't match a new payment, and holding those would leak one slot per
+successful deposit, forever.
+Follow-on 1: the poller now also refetches needs_manual/failed rows that aren't bitcart_terminal,
+purely so terminality releases the slot. Without it an underpaid deposit reserves its amount forever.
+Follow-on 2: that reintroduced an auto-close risk, so the Invalid/Refunded transition now uses a
+from-set EXCLUDING needs_manual. A human was asked to look at money that may sit in custody; Bitcart
+calling the invoice invalid is not that human answering.
+- PATTERN, now twice: this index is the single load-bearing guard against cross-user misattribution
+  on the shared static Tron address, and BOTH bugs were a status path quietly stepping outside its
+  predicate rather than anything wrong with the index. Any new status, or any new writer of `status`,
+  must be checked against it. Third time, consider a trigger that refuses to clear the slot while
+  bitcart_terminal is false.
+
+### Also fixed: unauthenticated route spawned detached work
+/webhooks/bitcart has no auth (Bitcart can't sign). The handler tokio::spawn'd BEFORE the
+known-invoice lookup, so a spammer could fire and disconnect while each detached task took one of 5
+pool connections — starving the deposit routes through the one route with no auth in front of it.
+Now the lookup is awaited in the handler (one indexed SELECT) and only real work is backgrounded.
+handle_webhook remains as the composition of is_known_invoice + process_known_webhook so tests still
+cover the unknown-id case end to end.
+
+### TOOLING GOTCHA (cost me a false result)
+sqlx::migrate! embeds migration SQL at COMPILE time and cargo does not reliably re-fingerprint the
+migrations directory. A mutation run that edits a migration and restores it can silently execute the
+PREVIOUS binary's embedded schema — I got a spurious FAILED on already-correct code this way. Force
+a rebuild (touch a source file in the crate) when mutation-testing a migration. Also: point
+DATABASE_URL at a throwaway database name for such runs, since editing an applied migration's
+content trips sqlx's checksum bookkeeping on the existing test DB.
+Litter to know about: databases mut1/mut2/mut3 now exist in the TEST postgres (compose project
+clutch-treasury, not the user's clutch-dev stack). Harmless.
+
+### Agent's own flagged concern, accepted
+PaidOver's alert can't quote a surplus figure — T3's InvoiceStatus carries only state + tron_tx_id,
+no observed amount. It names the invoice for manual lookup instead of fabricating a number, which is
+the right call. Natural T5 follow-up if the TronGrid verifier surfaces the received amount anyway.
+
+## Plan C T5 (treasury half) — tron_verifier — 82/82 workspace tests green, mutation-checked
+Files: migrations/0002_deposit_evidence.sql (client_ref/deposit_tx_id/verified_at columns + the
+uq_mint_intents_deposit_tx partial unique index the brief required to close a double-mint hole the
+plan left open), src/tron_verifier.rs (new), modified intents.rs/api.rs/configuration.rs/lib.rs/
+main.rs/reconciliation.rs/breakers.rs, tests/db_tron_verifier.rs (12 new tests).
+
+The gap: the plan's `deposit_tx_id TEXT` had no uniqueness, so one real on-chain transfer could
+back two mint intents. Added the partial unique index; the fallback-match backfill path treats
+losing that race as a HARD mismatch for the losing intent (reject, never retry into a second
+approval) — this is exactly the "code path steps outside the constraint's predicate" bug class
+a32a101 and d903bae already hit twice in the sibling crate, so it got mutation-tested rather than
+trusted on inspection: swallowed the backfill-race error to simulate exactly that bug, confirmed
+the test (`fallback_backfill_losing_the_race_rejects_not_approves`) fails and correctly reports
+`left: "approved", right: "rejected"`, then restored the real code.
+
+Also mutation-tested the "custody event exactly-once across a rerun" requirement. Turns out this
+property is defended FOUR independent layers deep (verify_once's `WHERE status='created'` SELECT;
+approve_and_ledger's own `WHERE status='created'` UPDATE guard; chain_outbox.intent_id UNIQUE,
+which forces the whole transaction to roll back on a second attempt; treasury_events' existing
+uq_events_intent_kind ON CONFLICT) — stacking all three inner mutations together and rerunning
+still passed only because of the outbox UNIQUE, and only removing all four made the rerun test
+fail. Confirms the property is genuinely proven, not assumed, and that nothing in this codebase
+ever moves mint_intents.status backward (checked every writer), so those inner layers are
+legitimate defense-in-depth rather than dead code the test coincidentally exercises.
+
+Central distinction (hard mismatch -> reject vs transient -> retry) is structural, not just
+tested: verify_once's match has exactly two arms that write `status` (Pass, HardMismatch);
+Transient falls through to a debug log only. "Reschedule with backoff" needed no new column —
+it's the existing poll loop itself (same shape as outbox.rs/watcher.rs), and the brief's
+warn-at-30m/p1-at-24h is a pure age check against created_at, no new state.
+
+daily_headroom_clt reuses breakers::daily_mint_total (extracted from check_mint_inner) rather
+than reimplementing the 24h sum — verified it actually shrinks with real approved-mint rows, not
+just that the field exists.
+
+TronGrid endpoint shapes are ASSUMED (flagged in the task report), not verified against a live
+call — trc20 transfer list fields (transaction_id, to, value as decimal string, token_info.address),
+the transactions/{id} confirmed boolean, and the accounts/{address} trc20 balance map. wiremock
+pins OUR side of the contract only, same caveat T3's Bitcart integration carries.

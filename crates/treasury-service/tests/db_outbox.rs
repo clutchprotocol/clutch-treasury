@@ -18,7 +18,7 @@ async fn pool() -> PgPool {
 #[tokio::test]
 async fn watcher_credit_is_idempotent() {
     let pool = pool().await;
-    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice").await.unwrap();
+    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None).await.unwrap();
     approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
 
     // Simulate the watcher seeing the tx twice (reorg replay / crash-restart).
@@ -107,5 +107,10 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         confirmations: 2,
         outbox_poll_ms: 2000,
         reconciliation_interval_secs: 86400,
+        trongrid_url: "http://unused".into(),
+        trongrid_api_key: "test-trongrid-key".into(),
+        custody_tron_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".into(),
+        usdt_contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".into(),
+        deposit_confirmations: 19,
     }
 }

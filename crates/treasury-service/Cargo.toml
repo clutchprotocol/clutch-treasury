@@ -25,6 +25,9 @@ sqlx = { version = "0.8.2", features = ["runtime-tokio-rustls", "postgres", "chr
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 sha3 = "0.10.1"
+# TronGrid REST calls (tron_verifier.rs) — same version payment-orchestrator's BitcartAdapter
+# already resolves to in Cargo.lock, so this direct dep adds no new version to pin.
+reqwest = { version = "0.12.7", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -34,3 +37,4 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"

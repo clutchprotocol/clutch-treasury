@@ -27,6 +27,22 @@ pub async fn check_mint_excluding(
     check_mint_inner(pool, config, amount_clt, Some(intent_id)).await
 }
 
+/// The rolling 24h mint total that counts against `daily_mint_cap_clt` — every status past
+/// `created` that represents a mint already authorised (approved/submitted/credited). Shared
+/// by `check_mint_inner`'s plain gate and `/internal/reserve-status`'s `daily_headroom_clt`
+/// (api.rs) so the two never compute this sum two different ways.
+pub async fn daily_mint_total(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (day_total,): (i64,) = sqlx::query_as(
+        // ::BIGINT — SUM(BIGINT) is NUMERIC, sqlx can't decode that into i64.
+        "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM mint_intents
+         WHERE status IN ('approved','submitted','credited')
+           AND created_at > now() - interval '24 hours'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(day_total)
+}
+
 async fn check_mint_inner(
     pool: &PgPool,
     config: &AppConfig,
@@ -55,19 +71,10 @@ async fn check_mint_inner(
         return Err(deny(r));
     }
 
-    let (day_total,): (i64,) = match exclude_intent {
-        None => {
-            sqlx::query_as(
-                // ::BIGINT — SUM(BIGINT) is NUMERIC, sqlx can't decode that into i64.
-                "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM mint_intents
-                 WHERE status IN ('approved','submitted','credited')
-                   AND created_at > now() - interval '24 hours'",
-            )
-            .fetch_one(pool)
-            .await
-        }
+    let day_total = match exclude_intent {
+        None => daily_mint_total(pool).await,
         Some(id) => {
-            sqlx::query_as(
+            sqlx::query_as::<_, (i64,)>(
                 "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM mint_intents
                  WHERE status IN ('approved','submitted','credited')
                    AND created_at > now() - interval '24 hours'
@@ -76,6 +83,7 @@ async fn check_mint_inner(
             .bind(id)
             .fetch_one(pool)
             .await
+            .map(|(t,)| t)
         }
     }
     .map_err(|e| deny(format!("cap read failed: {e}")))?;

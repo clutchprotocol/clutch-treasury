@@ -12,29 +12,54 @@ pub struct MintIntent {
     pub created_by: String,
     pub approved_by: Option<String>,
     pub chain_tx_hash: Option<String>,
+    pub client_ref: Option<String>,
+    pub deposit_tx_id: Option<String>,
+    pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-const MINT_COLS: &str =
-    "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, chain_tx_hash";
+const MINT_COLS: &str = "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, \
+    chain_tx_hash, client_ref, deposit_tx_id, verified_at";
 
+/// `client_ref` is the orchestrator's idempotency key (Plan C T5) — `None` for Plan B's
+/// direct/manual mint intents, `Some(deposit_intent_id)` for deposit-backed ones the
+/// tron_verifier will pick up. `deposit_tx_id` may be known already (Bitcart returned a
+/// hash) or backfilled later by the verifier's fallback match; either way it is NEVER the
+/// sole authority for a second create — see `find_by_client_ref` for the replay path, which
+/// the caller (api.rs) must check before calling this, exactly as Plan C's brief specifies
+/// ("existing client_ref -> 200 with the existing intent, else create").
 pub async fn create_mint_intent(
     pool: &PgPool,
     beneficiary: &str,
     amount_clt: i64,
     created_by: &str,
+    client_ref: Option<&str>,
+    deposit_tx_id: Option<&str>,
 ) -> Result<MintIntent, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query_as::<_, MintIntent>(&format!(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by)
-         VALUES ($1, $2, $3, $4, $5) RETURNING {MINT_COLS}"
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {MINT_COLS}"
     ))
     .bind(id)
     .bind(beneficiary)
     .bind(amount_clt)
     .bind(intent_ref(&id.to_string()))
     .bind(created_by)
+    .bind(client_ref)
+    .bind(deposit_tx_id)
     .fetch_one(pool)
     .await
+}
+
+/// The replay lookup api.rs's create-intent handler needs: a duplicate `client_ref` returns
+/// the ORIGINAL intent rather than erroring or creating a second row (spec: "duplicate
+/// client_ref create replays instead of duplicating"). `client_ref` is UNIQUE in the schema,
+/// so this can only ever return zero or one row.
+pub async fn find_by_client_ref(pool: &PgPool, client_ref: &str) -> Result<Option<MintIntent>, sqlx::Error> {
+    sqlx::query_as::<_, MintIntent>(&format!("SELECT {MINT_COLS} FROM mint_intents WHERE client_ref = $1"))
+        .bind(client_ref)
+        .fetch_optional(pool)
+        .await
 }
 
 /// Approval + outbox row in ONE db transaction with a row lock — the state

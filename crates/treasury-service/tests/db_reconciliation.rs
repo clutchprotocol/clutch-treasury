@@ -6,6 +6,7 @@ fn s(onchain: u64, genesis: u64, ledger: i64, custody: i64) -> Sources {
         genesis_allocation: genesis,
         ledger_liability: ledger,
         custody_reported: custody,
+        trongrid_balance: None,
     }
 }
 
@@ -53,6 +54,7 @@ async fn mismatch_halts_minting() {
             genesis_allocation: 1_000_000_000_000_000,
             ledger_liability: 0,
             custody_reported: 0,
+            trongrid_balance: None,
         },
     )
     .await

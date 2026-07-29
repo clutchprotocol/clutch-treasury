@@ -63,8 +63,29 @@ async fn health() -> Json<serde_json::Value> {
 struct CreateMintIntentBody {
     beneficiary: String,
     amount_clt: i64,
+    /// Plan C T5: the orchestrator's deposit-intent id, its idempotency key for this call.
+    /// `None` for Plan B's direct/manual mint intents.
+    client_ref: Option<String>,
+    /// The Tron transfer the tron_verifier should check first (may be absent — Bitcart
+    /// sometimes returns no hash; the verifier's fallback match then backfills this).
+    deposit_tx_id: Option<String>,
 }
 
+/// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
+/// body — a body field would be spoofable within a role and would collapse four-eyes down to
+/// whatever string an attacker chose to write next to their own approval (brief's explicit
+/// requirement). This is what keeps the `four_eyes` DB CHECK meaningful: initiator-token calls
+/// always record literally `"initiator"` (renamed `'orchestrator'` in Plan C's bridge worker,
+/// which authenticates as this same Role::Initiator), and only `tron_verifier.rs` ever writes
+/// `approved_by = 'tron-verifier'` — neither string is ever read off anything a caller sent.
+///
+/// Duplicate `client_ref`: replays the EXISTING intent rather than creating a second row
+/// (spec — this is the treasury-side half of the bridge worker's idempotent retry). No
+/// separate CAS/lock needed beyond the schema's `client_ref UNIQUE`: the lookup-then-insert
+/// below has a race window (two concurrent creates with the same never-before-seen
+/// client_ref), but the loser's INSERT simply fails the unique constraint and 500s into a
+/// caller retry, which re-runs this handler and finds the winner's row via `find_by_client_ref`
+/// — no duplicate intent and no double mint can result either way.
 async fn create_mint_intent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -74,9 +95,24 @@ async fn create_mint_intent_handler(
     if role != Role::Initiator {
         return Err(StatusCode::FORBIDDEN);
     }
-    let intent = intents::create_mint_intent(&state.pool, &body.beneficiary, body.amount_clt, actor_name(role))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(client_ref) = &body.client_ref {
+        if let Some(existing) = intents::find_by_client_ref(&state.pool, client_ref)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            return Ok((StatusCode::OK, Json(intent_json(&existing))));
+        }
+    }
+    let intent = intents::create_mint_intent(
+        &state.pool,
+        &body.beneficiary,
+        body.amount_clt,
+        actor_name(role),
+        body.client_ref.as_deref(),
+        body.deposit_tx_id.as_deref(),
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((StatusCode::CREATED, Json(intent_json(&intent))))
 }
 
@@ -253,6 +289,14 @@ async fn reserve_status_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Plan C T2b deliberately deferred its headroom check waiting for this field (5b consumes
+    // it before proposing a new mint). Reuses breakers::daily_mint_total — the exact sum the
+    // daily-cap gate itself checks against — rather than recomputing the 24h window here.
+    let day_total = breakers::daily_mint_total(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let daily_headroom_clt = (state.config.daily_mint_cap_clt - day_total).max(0);
+
     Ok(Json(json!({
         "balances": {
             "clt_liability": balances.clt_liability,
@@ -267,6 +311,7 @@ async fn reserve_status_handler(
             "run_at": run_at,
         })),
         "pending_outbox": pending_outbox,
+        "daily_headroom_clt": daily_headroom_clt,
     })))
 }
 
@@ -320,6 +365,9 @@ fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
         "created_by": intent.created_by,
         "approved_by": intent.approved_by,
         "chain_tx_hash": intent.chain_tx_hash,
+        "client_ref": intent.client_ref,
+        "deposit_tx_id": intent.deposit_tx_id,
+        "verified_at": intent.verified_at,
     })
 }
 

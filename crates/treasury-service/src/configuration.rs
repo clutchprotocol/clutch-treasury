@@ -21,6 +21,11 @@ pub struct AppConfig {
     pub outbox_poll_ms: u64,
     pub reconciliation_interval_secs: u64,
     pub genesis_allocation: i64,
+    pub trongrid_url: String,
+    pub trongrid_api_key: String,
+    pub custody_tron_address: String,
+    pub usdt_contract: String,
+    pub deposit_confirmations: u32,
 }
 
 impl AppConfig {
@@ -37,6 +42,7 @@ impl AppConfig {
             ("APP_INITIATOR_TOKEN", &cfg.initiator_token),
             ("APP_APPROVER_TOKEN", &cfg.approver_token),
             ("APP_READONLY_TOKEN", &cfg.readonly_token),
+            ("APP_TRONGRID_API_KEY", &cfg.trongrid_api_key),
         ] {
             if v.trim().is_empty() {
                 panic!("{name} is empty — set it in the environment (.env), never in TOML");
