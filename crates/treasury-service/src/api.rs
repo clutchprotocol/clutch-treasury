@@ -130,6 +130,24 @@ async fn create_mint_intent_handler(
     Ok((StatusCode::CREATED, Json(intent_json(&intent))))
 }
 
+/// `GET /internal/mint-intents/:id` — any role (same convention as reserve-status/reconciliation
+/// reads below): Plan C 5b's bridge worker polls this with the readonly token to learn what
+/// became of a deposit-backed intent it created (`credited` / `rejected` / `failed` / still
+/// pending). Reuses the exact same `intent_json` shape the create/approve routes already return,
+/// so the bridge parses one response shape everywhere.
+async fn get_mint_intent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    caller_role(&headers, &state.config)?; // any role
+    let intent = intents::find_by_id(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(intent_json(&intent)))
+}
+
 async fn approve_mint_intent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -402,6 +420,7 @@ pub fn router(pool: PgPool, config: AppConfig) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/internal/mint-intents", post(create_mint_intent_handler))
+        .route("/internal/mint-intents/:id", get(get_mint_intent_handler))
         .route("/internal/mint-intents/:id/approve", post(approve_mint_intent_handler))
         .route("/internal/redemption-intents", post(create_redemption_intent_handler))
         .route("/internal/halt", post(halt_handler))

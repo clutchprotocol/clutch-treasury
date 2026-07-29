@@ -2,9 +2,10 @@
 //! that keeps one payment from being credited twice. This module owns the row-level
 //! mechanics and (below, `create_and_invoice`) the create-flow orchestration — no HTTP
 //! itself (that's `api.rs`), but it does call the `PaymentAdapter` (T3) to turn a fresh
-//! intent into a live Bitcart invoice. No treasury calls: the daily-headroom check needs
-//! the treasury's `reserve-status` to expose `daily_headroom_clt`, which doesn't exist yet
-//! (lands in T5, which already touches treasury-service) — bounds checks only for now.
+//! intent into a live Bitcart invoice, and (T2b's deferral, landed in 5b) the treasury's
+//! `reserve-status` for the daily-headroom check. The bridge worker that crosses into the
+//! treasury's private zone to actually request a mint lives in `treasury_bridge.rs`, not here —
+//! this module only owns the row and its guarded transitions.
 //!
 //! At par (1 USD = 1,000,000 CLT, USDT also 6 decimals) amount_usdt == amount_clt is an
 //! integer identity — no rate arithmetic anywhere in this file.
@@ -36,10 +37,20 @@ pub struct DepositIntent {
     pub response_body: Option<serde_json::Value>,
     pub bitcart_terminal: bool,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// Set once `treasury_bridge`'s POST to `/internal/mint-intents` succeeds (migration 0004)
+    /// — the id the bridge polls `GET /internal/mint-intents/:id` against. `None` until then.
+    pub treasury_intent_id: Option<Uuid>,
+    /// Consecutive treasury-unreachable failures on whichever step (create or poll) is
+    /// currently live for this row — reset to 0 on any successful call, alerted at 10.
+    pub attempts: i32,
+    /// Jittered-backoff gate: the bridge's scan only picks up a row once `now() >=
+    /// next_attempt_at`, so a failed attempt doesn't get retried on every single poll tick.
+    pub next_attempt_at: chrono::DateTime<chrono::Utc>,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, \
-    status, client_key, invoice_id, tron_tx_id, response_status, response_body, bitcart_terminal, expires_at";
+    status, client_key, invoice_id, tron_tx_id, response_status, response_body, bitcart_terminal, expires_at, \
+    treasury_intent_id, attempts, next_attempt_at";
 
 #[derive(Debug)]
 pub enum CreateOutcome {
@@ -333,6 +344,94 @@ pub async fn transition(pool: &PgPool, id: Uuid, from: &[&str], to: &str) -> Res
     Ok(result.rows_affected() == 1)
 }
 
+/// `treasury_bridge`'s (5b) equivalent of `set_tron_tx_id`: records the treasury's own intent
+/// id once the create POST succeeds. `WHERE treasury_intent_id IS NULL` is a CAS, not a mere
+/// convenience — it makes storing the id idempotent against a retried/duplicated call the same
+/// way `set_tron_tx_id` does, keeping the first-seen id rather than letting a later replay
+/// response (same value, since `client_ref` replay returns the SAME treasury intent) clobber it.
+pub async fn set_treasury_intent_id(pool: &PgPool, id: Uuid, treasury_intent_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE deposit_intents SET treasury_intent_id = $1, updated_at = now() WHERE id = $2 AND treasury_intent_id IS NULL",
+    )
+    .bind(treasury_intent_id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Base and cap for the bridge's jittered backoff (`record_attempt_failure`) — same shape as an
+/// exponential-with-ceiling schedule, kept as two plain constants rather than a config knob
+/// since nothing outside this crate needs to tune it.
+const BACKOFF_BASE_SECS: i64 = 5;
+const BACKOFF_MAX_SECS: i64 = 300;
+
+/// A treasury-unreachable failure on this row's currently-live step (create or poll — never
+/// both at once, see the column's doc comment): bump `attempts` and push `next_attempt_at` out
+/// by a jittered exponential backoff capped at `BACKOFF_MAX_SECS`, so a treasury outage spaces
+/// retries out instead of spinning the log on every poll tick. Returns the new attempt count —
+/// the caller alerts once it crosses the brief's 10-consecutive-failures threshold.
+pub async fn record_attempt_failure(pool: &PgPool, id: Uuid) -> Result<i32, sqlx::Error> {
+    let (attempts,): (i32,) = sqlx::query_as(
+        "UPDATE deposit_intents SET attempts = attempts + 1, updated_at = now() WHERE id = $1 RETURNING attempts",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+
+    // Cap the EXPONENT, not just the final product: `attempts` is an unbounded counter (a
+    // treasury outage lasting days at a 30s poll interval reaches the hundreds), and
+    // `BASE * 2^attempts` would overflow i64 — and Rust panics on overflow in debug builds,
+    // which is exactly the rig this runs in — long before `.min(BACKOFF_MAX_SECS)` gets a
+    // chance to clamp it. Once 2^n alone exceeds the cap, growing n further changes nothing.
+    let capped_exponent = attempts.max(0).min(BACKOFF_MAX_SECS.ilog2() as i32 + 1) as u32;
+    let backoff_secs = (BACKOFF_BASE_SECS * 2i64.pow(capped_exponent)).min(BACKOFF_MAX_SECS);
+    let jitter_secs = {
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..=backoff_secs / 2)
+    };
+    sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() + ($1 || ' seconds')::interval WHERE id = $2")
+        .bind((backoff_secs + jitter_secs).to_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(attempts)
+}
+
+/// Resets the failure count after a successful treasury call — the next failure starts counting
+/// from zero again rather than carrying over a prior outage's tally.
+pub async fn reset_attempts(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE deposit_intents SET attempts = 0, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Rows due for the bridge's create step: `confirmed` deposits whose backoff window has
+/// elapsed. The `confirmed` row itself IS the pending-operation row (spec §6 outbox semantics —
+/// it was written atomically with the state change by `webhook.rs`'s `confirm_and_credit`), so
+/// there is no separate queue to scan.
+pub async fn due_for_mint_request(pool: &PgPool) -> Result<Vec<DepositIntent>, sqlx::Error> {
+    sqlx::query_as::<_, DepositIntent>(&format!(
+        "SELECT {INTENT_COLS} FROM deposit_intents WHERE status = 'confirmed' AND next_attempt_at <= now() ORDER BY created_at"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
+/// Rows due for the bridge's status-poll step: `mint_requested` deposits (a treasury intent id
+/// was already stored) whose backoff window has elapsed.
+pub async fn due_for_status_poll(pool: &PgPool) -> Result<Vec<DepositIntent>, sqlx::Error> {
+    sqlx::query_as::<_, DepositIntent>(&format!(
+        "SELECT {INTENT_COLS} FROM deposit_intents
+         WHERE status = 'mint_requested' AND treasury_intent_id IS NOT NULL AND next_attempt_at <= now()
+         ORDER BY created_at"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
 /// HTTP-shaped result of the create-flow (T2b): `api.rs` matches this directly onto a
 /// status code + optional header, keeping this module free of any `axum` dependency.
 #[derive(Debug)]
@@ -348,8 +447,49 @@ pub enum DepositOutcome {
     StillProcessing,
     /// amount_usdt outside configured bounds.
     OutOfBounds { min: i64, max: i64 },
+    /// The daily-headroom check (T2b's deferral, now landed in 5b): the treasury could not be
+    /// reached to ask. Fail closed — 503 + Retry-After, never proceed on an unanswered question
+    /// about whether we could actually mint against this deposit.
+    TreasuryUnavailable,
+    /// The daily-headroom check answered, and today's remaining mint headroom is below this
+    /// amount — a clear 4xx, not a 503: asking again immediately won't help, tomorrow's headroom
+    /// (or a smaller amount) will.
+    InsufficientHeadroom { headroom_clt: i64 },
     /// Bitcart call or DB write failed — caller 5xx's without leaking internals.
     Failed(String),
+}
+
+/// T2b's deferred daily-headroom check, landed here now that treasury-service's
+/// `/internal/reserve-status` exposes `daily_headroom_clt` (T5a). `GET`s it with the readonly
+/// token and refuses the deposit when headroom is short — **fail closed** either way a question
+/// goes unanswered: an unreachable treasury and an insufficient headroom both refuse rather than
+/// let the deposit proceed. Taking a user's money when we cannot mint against it is strictly
+/// worse than turning the deposit away up front (they can retry later; funds already stranded in
+/// custody need a human) — the availability coupling this creates (a treasury outage now also
+/// blocks new deposit creation, not just deposit progress) is the accepted tradeoff.
+async fn check_headroom(config: &OrchConfig, amount_usdt: i64) -> Result<(), DepositOutcome> {
+    let resp = reqwest::Client::new()
+        .get(format!("{}/internal/reserve-status", config.treasury_url))
+        .bearer_auth(&config.treasury_readonly_token)
+        .send()
+        .await
+        .map_err(|_| DepositOutcome::TreasuryUnavailable)?;
+
+    if !resp.status().is_success() {
+        return Err(DepositOutcome::TreasuryUnavailable);
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|_| DepositOutcome::TreasuryUnavailable)?;
+    let headroom_clt = body
+        .get("daily_headroom_clt")
+        .and_then(|v| v.as_i64())
+        .ok_or(DepositOutcome::TreasuryUnavailable)?;
+
+    // At par (module docs), amount_usdt is the amount_clt this deposit will eventually ask the
+    // treasury to mint — comparable directly against headroom_clt with no rate conversion.
+    if headroom_clt < amount_usdt {
+        return Err(DepositOutcome::InsufficientHeadroom { headroom_clt });
+    }
+    Ok(())
 }
 
 /// The create-flow orchestration (T2b): routes `deposits::create`'s outcome (idempotency
@@ -370,11 +510,6 @@ pub async fn create_and_invoice(
     client_key: &str,
     notification_url: &str,
 ) -> DepositOutcome {
-    // ponytail: daily-headroom check omitted here — it needs the treasury's
-    // reserve-status to expose daily_headroom_clt, which treasury-service doesn't
-    // implement yet (lands in T5, which already touches that service). Bounds checks
-    // (min_deposit_usdt..=max_deposit_usdt, enforced inside deposits::create) are the
-    // only cap for now.
     let outcome = match create(pool, config, user_pk, clt_address, amount_usdt, client_key).await {
         Ok(o) => o,
         Err(ApiError::OutOfBounds { min, max }) => return DepositOutcome::OutOfBounds { min, max },
@@ -390,6 +525,15 @@ pub async fn create_and_invoice(
         CreateOutcome::StillProcessing => return DepositOutcome::StillProcessing,
         CreateOutcome::Created(intent) => intent,
     };
+
+    // Headroom is checked here, AFTER create()'s idempotency resolution and BEFORE ever calling
+    // Bitcart: a replay/resume of an already-`Created` row must not re-refuse on today's
+    // headroom (the row already exists; this may be a resume of a genuinely earlier attempt),
+    // and no invoice/custody exposure has been created yet for a brand-new row, so refusing here
+    // costs nothing but the row itself (soft-expires like any other unpaid intent).
+    if let Err(outcome) = check_headroom(config, intent.amount_usdt).await {
+        return outcome;
+    }
 
     // Bitcart has no server-side order_id dedup (module docs, adapter.rs module docs) —
     // the intent id is unique per row regardless of how many times this call is retried,

@@ -70,6 +70,16 @@ pub async fn find_by_client_ref(pool: &PgPool, client_ref: &str) -> Result<Optio
         .await
 }
 
+/// Plan C 5b: the bridge worker's status-poll lookup (`GET /internal/mint-intents/:id`,
+/// readonly token) — it has to check what became of the intent it created, and there was no
+/// route to read one by id before this.
+pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<MintIntent>, sqlx::Error> {
+    sqlx::query_as::<_, MintIntent>(&format!("SELECT {MINT_COLS} FROM mint_intents WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Approval + outbox row in ONE db transaction with a row lock — the state
 /// transition and the work item are atomic; retries can't double-enqueue
 /// (unique intent_id on chain_outbox is the backstop).

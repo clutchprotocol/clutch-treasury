@@ -80,6 +80,20 @@ async fn create_deposit_handler(
             StatusCode::BAD_REQUEST,
             json!({"error": format!("amount_usdt must be between {min} and {max}")}),
         ),
+        // Fail closed (T2b's deferred headroom check, landed in 5b): the treasury couldn't be
+        // asked whether it could mint against this deposit — 503 + Retry-After, same shape as
+        // any other "ask again shortly" backpressure signal.
+        DepositOutcome::TreasuryUnavailable => {
+            resp_headers.insert("retry-after", "30".parse().unwrap());
+            (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "treasury unreachable — cannot verify mint headroom, try again shortly"}))
+        }
+        // A clear 4xx, not a 503: the treasury DID answer, and the answer is "not enough room
+        // today" — retrying immediately won't change that, so this isn't the same kind of
+        // "try again shortly" signal a 503 implies.
+        DepositOutcome::InsufficientHeadroom { headroom_clt } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": format!("insufficient daily mint headroom ({headroom_clt} CLT remaining) to cover this deposit")}),
+        ),
         DepositOutcome::Failed(msg) => {
             tracing::error!("create_and_invoice failed: {msg}");
             (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal error"}))

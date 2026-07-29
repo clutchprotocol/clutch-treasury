@@ -13,14 +13,32 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
 use payment_orchestrator::configuration::OrchConfig;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const JWT_SECRET: &str = "test-jwt-secret";
+
+/// Plan C 5b landed the daily-headroom check inside `create_and_invoice` — every deposit create
+/// now GETs the treasury's `/internal/reserve-status` before ever calling Bitcart. This file's
+/// tests are about the create-flow's idempotency/ownership/bounds properties (headroom itself is
+/// covered separately in `db_bridge.rs`), so every test here needs a treasury double that just
+/// answers with generous headroom and gets out of the way — same wiremock convention this crate
+/// already uses for Bitcart coverage in `bitcart_adapter.rs`.
+async fn mock_treasury_with_generous_headroom() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/reserve-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"daily_headroom_clt": 1_000_000_000})))
+        .mount(&server)
+        .await;
+    server
+}
 
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
@@ -39,7 +57,7 @@ async fn pool() -> PgPool {
     pool
 }
 
-fn test_config() -> OrchConfig {
+fn test_config(treasury_url: String) -> OrchConfig {
     OrchConfig {
         http_addr: "0.0.0.0:0".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
@@ -48,7 +66,7 @@ fn test_config() -> OrchConfig {
         bitcart_token: "t".into(),
         bitcart_store_id: "s".into(),
         public_base_url: "https://orchestrator.example".into(),
-        treasury_url: "http://unused".into(),
+        treasury_url,
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
         custody_tron_address: "Tunused".into(),
@@ -120,7 +138,8 @@ async fn body_json(resp: axum::response::Response) -> Value {
 #[tokio::test]
 async fn replay_same_key_same_body_returns_original_status_and_body() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter.clone());
     let auth = bearer_for("0xalice");
@@ -163,7 +182,8 @@ async fn replay_same_key_same_body_returns_original_status_and_body() {
 #[tokio::test]
 async fn same_key_different_body_returns_409() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter.clone());
     let auth = bearer_for("0xalice");
@@ -215,7 +235,8 @@ async fn same_key_different_body_returns_409() {
 #[tokio::test]
 async fn retry_while_processing_returns_409_with_retry_after() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter.clone());
     let auth = bearer_for("0xbob");
@@ -277,7 +298,8 @@ async fn retry_while_processing_returns_409_with_retry_after() {
 #[tokio::test]
 async fn get_deposit_rejects_non_owner() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter.clone());
 
@@ -339,7 +361,8 @@ async fn get_deposit_rejects_non_owner() {
 #[tokio::test]
 async fn out_of_bounds_amount_returns_400() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter);
 
@@ -364,7 +387,8 @@ async fn out_of_bounds_amount_returns_400() {
 #[tokio::test]
 async fn missing_idempotency_key_returns_400() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter);
 
@@ -387,7 +411,8 @@ async fn missing_idempotency_key_returns_400() {
 #[tokio::test]
 async fn missing_auth_returns_401() {
     let pool = pool().await;
-    let config = test_config();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
     let adapter = Arc::new(FakeAdapter::new());
     let app = router_with(pool.clone(), config.clone(), adapter);
 

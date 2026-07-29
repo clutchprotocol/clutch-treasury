@@ -30,6 +30,10 @@ async fn main() {
     // state the webhook can reach must also be reachable here alone, on a plain timer.
     tokio::spawn(payment_orchestrator::poller::run(pool.clone(), adapter.clone(), config.poll_interval_secs));
 
+    // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
+    // treasury's private zone. Same poll-interval convention as the Bitcart poller above.
+    tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));
+
     let app = api::router(pool, config.clone(), adapter);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("payment-orchestrator listening on {}", config.http_addr);

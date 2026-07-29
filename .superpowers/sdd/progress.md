@@ -290,3 +290,135 @@ TronGrid endpoint shapes are ASSUMED (flagged in the task report), not verified 
 call — trc20 transfer list fields (transaction_id, to, value as decimal string, token_info.address),
 the transactions/{id} confirmed boolean, and the accounts/{address} trc20 balance map. wiremock
 pins OUR side of the contract only, same caveat T3's Bitcart integration carries.
+
+## Plan C T5a treasury TronGrid verifier — 40e1469 + review fix cb497e3 (both pushed), 15/15 db_tron_verifier
+Verified good in T5a as delivered: all four evidence conditions checked with no short-circuit;
+hard-vs-transient split is clean (an unmatched tx hash is treated as TRANSIENT, not a mismatch —
+correct, absence of evidence is not evidence against); created_by derives from the authenticated
+role, never the body; approve + verified_at + outbox + custody event in ONE transaction with the
+rerun proven by calling verify_once twice and counting rows; daily_headroom_clt added reusing the
+breaker's existing daily total; trongrid_balance recorded as a cross-check column that no branch
+reads (correctly NOT wired into the breaker). Agent closed the deposit_tx_id uniqueness gap I
+flagged, and mutation-tested both required proofs itself.
+
+### CRITICAL #3 — verifier matched the WRONG amount (cb497e3)
+The treasury never received the discriminator. amount_clt is the intended figure (10_000_000); what
+the user was told to pay is amount + discriminator (10_000_123), and on the shared static custody
+address that discriminated amount is the ONLY thing separating payers. pay_amount_usdt lived solely
+in the orchestrator, so the fallback matched `>= amount_clt`: "any confirmed transfer to custody of
+at least the intended amount".
+Impact: the first NULL-tx_id intent claims whichever qualifying transfer TronGrid lists first, is
+approved on a stranger's money, and (verifier ledgers the OBSERVED amount) records that stranger's
+FULL transfer as this deposit's custody. Rightful depositor then locked out of their own transfer by
+uq_mint_intents_deposit_tx. A 50 USDT deposit could back a 2 USDT mint and inflate reserve by 48.
+FIX (migration 0003 + code):
+- expected_amount_usdt travels with the intent; fallback matches EXACTLY and only within
+  deposit_match_window_hours (24). Slots are recycled after terminality, so an old unclaimed
+  transfer at a reused amount must not back a later intent.
+- amount_clt REMOVED from DepositBackedIntent so no path can match on it again. This is the
+  structural half of the fix — the comment explains why the struct omits it.
+- deposit-backed create without expected_amount_usdt = 400 + DB CHECK; NULL fails closed in the
+  verifier (Transient, never approve/reject, escalates via stuck sweep).
+- approving off the fallback raises a warn EVERY time: weaker evidence path, and a run of them means
+  the processor stopped returning hashes — worth seeing before it backs much of the reserve.
+- Consequence accepted: an overpayment with NO tx hash no longer auto-verifies. It ages into the
+  stuck sweep and a human. Right side to fail on.
+- CHECK is NOT VALID: still enforced on every INSERT/UPDATE (the point), only skips scanning
+  pre-column rows. No safe backfill exists for those — amount_clt is exactly the value whose use as
+  a match key is the bug.
+Mutation-checked by restoring the >= match: fallback_must_not_claim_a_larger_transfer_from_another_payer fails.
+- LESSON: three Criticals now, all the same shape — a money-identity value that one service owns and
+  another silently substitutes something weaker for. Discriminator slot freed early (a32a101),
+  freed on status alone (d903bae), and now matched against the undiscriminated amount. Whenever the
+  discriminated amount crosses a service boundary, check it actually arrived.
+- Test fixtures now keep amount_clt != expected_amount_usdt everywhere; that difference is what
+  lets them catch a regression to the intended amount.
+
+### RIG GOTCHAS
+- treasury-service tests connect straight to DATABASE_URL and do NOT create the database (unlike the
+  orchestrator's, which append _orchestrator and create). Overriding DATABASE_URL to a throwaway
+  name makes all 8 db_breakers tests fail at PgPool::connect — an environmental failure that looks
+  like a code failure. Only the orchestrator tolerates that trick.
+- Standing: sqlx::migrate! embeds SQL at compile time; force a rebuild when mutating a migration.
+
+### STILL OPEN from T5a (agent flagged, accepted)
+- TronGrid endpoint/field shapes are ASSUMED, not verified live — including block_timestamp, which
+  cb497e3 now depends on for the window. Missing field defaults to 0, which fails closed (outside
+  every window), so a wrong name degrades to "fallback never matches" rather than a bad approval.
+  Verify in T7 alongside the Bitcart field names.
+- usdt_contract default is the real MAINNET USDT-TRC20 address. Confirm intended network before any
+  non-test deploy.
+- chain_outbox.intent_id UNIQUE turned out to be an extra unplanned layer of rerun-safety.
+
+## Plan C T5b payment-orchestrator: deposit->mint bridge — 74 workspace tests green (14 new)
+Files: src/treasury_bridge.rs (new), migrations/0004_mint_intent_link.sql (treasury_intent_id,
+attempts, next_attempt_at), modified deposits.rs (headroom check + bridge DB helpers), main.rs
+(spawn), lib.rs. Treasury side (small, per brief): api.rs gains GET /internal/mint-intents/:id
+(any role), intents.rs gains find_by_id. tests/db_bridge.rs (13 new) + 1 new test in
+db_tron_verifier.rs for the new GET route (16 total there now).
+
+THE line (brief's own words): the POST body sends `expected_amount_usdt: intent.pay_amount_usdt`
+— the DISCRIMINATED amount — never amount_clt. Proven on the wire, not by reading the code:
+post_sends_pay_amount_usdt_as_expected_amount_usdt_proven_on_the_wire seeds a fixture with
+amount_clt=1_000_000 != pay_amount_usdt=1_000_391 (same fixture discipline db_tron_verifier.rs
+already uses) and wiremock's body_json matcher requires the EXACT JSON — sending amount_clt in
+that field would 404 the mock and fail the test on the resulting stuck-at-confirmed path, not
+silently pass.
+
+client_ref idempotency: added NO dedup layer on top of the treasury's existing client_ref replay,
+per the brief's explicit instruction. due_for_mint_request only selects status='confirmed' rows,
+so a row the create step already moved to mint_requested is naturally excluded from re-selection
+on the next tick — retried_run_does_not_create_a_second_mint_intent proves the POST route sees
+exactly one call across two run_once passes via wiremock's .expect(1).
+
+Reliability: attempts + next_attempt_at columns, jittered exponential backoff (base 5s, cap 300s),
+p1 alert fires at exactly the 10th CONSECUTIVE failure (not before, not repeated on the 11th) and
+resets on any success — all four properties proven directly, not asserted from the constants.
+
+Status transitions, every one through the existing guarded `transition` (no bare UPDATE added):
+confirmed -> mint_requested (create success), mint_requested -> credited, mint_requested ->
+needs_manual (rejected/failed) + p1 alert whose text says funds are in custody unminted and that
+re-minting needs a human-created NEW treasury intent (client_ref is burned) — asserted by
+substring match on the actual alert row, not by reading the format string.
+
+Daily-headroom check (T2b's deferred ponytail comment, now implemented): GETs
+/internal/reserve-status with the readonly token before ever calling the PaymentAdapter. FAILS
+CLOSED both ways — unreachable treasury and insufficient headroom both refuse the deposit (503+
+Retry-After vs 422) rather than proceeding. Proven with a PanicsIfCalledAdapter that would fail
+the test immediately if Bitcart were ever invoked in either failure case — stronger than checking
+the returned outcome alone, since it structurally guarantees the check runs strictly before any
+invoice creation.
+
+### BUG CAUGHT BEFORE IT SHIPPED — debug-build integer overflow in the backoff formula
+First draft computed `BACKOFF_BASE_SECS * 2i64.saturating_pow(attempts as u32)` then `.min(cap)`.
+`saturating_pow` only saturates the POWER; the subsequent multiplication by 5 then overflows i64
+once attempts gets into the hundreds (a multi-day outage at a 30s poll interval), and Rust panics
+on overflow in debug builds — exactly the profile `cargo test` uses in this rig. Caught by tracing
+the arithmetic through by hand before running, not by a failing test (nothing in this task's test
+set runs attempts into the hundreds). Fixed by capping the EXPONENT itself
+(`min(BACKOFF_MAX_SECS.ilog2()+1)`) before the `pow`, so the intermediate value can never leave a
+range `.min(cap)` can safely clamp. Worth a note for whoever writes the next backoff formula in
+this codebase: cap the input to pow(), not just the output.
+
+### Test-authoring correction made during this task (not an implementation bug)
+`run_once` drives BOTH due_for_mint_request and due_for_status_poll every call (same shape as
+outbox.rs/watcher.rs's existing two-pass-per-tick convention) — so a row the create step just
+moved to mint_requested is immediately eligible for that SAME call's poll half. Three early test
+drafts assumed create and poll were strictly separate ticks and asserted an intermediate state
+that the same-tick poll silently altered from underneath them (one via an unmounted GET route
+causing a spurious failure + backoff that then made the NEXT call skip the row's backoff window
+entirely). Fixed by making every test's HTTP fixtures answer whichever half of run_once might
+touch the row at each point in the test, not just the half the test means to isolate. Two of the
+three failures reproduced with genuinely wrong error messages the first time (right diagnosis
+took reading create_step/poll_step's control flow line by line, not guessing from the assertion
+text alone) — recorded here so the next task in this file doesn't have to rediscover the
+two-loops-per-tick property the hard way.
+
+### Existing tests updated for the new headroom dependency (not scope creep)
+db_deposit_api.rs's 7 tests all call create_and_invoice (indirectly via the real router), which
+now GETs reserve-status before ever reaching the adapter — treasury_url: "http://unused" made
+every one of them 503 instead of reaching their real assertions. Added a
+mock_treasury_with_generous_headroom() wiremock helper (same convention bitcart_adapter.rs already
+uses) and threaded treasury_url through test_config(); db_deposits.rs/db_webhook.rs call
+deposits::create directly and never touch create_and_invoice, so they were unaffected and left
+alone.

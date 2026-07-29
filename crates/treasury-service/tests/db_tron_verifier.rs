@@ -522,6 +522,71 @@ async fn duplicate_client_ref_create_replays_instead_of_duplicating() {
     assert_eq!(n, 1, "duplicate client_ref must not create a second row");
 }
 
+/// Plan C 5b: `GET /internal/mint-intents/:id` is new in this task — the bridge worker has to
+/// poll a deposit-backed intent's status and there was no route to read one by id before. Any
+/// role may call it (readonly is what the bridge actually uses), and it returns the same
+/// `intent_json` shape the create/approve routes already do, plus 404 for an id no row holds.
+#[tokio::test]
+async fn get_mint_intent_by_id_returns_intent_json_with_readonly_token() {
+    let pool = pool().await;
+    let mut config = test_config("http://unused".to_string());
+    config.initiator_token = "test-initiator".to_string();
+    config.readonly_token = "test-readonly".to_string();
+    let app = treasury_service::api::router(pool.clone(), config);
+
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mint-intents")
+                .header("authorization", "Bearer test-initiator")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000456,"client_ref":"deposit-getbyid","deposit_tx_id":"tx-getbyid"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let created_body = axum::body::to_bytes(create_res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let get_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/internal/mint-intents/{id}"))
+                .header("authorization", "Bearer test-readonly")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_res.status(), StatusCode::OK, "the bridge's readonly token must be able to read a mint intent by id");
+    let get_body = axum::body::to_bytes(get_res.into_body(), usize::MAX).await.unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+    assert_eq!(get_json["id"].as_str().unwrap(), id);
+    assert_eq!(get_json["status"].as_str().unwrap(), "created");
+    assert_eq!(get_json["client_ref"].as_str().unwrap(), "deposit-getbyid");
+
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/internal/mint-intents/{}", Uuid::new_v4()))
+                .header("authorization", "Bearer test-readonly")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND, "an id no row holds must 404, not 500 or an empty 200");
+}
+
 /// `/internal/reserve-status` must expose `daily_headroom_clt` (5b's blocked dependency) and
 /// it must actually shrink as approved-or-later mint intents accumulate within the 24h window
 /// — proving it reuses the real daily-cap sum, not a hardcoded/static number.
