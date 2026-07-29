@@ -3,6 +3,14 @@ name = "treasury-service"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "treasury_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "treasury-service"
+path = "src/main.rs"
+
 [dependencies]
 clutch-chain = { path = "../clutch-chain" }
 axum = { version = "0.7.5", features = ["macros"] }

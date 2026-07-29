@@ -1,7 +1,5 @@
-mod api;
-mod configuration;
-
-use configuration::AppConfig;
+use treasury_service::api;
+use treasury_service::configuration::AppConfig;
 
 #[tokio::main]
 async fn main() {
