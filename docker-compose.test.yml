@@ -30,6 +30,13 @@ services:
       APP_INITIATOR_TOKEN: test-initiator
       APP_APPROVER_TOKEN: test-approver
       APP_READONLY_TOKEN: test-readonly
+      # payment-orchestrator's own secrets, same test rig, same rule: OrchConfig::load
+      # panics on an empty one, so all four must be present for `cargo test --workspace`
+      # to even construct a config in orchestrator tests.
+      APP_JWT_SECRET: test-jwt-secret
+      APP_BITCART_TOKEN: test-bitcart-token
+      APP_TREASURY_INITIATOR_TOKEN: test-initiator
+      APP_TREASURY_READONLY_TOKEN: test-readonly
     depends_on:
       test-postgres:
         condition: service_healthy

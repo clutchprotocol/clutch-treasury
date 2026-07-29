@@ -1,0 +1,14 @@
+http_addr = "0.0.0.0:8095"
+database_url = "postgres://postgres:postgres@localhost:5434/orchestrator"
+jwt_secret = ""
+bitcart_url = "http://localhost:8000"
+bitcart_token = ""
+bitcart_store_id = ""
+treasury_url = "http://localhost:8090"
+treasury_initiator_token = ""
+treasury_readonly_token = ""
+custody_tron_address = ""
+deposit_ttl_minutes = 30
+min_deposit_usdt = 1000000
+max_deposit_usdt = 50000000
+poll_interval_secs = 30
