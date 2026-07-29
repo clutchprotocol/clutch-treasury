@@ -137,6 +137,20 @@ pub struct RedemptionIntent {
     pub burn_tx_hash: Option<String>,
 }
 
+/// Plan C T6's status read. Without it the orchestrator's `GET /api/v1/redemptions/:id` could only
+/// serve the status captured at creation time — so a user polling their own redemption would see
+/// `created` forever, including after the payout had already happened. There was no route to read
+/// one redemption intent before this.
+pub async fn find_redemption_by_id(pool: &PgPool, id: Uuid) -> Result<Option<RedemptionIntent>, sqlx::Error> {
+    sqlx::query_as::<_, RedemptionIntent>(
+        "SELECT id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash
+         FROM redemption_intents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn create_redemption_intent(
     pool: &PgPool,
     redeemer_address: &str,

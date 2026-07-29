@@ -3,7 +3,16 @@ use treasury_service::intents::create_redemption_intent;
 use treasury_service::watcher::confirm_burn;
 
 async fn pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    // Each test BINARY gets its own database. --test-threads=1 only serialises tests WITHIN a
+    // binary; cargo runs binaries in PARALLEL, and every pool() here TRUNCATEs shared tables —
+    // so binaries were wiping each other mid-test. That produced a ~1-in-6 flake that moved
+    // between tests run to run (see progress.md).
+    let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
+    let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
+    let url = format!("{prefix}/{dbname}_tre_redemption");
+    if !<sqlx::Postgres as sqlx::migrate::MigrateDatabase>::database_exists(&url).await.unwrap_or(false) {
+        <sqlx::Postgres as sqlx::migrate::MigrateDatabase>::create_database(&url).await.unwrap();
+    }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     sqlx::query("TRUNCATE treasury_events, redemption_intents, alerts RESTART IDENTITY CASCADE")

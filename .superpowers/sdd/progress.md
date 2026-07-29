@@ -509,3 +509,48 @@ shape of test that flakes under container resource contention. Left as-is per th
 `redemptions_enabled` gated in front of auth in BOTH handlers (not just validation) — a disabled
 route 503s the same way regardless of whether the caller's JWT would otherwise have been valid, so
 there's no behavioral asymmetry between the two routes to notice or exploit.
+
+## Plan C T6 redemption proxy — fe12dda PUSHED; my review fix is UNVERIFIED WIP (docker daemon down)
+T6 as delivered is good. Verified by reading: redeemer_address has NO body field at all (nothing to
+ignore — stronger than ignoring it); base58check via bs58 with_check(Some(0x41)); redemptions_enabled
+defaults false and BOTH routes 503; GET owner-mismatch 404 like deposits; bounds enforced.
+Agent found something I had not specified and it was a real hole: with_check verifies the checksum
+and version byte but NOT the payload length, so version 0x41 + 10 address bytes + a valid checksum
+passes. It added an explicit 21-byte length check and a test built from an independently constructed
+short address. Good catch — that is the kind of thing a "checksum validated" claim hides.
+
+### GAP FOUND IN REVIEW (agent flagged it; fix written, NOT verified, NOT pushed)
+Treasury had only POST /internal/redemption-intents, no GET, so the proxy's GET served the status
+CAPTURED AT CREATION. watcher::confirm_burn is what advances a redemption, so a user polling their
+own redemption would see `created` forever — including after their CLT was burned and the payout
+made. Someone checking on their own money would be told nothing had happened.
+FIX WRITTEN (5 files, patch saved — see below):
+- treasury: intents::find_redemption_by_id + GET /internal/redemption-intents/:id (any role, mirrors
+  the mint GET added in 5b).
+- orchestrator: redemptions::fetch_treasury_status (READONLY token — a status read must never need
+  the initiator credential) and GET now serves live status, falling back to the stored snapshot when
+  the treasury can't be reached, with a `status_live` bool saying which.
+- Deliberate asymmetry vs the create path's fail-closed 503: reading a status moves no money, so
+  refusing the read is the wrong trade — but the client must be able to tell "nothing has happened
+  yet" from "we could not ask". Hence status_live rather than a silent stale value.
+- 2 new tests written: live status overrides a deliberately stale stored snapshot; unreachable
+  treasury falls back and flags it.
+
+### STATE: BLOCKED ON DOCKER, NOTHING PUSHED
+`docker version` fails: "cannot find //./pipe/dockerDesktopLinuxEngine" — Docker Desktop is not
+running, so the user's clutch-dev stack is down too. The test rig is the only way this repo is
+allowed to build (user memory: never host cargo), so the fix above is UNVERIFIED. Not committed and
+not pushed on purpose: it is money-path code and the whole point of the rig is that I do not claim
+green without it.
+RESUME: start Docker Desktop, then
+  git apply "C:/Users/MEHRAN~1/AppData/Local/Temp/claude/D--source-clutch/986f4c73-c408-4dd1-afa8-338738fc5e0a/scratchpad/t6-live-status.patch"
+  docker compose -f docker-compose.test.yml run --rm test
+(the working tree already holds the change; the patch is a backup against losing it)
+
+### ALSO OUTSTANDING from T6
+Agent reported a FLAKY pre-existing test in db_bridge.rs (T5b, which it did not touch): passed on 2
+of 3 full runs, passed on isolated rerun. Un-investigatable until docker is back. Worth chasing
+rather than shrugging at — db_bridge covers the deposit->mint boundary, and a flake there erodes the
+signal on exactly the path three Criticals already came from. Candidate cause to check first: the
+alert-threshold tests drive run_once repeatedly and rewrite next_attempt_at, so a shared-clock/
+ordering assumption is the likeliest culprit.

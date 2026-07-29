@@ -20,7 +20,7 @@ use uuid::Uuid;
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
-    let url = format!("{prefix}/{dbname}_orchestrator");
+    let url = format!("{prefix}/{dbname}_orch_webhook");
 
     if !Postgres::database_exists(&url).await.unwrap_or(false) {
         Postgres::create_database(&url).await.unwrap();

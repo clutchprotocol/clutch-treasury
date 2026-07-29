@@ -31,7 +31,7 @@ const VALID_TRON_ADDRESS: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
-    let url = format!("{prefix}/{dbname}_orchestrator");
+    let url = format!("{prefix}/{dbname}_orch_redemptions");
 
     if !Postgres::database_exists(&url).await.unwrap_or(false) {
         Postgres::create_database(&url).await.unwrap();
@@ -349,6 +349,120 @@ async fn get_redemption_rejects_non_owner() {
         .await
         .unwrap();
     assert_eq!(intruder_get.status(), StatusCode::NOT_FOUND, "a caller whose pk does not own the intent must be rejected with 404, not 403");
+}
+
+/// GET must report the treasury's CURRENT status, not the one captured at creation.
+///
+/// `watcher::confirm_burn` is what advances a redemption, so serving the stored snapshot would show
+/// `created` forever — including after the user's CLT was burned and the payout made. That is worse
+/// than unhelpful: someone checking on their own money would be told nothing had happened.
+#[tokio::test]
+async fn get_redemption_reports_live_treasury_status_not_the_creation_snapshot() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-live", 2_000_000)))
+        .mount(&server)
+        .await;
+    // The treasury has since moved on: burn confirmed, payout made.
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/redemption-intents/{treasury_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": treasury_id,
+            "redeemer_address": "0xlive",
+            "payout_address": VALID_TRON_ADDRESS,
+            "amount_clt": 2_000_000,
+            "status": "paid",
+            "redemption_ref": "ref-live",
+            "burn_tx_hash": "0xburned",
+        })))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let created = body_json_of(
+        app.clone()
+            .oneshot(post_redemption_request(&bearer_for("0xlive"), VALID_TRON_ADDRESS, 2_000_000))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(created["status"], "created", "creation returns the status the treasury reported then");
+    let id = created["id"].as_str().unwrap();
+
+    // The stored snapshot still says `created`; the response must not.
+    let (stored,): (String,) = sqlx::query_as("SELECT status FROM redemption_map WHERE id = $1::uuid")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "created", "test premise: the stored snapshot is stale");
+
+    let body = body_json_of(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/redemptions/{id}"))
+                .header("authorization", bearer_for("0xlive"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(body["status"], "paid", "GET must serve the treasury's live status, not the stale snapshot");
+    assert_eq!(body["status_live"], true, "and must say the status was read live");
+}
+
+/// When the treasury cannot be reached, GET falls back to the stored status and SAYS SO. Reading a
+/// status moves no money, so the create path's fail-closed 503 would be the wrong trade here — but
+/// a client must be able to tell "nothing has happened yet" from "we could not ask".
+#[tokio::test]
+async fn get_redemption_falls_back_to_stored_status_and_flags_it_when_treasury_is_down() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+
+    // Only the POST is mounted — the status GET 404s, standing in for an unreachable treasury.
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-down", 2_000_000)))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let created = body_json_of(
+        app.clone()
+            .oneshot(post_redemption_request(&bearer_for("0xdown"), VALID_TRON_ADDRESS, 2_000_000))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+
+    let get_res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/redemptions/{id}"))
+                .header("authorization", bearer_for("0xdown"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_res.status(), StatusCode::OK, "an unreachable treasury must not fail the read");
+    let body = body_json_of(get_res).await;
+    assert_eq!(body["status"], "created", "falls back to the stored snapshot");
+    assert_eq!(body["status_live"], false, "and flags that it is NOT live");
 }
 
 /// A GET for an id that was never created must also be 404 (not found, distinct from the

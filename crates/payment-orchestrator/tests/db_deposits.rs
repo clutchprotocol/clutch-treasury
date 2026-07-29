@@ -20,7 +20,7 @@ async fn pool() -> PgPool {
     // is fixed (postgres://user:pass@host:port/dbname), so a plain string split is enough
     // and avoids pulling in a URL-parsing crate for one rename.
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
-    let url = format!("{prefix}/{dbname}_orchestrator");
+    let url = format!("{prefix}/{dbname}_orch_deposits");
 
     if !Postgres::database_exists(&url).await.unwrap_or(false) {
         Postgres::create_database(&url).await.unwrap();

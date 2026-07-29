@@ -213,9 +213,15 @@ async fn create_redemption_handler(
 /// resource exists to someone not allowed to see it). Also 503s while `redemptions_enabled`
 /// is false, for the same reason creation does.
 ///
-/// Serves the status captured at intent-creation time, not a live treasury re-fetch — the
-/// treasury has no `GET /internal/redemption-intents/:id` route to proxy (only the `POST`
-/// exists; confirmed against `treasury-service/src/api.rs`'s router). See the task report.
+/// Status comes from a LIVE treasury re-fetch, with the stored creation-time status as the
+/// fallback only when the treasury can't be reached. The stored value alone would be actively
+/// misleading: `watcher::confirm_burn` is what advances a redemption, so a user polling their own
+/// redemption would see `created` forever — including after their CLT was burned and the payout
+/// made. `GET /internal/redemption-intents/:id` was added treasury-side for exactly this.
+///
+/// A stale-status fallback is the right failure mode here, unlike the create path's fail-closed
+/// 503: reading a status moves no money, and the alternative is telling a worried user nothing at
+/// all. `status_live` marks which they got, so a client can tell "not yet" from "we couldn't ask".
 async fn get_redemption_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -232,12 +238,14 @@ async fn get_redemption_handler(
     if mapping.user_pk != user_pk {
         return Err(StatusCode::NOT_FOUND);
     }
+    let live = redemptions::fetch_treasury_status(&state.config, mapping.treasury_intent_id).await;
     Ok(Json(json!({
         "id": mapping.id,
         "redemption_ref": mapping.redemption_ref,
         "payout_tron_address": mapping.payout_tron_address,
         "amount_clt": mapping.amount_clt,
-        "status": mapping.status,
+        "status": live.as_deref().unwrap_or(&mapping.status),
+        "status_live": live.is_some(),
     })))
 }
 

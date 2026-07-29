@@ -23,7 +23,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
-    let url = format!("{prefix}/{dbname}_orchestrator");
+    let url = format!("{prefix}/{dbname}_orch_bridge");
 
     if !Postgres::database_exists(&url).await.unwrap_or(false) {
         Postgres::create_database(&url).await.unwrap();
@@ -67,14 +67,21 @@ fn test_config(treasury_url: String) -> OrchConfig {
 /// `pay_amount_usdt` deliberately DIFFERENT — the same fixture discipline `db_tron_verifier.rs`
 /// uses, and for the same reason: if the bridge ever regresses to sending `amount_clt` where
 /// `expected_amount_usdt` belongs, a test where the two values are equal could not catch it.
+/// `next_attempt_at` is backdated rather than left to its `DEFAULT now()`. That default is right
+/// in production — a new row should be due immediately — but `due_for_mint_request` filters on
+/// `next_attempt_at <= now()`, so a row inserted with exactly `now()` sits on that boundary and
+/// depends on the clock advancing between the INSERT and the SELECT. Under Docker Desktop on
+/// Windows it occasionally doesn't, and the row is silently skipped: the deposit never leaves
+/// `confirmed` and the test fails somewhere far from the cause. This was the ~1-in-8 flake in this
+/// file. Backdating puts the fixture unambiguously in the past and takes the clock out of it.
 async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, pay_amount_usdt: i64, tron_tx_id: Option<&str>) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, status, client_key,
-             invoice_id, tron_tx_id, bitcart_terminal, expires_at)
+             invoice_id, tron_tx_id, bitcart_terminal, expires_at, next_attempt_at)
          VALUES ($1, 'user-pk-1', 'TBeneficiary1111111111111111111111', $2, $3, $2, 'confirmed', $4,
-                 'inv-1', $5, TRUE, now() + interval '30 minutes')",
+                 'inv-1', $5, TRUE, now() + interval '30 minutes', now() - interval '1 hour')",
     )
     .bind(id)
     .bind(amount_clt)
@@ -391,46 +398,56 @@ async fn p1_alert_fires_at_ten_consecutive_failures_and_again_at_twenty() {
     let deposit_id = seed_confirmed_deposit(&pool, 1_000_000, 1_000_321, Some("tron-tx-flaky")).await;
     let config = test_config(server.uri());
 
-    for i in 1..=9 {
-        treasury_bridge::run_once(&pool, &config).await;
-        // Reset next_attempt_at so the next call is immediately due — this test asserts the
-        // COUNT threshold, not the real backoff timing (that's a separate concern this file
-        // doesn't need to slow itself down proving).
-        sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1")
+    // One failing tick, with the row forced unambiguously due first.
+    //
+    // `next_attempt_at = now() - interval` and not `= now()`: this test is about the COUNT
+    // threshold, not backoff timing, and `due_for_mint_request` filters on
+    // `next_attempt_at <= now()`. Resetting to exactly `now()` puts the row on that boundary
+    // every single iteration, which made this test flaky — a skipped tick left `attempts` one
+    // short and surfaced as a confusing alert-count mismatch. Backdating removes the boundary.
+    //
+    // It also asserts `attempts` itself, so a skipped tick fails HERE, naming the real cause,
+    // instead of showing up later as a wrong page count.
+    async fn failing_tick(pool: &PgPool, config: &OrchConfig, deposit_id: Uuid, expected_attempts: i32) {
+        sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() - interval '1 hour' WHERE id = $1")
             .bind(deposit_id)
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 0, "no p1 before the 10th consecutive failure (attempt {i})");
+        treasury_bridge::run_once(pool, config).await;
+        let row = deposits::find_by_id(pool, deposit_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.attempts, expected_attempts,
+            "every tick must record exactly one failure — a skipped tick means the row wasn't selected as due"
+        );
     }
 
-    treasury_bridge::run_once(&pool, &config).await; // 10th consecutive failure
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
-    assert_eq!(n, 1, "the 10th consecutive failure must page p1");
+    async fn p1_count(pool: &PgPool) -> i64 {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        n
+    }
+
+    for i in 1..=9 {
+        failing_tick(&pool, &config, deposit_id, i).await;
+        assert_eq!(p1_count(&pool).await, 0, "no p1 before the 10th consecutive failure (attempt {i})");
+    }
+
+    failing_tick(&pool, &config, deposit_id, 10).await;
+    assert_eq!(p1_count(&pool).await, 1, "the 10th consecutive failure must page p1");
 
     // 11th through 19th: still one page — the signal repeats, it doesn't spam every tick.
     for i in 11..=19 {
-        sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1")
-            .bind(deposit_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        treasury_bridge::run_once(&pool, &config).await;
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 1, "failure {i} must not page again between thresholds");
+        failing_tick(&pool, &config, deposit_id, i).await;
+        assert_eq!(p1_count(&pool).await, 1, "failure {i} must not page again between thresholds");
     }
 
-    // 20th: page again. A deposit stuck this long has real money behind it and the page must not
-    // have gone quiet permanently after the first one.
-    sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1")
-        .bind(deposit_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    treasury_bridge::run_once(&pool, &config).await;
-    let (n_after,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'").fetch_one(&pool).await.unwrap();
-    assert_eq!(n_after, 2, "a still-stuck deposit must page again at the 20th failure, not fall silent");
+    // 20th: page again. A deposit stuck this long has real money behind it, and the page must not
+    // have gone permanently quiet after the first one.
+    failing_tick(&pool, &config, deposit_id, 20).await;
+    assert_eq!(p1_count(&pool).await, 2, "a still-stuck deposit must page again at the 20th failure, not fall silent");
 }
 
 /// A treasury call that DOES succeed after prior failures must reset the streak — proven by
@@ -455,7 +472,13 @@ async fn a_successful_call_resets_the_consecutive_failure_streak() {
     let config = test_config(server.uri());
     treasury_bridge::run_once(&pool, &config).await;
     assert_eq!(deposits::find_by_id(&pool, deposit_id).await.unwrap().unwrap().attempts, 1);
-    sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() WHERE id = $1").bind(deposit_id).execute(&pool).await.unwrap();
+    // Backdated, not `= now()`: `due_for_mint_request` filters on `next_attempt_at <= now()`, and
+    // resetting to exactly `now()` leaves the row on that boundary — the flake this file had.
+    sqlx::query("UPDATE deposit_intents SET next_attempt_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(deposit_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Now mount both routes so the NEXT call's create step succeeds AND its same-tick poll
     // step (still-pending "created") also succeeds — attempts must reset to 0 either way.

@@ -214,6 +214,23 @@ async fn create_redemption_intent_handler(
     Ok((StatusCode::CREATED, Json(redemption_intent_json(&intent))))
 }
 
+/// `GET /internal/redemption-intents/:id` — any role, same convention as the mint read above.
+/// Plan C T6's redemption proxy polls this so a user checking their redemption sees the CURRENT
+/// status; without it the proxy could only echo the status captured at creation, showing `created`
+/// forever even after the burn was confirmed and the payout made.
+async fn get_redemption_intent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    caller_role(&headers, &state.config)?; // any role
+    let intent = intents::find_redemption_by_id(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(redemption_intent_json(&intent)))
+}
+
 #[derive(Deserialize)]
 struct HaltBody {
     reason: String,
@@ -423,6 +440,7 @@ pub fn router(pool: PgPool, config: AppConfig) -> Router {
         .route("/internal/mint-intents/:id", get(get_mint_intent_handler))
         .route("/internal/mint-intents/:id/approve", post(approve_mint_intent_handler))
         .route("/internal/redemption-intents", post(create_redemption_intent_handler))
+        .route("/internal/redemption-intents/:id", get(get_redemption_intent_handler))
         .route("/internal/halt", post(halt_handler))
         .route("/internal/resume", post(resume_handler))
         .route("/internal/custody-deposits", post(custody_deposits_handler))

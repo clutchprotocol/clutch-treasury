@@ -162,6 +162,28 @@ pub async fn create_redemption(
     }
 }
 
+/// Live status from the treasury, or `None` if it couldn't be asked. Readonly token — reading a
+/// status must never need the initiator credential.
+///
+/// Returns `None` rather than an error on every failure path, because the caller's fallback (the
+/// stored creation-time status) is a better answer for the user than a 5xx: this read moves no
+/// money. The caller surfaces which one it used so nobody mistakes "we couldn't ask" for "nothing
+/// has happened yet".
+pub async fn fetch_treasury_status(config: &OrchConfig, treasury_intent_id: Uuid) -> Option<String> {
+    let resp = reqwest::Client::new()
+        .get(format!("{}/internal/redemption-intents/{treasury_intent_id}", config.treasury_url))
+        .bearer_auth(&config.treasury_readonly_token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::warn!("redemptions: treasury status read for {treasury_intent_id} returned {}", resp.status());
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("status").and_then(|v| v.as_str()).map(str::to_string)
+}
+
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<RedemptionMapRow>, sqlx::Error> {
     sqlx::query_as::<_, RedemptionMapRow>(
         "SELECT id, user_pk, treasury_intent_id, payout_tron_address, amount_clt, redemption_ref, status
