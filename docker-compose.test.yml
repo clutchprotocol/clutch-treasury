@@ -1,0 +1,35 @@
+services:
+  test-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: treasury_test
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  test:
+    image: rust:1.86-bookworm
+    working_dir: /app
+    volumes:
+      - .:/app
+      - treasury-cargo-cache:/usr/local/cargo/registry
+      - treasury-target-cache:/app/target
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@test-postgres:5432/treasury_test
+      APP_MINT_AUTHORITY_SECRET: "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509"
+      APP_INITIATOR_TOKEN: test-initiator
+      APP_APPROVER_TOKEN: test-approver
+      APP_READONLY_TOKEN: test-readonly
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+    # --test-threads=1: DB tests share one Postgres and TRUNCATE each other's tables;
+    # parallel threads inside one test binary would race. Serial is fine at this size.
+    command: cargo test --workspace -- --test-threads=1
+
+volumes:
+  treasury-cargo-cache:
+  treasury-target-cache:

@@ -1,0 +1,16 @@
+http_addr = "0.0.0.0:8090"
+database_url = "postgres://postgres:postgres@localhost:5433/treasury"
+node_ws_url = "ws://localhost:8081/ws"
+chain_id = 2077
+mint_authority_secret = ""
+initiator_token = ""
+approver_token = ""
+readonly_token = ""
+daily_mint_cap_clt = 500000000
+per_tx_mint_cap_clt = 50000000
+backing_target_bps = 10050
+backing_halt_bps = 10000
+custody_stub_balance_usdt = 0
+confirmations = 2
+outbox_poll_ms = 2000
+reconciliation_interval_secs = 86400

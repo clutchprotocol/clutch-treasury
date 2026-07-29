@@ -1,0 +1,17 @@
+[package]
+name = "clutch-chain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rlp = "0.5.2"
+secp256k1 = { version = "0.29.1", features = ["recovery", "rand"] }
+sha3 = "0.10.1"
+futures-util = "0.3"
+tokio-tungstenite = "0.23.1"
+uuid = { version = "1", features = ["v4"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true
