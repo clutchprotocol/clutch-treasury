@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub confirmations: u64,
     pub outbox_poll_ms: u64,
     pub reconciliation_interval_secs: u64,
+    pub genesis_allocation: i64,
 }
 
 impl AppConfig {

@@ -14,3 +14,4 @@ custody_stub_balance_usdt = 0
 confirmations = 2
 outbox_poll_ms = 2000
 reconciliation_interval_secs = 86400
+genesis_allocation = 1000000000000000
