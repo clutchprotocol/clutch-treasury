@@ -45,6 +45,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         bitcart_url: "http://unused".into(),
         bitcart_token: "t".into(),
         bitcart_store_id: "s".into(),
+        bitcart_invoice_currency: "USDT".into(),
         public_base_url: "http://unused".into(),
         treasury_url,
         treasury_initiator_token: "test-treasury-initiator".into(),

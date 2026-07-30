@@ -4,6 +4,9 @@ jwt_secret = ""
 bitcart_url = "http://localhost:8000"
 bitcart_token = ""
 bitcart_store_id = ""
+# The payment token, NOT fiat. A fiat code makes Bitcart round the discriminator away and
+# apply a conversion rate (proven against a live 0.10.3.0 instance).
+bitcart_invoice_currency = "USDT"
 public_base_url = "http://localhost:8095"
 treasury_url = "http://localhost:8090"
 treasury_initiator_token = ""

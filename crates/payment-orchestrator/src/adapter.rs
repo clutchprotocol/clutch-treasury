@@ -75,6 +75,23 @@ pub struct BitcartAdapter {
     /// from our advertised pay-in window (a mismatch would let invoices expire on Bitcart's
     /// side mid-window, which interacts badly with T2's amount-slot reservation).
     pub deposit_ttl_minutes: i64,
+    /// The currency the invoice is DENOMINATED in, and it must be the payment token itself
+    /// (e.g. `USDT`) — never a fiat code.
+    ///
+    /// This is not cosmetic. Omitting it makes Bitcart fall back to the store's
+    /// `default_currency`, and a live 0.10.3.0 run showed exactly what that costs: a price of
+    /// `5.000173` under a USD store was stored as `5.00` and converted at a 0.33 rate into
+    /// `15.152039` of the payment token. Two separate disasters in one:
+    ///
+    ///   1. The 6-decimal discriminator — the ONLY thing distinguishing two payers on the shared
+    ///      custody address — is rounded away, so every deposit of the same dollar figure becomes
+    ///      the same invoice.
+    ///   2. A rate is applied at all, which is precisely the arithmetic the integer par peg
+    ///      exists to eliminate.
+    ///
+    /// Denominated in the token, the same request returns price `5.000173` at rate `1.000000` —
+    /// exact, and no conversion. Keep it that way.
+    pub invoice_currency: String,
 }
 
 /// Bitcart invoice response shape, VERIFIED against `api/schemas/invoices.py`'s `DisplayInvoice`
@@ -99,6 +116,54 @@ struct BitcartInvoice {
     tx_hashes: Vec<String>,
     #[serde(default)]
     expiration_seconds: Option<i64>,
+    /// What the invoice ASKED for, and what was actually RECEIVED. Both kept as raw JSON numbers
+    /// or strings and parsed by integer arithmetic — never through f64, which would reintroduce
+    /// the precision loss the micro-unit peg exists to remove.
+    ///
+    /// These exist so the adapter can cross-check `exception_status` instead of trusting it. A
+    /// live instance was observed reporting `paid_over` for a payment of 2.0 against a 5.000203
+    /// invoice; believing that label alone credits the full intended amount for an underpayment,
+    /// which is unbacked CLT.
+    #[serde(default)]
+    price: Option<serde_json::Value>,
+    #[serde(default)]
+    sent_amount: Option<serde_json::Value>,
+}
+
+/// Parse a decimal money value into integer micro-units, without floats.
+///
+/// Accepts what Bitcart actually emits for these fields: a JSON string (`"5.000173"`) or a bare
+/// JSON number (`6.5`, `0.0`). In both cases the textual form is parsed digit by digit, so no f64
+/// ever touches the value. More than 6 decimal places truncates rather than rounds — deliberately
+/// downward, so a cross-check can never over-credit on a rounding artifact.
+fn decimal_to_micros(v: &serde_json::Value) -> Option<i64> {
+    let s = match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let s = s.trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit()) || !frac_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: i64 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
+    let mut frac: i64 = 0;
+    for i in 0..6 {
+        frac = frac * 10 + frac_part.as_bytes().get(i).map_or(0, |b| i64::from(b - b'0'));
+    }
+    let total = whole.checked_mul(1_000_000)?.checked_add(frac)?;
+    Some(if neg { -total } else { total })
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +186,9 @@ impl PaymentAdapter for BitcartAdapter {
             "store_id": self.store_id,
             "order_id": order_id,
             "notification_url": notification_url,
+            // Denominate in the token, never the store's fiat default — see `invoice_currency`.
+            // Without this the discriminator is rounded away and a conversion rate is applied.
+            "currency": self.invoice_currency,
             // MINUTES, not seconds. Verified against 0.10.3.0: `CreateInvoice.expiration: int`
             // and `Invoice.expiration_seconds` is a property returning `expiration * 60`.
             // Sending seconds here made a 30-minute window into 30 HOURS — Bitcart would keep
@@ -195,10 +263,37 @@ impl PaymentAdapter for BitcartAdapter {
             _ => None,
         };
 
-        Ok(InvoiceStatus {
-            state: map_status(&invoice.status, invoice.exception_status.as_deref()),
-            tron_tx_id,
-        })
+        let mut state = map_status(&invoice.status, invoice.exception_status.as_deref());
+
+        // Cross-check the label against the numbers. `exception_status` is Bitcart's opinion;
+        // `price` vs `sent_amount` is what actually moved. A live instance was seen reporting
+        // `paid_over` for 2.0 received against a 5.000203 invoice, and PaidOver credits the full
+        // INTENDED amount — so believing the label alone mints CLT that no deposit backs.
+        //
+        // Only ever downgrades. If the numbers say short-paid, the state becomes PaidPartial and
+        // goes to a human; a genuine overpayment (sent >= asked) keeps whatever Bitcart said.
+        // Unparseable or absent numbers leave the label untouched — this guard adds safety, it
+        // must not invent a verdict from missing data.
+        if matches!(state, InvoiceState::Confirmed | InvoiceState::PaidOver) {
+            if let (Some(asked), Some(sent)) = (
+                invoice.price.as_ref().and_then(decimal_to_micros),
+                invoice.sent_amount.as_ref().and_then(decimal_to_micros),
+            ) {
+                if sent < asked {
+                    tracing::warn!(
+                        invoice_id = %invoice.id,
+                        asked_micros = asked,
+                        sent_micros = sent,
+                        reported = ?state,
+                        "bitcart reported a fully-paid state but sent_amount is BELOW price — \
+                         treating as PaidPartial so it goes to manual review instead of crediting"
+                    );
+                    state = InvoiceState::PaidPartial;
+                }
+            }
+        }
+
+        Ok(InvoiceStatus { state, tron_tx_id })
     }
 }
 
@@ -211,7 +306,14 @@ fn map_status(status: &str, exception_status: Option<&str>) -> InvoiceState {
             "paid_partial" => return InvoiceState::PaidPartial,
             "paid_over" => return InvoiceState::PaidOver,
             "failed_confirm" => return InvoiceState::FailedConfirm,
-            "" => {} // no exception — fall through to the main status
+            // "none" is what a live 0.10.3.0 actually sends on a healthy invoice — a literal
+            // string, not null and not "". The model types it `str | None`, which is why this
+            // was written expecting empty/absent; only a real call showed otherwise.
+            //
+            // Getting this wrong was total: every ordinary invoice mapped to Unknown("none"),
+            // and T4 routes Unknown to needs_manual + P1. Every deposit would have been parked
+            // for a human and nothing would ever have been credited.
+            "none" | "" => {} // no exception — fall through to the main status
             other => return InvoiceState::Unknown(other.to_string()),
         }
     }

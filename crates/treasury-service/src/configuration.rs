@@ -47,11 +47,24 @@ impl AppConfig {
             ("APP_INITIATOR_TOKEN", &cfg.initiator_token),
             ("APP_APPROVER_TOKEN", &cfg.approver_token),
             ("APP_READONLY_TOKEN", &cfg.readonly_token),
-            ("APP_TRONGRID_API_KEY", &cfg.trongrid_api_key),
         ] {
             if v.trim().is_empty() {
                 panic!("{name} is empty — set it in the environment (.env), never in TOML");
             }
+        }
+        // The TronGrid key is deliberately NOT in the list above. TronGrid serves the endpoints
+        // this service reads without any key, just at a lower rate limit — so demanding one makes
+        // a keyless testnet run impossible and pushes operators into inventing a placeholder. That
+        // is strictly worse than an empty value: a fake key still gets sent as a header, still
+        // lands on the rate-limited tier, and makes the config assert something untrue.
+        //
+        // Warn instead, so a production deployment running unkeyed is visible rather than silent.
+        // The env-only rule still applies whenever a key IS set.
+        if cfg.trongrid_api_key.trim().is_empty() {
+            tracing::warn!(
+                "APP_TRONGRID_API_KEY is not set — deposit verification will use TronGrid's \
+                 rate-limited public tier. Acceptable for local/testnet; set a key for production."
+            );
         }
         assert!(cfg.backing_halt_bps <= cfg.backing_target_bps, "halt bps above target bps");
         Ok(cfg)

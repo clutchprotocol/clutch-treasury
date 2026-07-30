@@ -24,6 +24,7 @@ async fn main() {
         token: config.bitcart_token.clone(),
         store_id: config.bitcart_store_id.clone(),
         deposit_ttl_minutes: config.deposit_ttl_minutes,
+        invoice_currency: config.bitcart_invoice_currency.clone(),
     });
 
     // The poller is the reliability path (Bitcart's IPN is unsigned and never retried) — every
