@@ -2,11 +2,21 @@ use config::{Config, ConfigError, Environment, File};
 use dotenv::dotenv;
 use serde::Deserialize;
 
+fn default_allowed_origins() -> String {
+    "*".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OrchConfig {
     pub http_addr: String,
     pub database_url: String,
     pub jwt_secret: String,
+    /// CORS: `"*"` or a comma-separated list of allowed origins (e.g.
+    /// `https://app.example.com,https://app-stage.example.com`). Same config style as
+    /// clutch-hub-api's `AppConfig::allowed_origins` — this service has no browser routes of its
+    /// own before this change, so there was nothing to mirror until now.
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: String,
     pub bitcart_url: String,
     pub bitcart_token: String,
     pub bitcart_store_id: String,

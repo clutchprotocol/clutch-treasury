@@ -50,6 +50,7 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         http_addr: "0.0.0.0:0".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: JWT_SECRET.into(),
+        allowed_origins: "*".into(),
         bitcart_url: "http://unused".into(),
         bitcart_token: "t".into(),
         bitcart_store_id: "s".into(),

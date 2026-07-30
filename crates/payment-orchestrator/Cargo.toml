@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7.5", features = ["macros"] }
+# CORS only — already resolves to 0.6.11 in Cargo.lock via reqwest's dependency tree, so this
+# direct dep adds no new version to pin.
+tower-http = { version = "0.6", features = ["cors"] }
 config = "0.14.0"
 dotenv = "0.15"
 sqlx = { version = "0.8.2", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }

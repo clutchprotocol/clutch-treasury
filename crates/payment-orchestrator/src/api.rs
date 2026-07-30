@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::adapter::PaymentAdapter;
@@ -26,6 +27,33 @@ pub struct AppState {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+/// `"*"` allows any origin (local/dev default); otherwise a comma-separated allowlist.
+/// Same config style as clutch-hub-api's `build_cors` (`hub/server.rs`) — different crate
+/// because this service is Axum, not Actix, but the origin-parsing rule is identical.
+/// Must explicitly allow `Idempotency-Key` (deposits require it) and `Authorization` (the JWT
+/// bearer token) since the specific-origins branch can't use a header wildcard.
+fn build_cors(allowed_origins: &str) -> CorsLayer {
+    let layer = CorsLayer::new().allow_methods([Method::GET, Method::POST, Method::OPTIONS]);
+
+    if allowed_origins.trim() == "*" {
+        layer.allow_origin(Any).allow_headers(Any)
+    } else {
+        let origins: Vec<_> = allowed_origins
+            .split(',')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        layer
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_headers(AllowHeaders::list([
+                HeaderName::from_static("authorization"),
+                HeaderName::from_static("content-type"),
+                HeaderName::from_static("idempotency-key"),
+            ]))
+    }
 }
 
 #[derive(Deserialize)]
@@ -276,6 +304,7 @@ async fn bitcart_webhook_handler(State(state): State<AppState>, Json(body): Json
 }
 
 pub fn router(pool: PgPool, config: OrchConfig, adapter: Arc<dyn PaymentAdapter>) -> Router {
+    let cors = build_cors(&config.allowed_origins);
     let state = AppState { pool, config, adapter };
     Router::new()
         .route("/health", get(health))
@@ -284,5 +313,6 @@ pub fn router(pool: PgPool, config: OrchConfig, adapter: Arc<dyn PaymentAdapter>
         .route("/api/v1/redemptions", post(create_redemption_handler))
         .route("/api/v1/redemptions/:id", get(get_redemption_handler))
         .route("/webhooks/bitcart", post(bitcart_webhook_handler))
+        .layer(cors)
         .with_state(state)
 }
