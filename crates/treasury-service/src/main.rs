@@ -1,6 +1,11 @@
 use treasury_service::api;
 use treasury_service::configuration::AppConfig;
 
+/// How long to wait before retrying a FAILED reconciliation run. Deliberately far shorter than
+/// `reconciliation_interval_secs`: minting is blocked until a run succeeds, so a transient failure
+/// (node not up yet, a brief RPC outage) must not cost a full interval of downtime.
+const RECONCILIATION_RETRY_SECS: u64 = 30;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -25,10 +30,29 @@ async fn main() {
                 match treasury_service::reconciliation::run_once(
                     &pool, &node, cfg.custody_stub_balance_usdt, cfg.genesis_allocation as u64, &cfg,
                 ).await {
-                    Ok(status) => tracing::info!("reconciliation run: {}", status),
-                    Err(e) => tracing::error!("reconciliation failed to run: {}", e),
+                    Ok(status) => {
+                        tracing::info!("reconciliation run: {}", status);
+                        tokio::time::sleep(std::time::Duration::from_secs(cfg.reconciliation_interval_secs)).await;
+                    }
+                    // A FAILED run must not wait the full interval before trying again.
+                    //
+                    // Found on a real deployment: this loop's first run fires at startup and lost
+                    // a race with the node WebSocket ("connection not established"). Sleeping
+                    // `reconciliation_interval_secs` (86400) then meant no reconciliation existed
+                    // for 24 hours — and the backing breaker correctly refuses to "mint blind"
+                    // without a recent one, so the treasury could not mint at all for a day after
+                    // every fresh deploy. The breaker was right; the retry cadence was wrong.
+                    Err(e) => {
+                        tracing::error!(
+                            "reconciliation failed to run: {e} — retrying in {}s rather than \
+                             waiting the full {}s interval (minting stays blocked until one \
+                             succeeds)",
+                            RECONCILIATION_RETRY_SECS,
+                            cfg.reconciliation_interval_secs
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONCILIATION_RETRY_SECS)).await;
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(cfg.reconciliation_interval_secs)).await;
             }
         });
     }
