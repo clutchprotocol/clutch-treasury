@@ -171,6 +171,15 @@ struct BitcartPayment {
     /// A `PaymentMethod` column, surfaced through `to_payment_dict`.
     #[serde(default)]
     payment_address: Option<String>,
+    /// The authoritative amount THIS method must receive, at full precision.
+    ///
+    /// Use this and not the invoice's `price` for any amount comparison. A live instance showed
+    /// why: for a 5.000921 request, `price` came back display-formatted as `"5.00"` (2dp, per
+    /// Bitcart's currency table) while `payments[0].amount` was the exact `"5.000921"`. Comparing
+    /// against `price` would treat a payment that is 921 micro-USDT short as fully paid — and the
+    /// missing part is the discriminator, the one thing identifying the payer.
+    #[serde(default)]
+    amount: Option<serde_json::Value>,
 }
 
 #[async_trait]
@@ -275,10 +284,17 @@ impl PaymentAdapter for BitcartAdapter {
         // Unparseable or absent numbers leave the label untouched — this guard adds safety, it
         // must not invent a verdict from missing data.
         if matches!(state, InvoiceState::Confirmed | InvoiceState::PaidOver) {
-            if let (Some(asked), Some(sent)) = (
-                invoice.price.as_ref().and_then(decimal_to_micros),
-                invoice.sent_amount.as_ref().and_then(decimal_to_micros),
-            ) {
+            // `payments[0].amount` FIRST — it carries full precision, whereas the invoice's
+            // `price` is display-formatted (a live 5.000921 request reported price "5.00"). Only
+            // fall back to `price` if no payment method is present at all, which for a trx-only
+            // store shouldn't happen.
+            let asked = invoice
+                .payments
+                .first()
+                .and_then(|p| p.amount.as_ref())
+                .and_then(decimal_to_micros)
+                .or_else(|| invoice.price.as_ref().and_then(decimal_to_micros));
+            if let (Some(asked), Some(sent)) = (asked, invoice.sent_amount.as_ref().and_then(decimal_to_micros)) {
                 if sent < asked {
                     tracing::warn!(
                         invoice_id = %invoice.id,

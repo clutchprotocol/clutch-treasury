@@ -471,3 +471,58 @@ async fn missing_amounts_leave_the_reported_state_untouched() {
     let result = adapter(server.uri()).get_invoice("inv-noamounts").await.unwrap();
     assert_eq!(result.state, InvoiceState::Confirmed);
 }
+
+/// The invoice `price` is DISPLAY-formatted; `payments[].amount` is authoritative.
+///
+/// Live evidence: a 5.000921 request came back with price `"5.00"` (2dp, Bitcart's currency table)
+/// while `payments[0].amount` was the exact `"5.000921"`. A short-payment check against `price`
+/// would therefore accept a payment 921 micro-USDT light — and the missing part IS the
+/// discriminator, the only thing identifying which payer this was.
+#[tokio::test]
+async fn short_payment_is_measured_against_payment_amount_not_the_display_price() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/invoices/inv-displayprice"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "inv-displayprice",
+            "status": "complete",
+            "exception_status": "none",
+            // Exactly the live shape: rounded display price, exact per-method amount.
+            "price": "5.00",
+            "payments": [{"payment_address": "TCustody", "amount": "5.000921"}],
+            "sent_amount": 5.0,
+            "tx_hashes": ["short-by-the-discriminator"],
+        })))
+        .mount(&server)
+        .await;
+
+    let result = adapter(server.uri()).get_invoice("inv-displayprice").await.unwrap();
+    assert_eq!(
+        result.state,
+        InvoiceState::PaidPartial,
+        "5.000000 against a 5.000921 requirement is short — comparing to the 5.00 display price \
+         would have wrongly accepted it"
+    );
+}
+
+/// And the exact-payment case at full precision still confirms.
+#[tokio::test]
+async fn exact_payment_at_full_precision_confirms() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/invoices/inv-exactfull"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "inv-exactfull",
+            "status": "complete",
+            "exception_status": "none",
+            "price": "5.00",
+            "payments": [{"payment_address": "TCustody", "amount": "5.000921"}],
+            "sent_amount": 5.000921,
+            "tx_hashes": ["exact-hash"],
+        })))
+        .mount(&server)
+        .await;
+
+    let result = adapter(server.uri()).get_invoice("inv-exactfull").await.unwrap();
+    assert_eq!(result.state, InvoiceState::Confirmed);
+}
