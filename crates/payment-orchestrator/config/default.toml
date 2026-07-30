@@ -1,4 +1,7 @@
-http_addr = "0.0.0.0:8095"
+# 8091 — matches Dockerfile.orchestrator EXPOSE/HEALTHCHECK and the clutch-deploy port map.
+# Was 8095, which no other file agreed with: the image healthchecked 8091 and would have reported
+# unhealthy forever while the process listened elsewhere.
+http_addr = "0.0.0.0:8091"
 database_url = "postgres://postgres:postgres@localhost:5434/orchestrator"
 jwt_secret = ""
 bitcart_url = "http://localhost:8000"
