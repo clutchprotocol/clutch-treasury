@@ -1,0 +1,73 @@
+# Publish the two runtime images to GHCR so clutch-deploy's stage can consume them.
+#
+# Stage runs `compose pull` and deliberately never `--build` — it has no sibling source checkout.
+# Without these images a stage deploy fails at pull with "repository does not exist", and if the
+# run had already torn the stack down it leaves stage offline until the next deploy.
+#
+# amd64 only, unlike clutch-node's multi-arch build: the stage VPS is x86_64 and nothing else
+# consumes these. Add an arm64 matrix leg the day something needs it — cross-building rocksdb
+# under QEMU is slow enough that it is not worth paying for speculatively.
+name: Build and Push Docker Images (GHCR)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "Dockerfile.orchestrator"
+      - ".dockerignore"
+      - ".github/workflows/docker-build-push.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clutch-treasury
+            dockerfile: Dockerfile
+          - name: clutch-orchestrator
+            dockerfile: Dockerfile.orchestrator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/clutchprotocol/${{ matrix.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Rust + rocksdb is a long compile; without a cache every run rebuilds from scratch.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
