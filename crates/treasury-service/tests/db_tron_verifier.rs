@@ -14,7 +14,12 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const CUSTODY: &str = "TCustodyAddressXXXXXXXXXXXXXXXXXXX";
+/// THIS intent's own derived deposit address. Deposits no longer share one custody address, so the
+/// verifier gathers evidence here — at the address the intent names — rather than at a global from
+/// its own config.
+const DEPOSIT_ADDR: &str = "TCustodyAddressXXXXXXXXXXXXXXXXXXX";
+/// A DIFFERENT intent's address, for proving evidence never crosses between them.
+const OTHER_ADDR: &str = "TOtherIntentAddressYYYYYYYYYYYYYYY";
 const USDT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
 async fn pool() -> PgPool {
@@ -64,7 +69,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         reconciliation_interval_secs: 86400,
         trongrid_url,
         trongrid_api_key: "test-trongrid-key".into(),
-        custody_tron_address: CUSTODY.into(),
+        custody_tron_address: DEPOSIT_ADDR.into(),
         usdt_contract: USDT.into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,
@@ -86,11 +91,25 @@ async fn seed_deposit_intent(
     client_ref: &str,
     deposit_tx_id: Option<&str>,
 ) -> Uuid {
+    seed_deposit_intent_at(pool, amount_clt, expected_amount_usdt, client_ref, deposit_tx_id, DEPOSIT_ADDR).await
+}
+
+/// As above, but naming the deposit address explicitly — used to prove evidence never crosses
+/// between two intents' addresses.
+async fn seed_deposit_intent_at(
+    pool: &PgPool,
+    amount_clt: i64,
+    expected_amount_usdt: i64,
+    client_ref: &str,
+    deposit_tx_id: Option<&str>,
+    deposit_address: &str,
+) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO mint_intents
-            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt)
-         VALUES ($1, 'TBeneficiary1111111111111111111111', $2, $3, 'orchestrator', $4, $5, $6)",
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
+             deposit_address)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', $2, $3, 'orchestrator', $4, $5, $6, $7)",
     )
     .bind(id)
     .bind(amount_clt)
@@ -98,6 +117,7 @@ async fn seed_deposit_intent(
     .bind(client_ref)
     .bind(deposit_tx_id)
     .bind(expected_amount_usdt)
+    .bind(deposit_address)
     .execute(pool)
     .await
     .unwrap();
@@ -139,8 +159,14 @@ fn trc20_event_json(tx_id: &str, to: &str, contract: &str, value: &str, event_ty
 }
 
 async fn mount_trc20_list(server: &MockServer, transfers: Vec<serde_json::Value>) {
+    mount_trc20_list_for(server, DEPOSIT_ADDR, transfers).await
+}
+
+/// Mocks the transfer list for ONE address — the verifier now queries the intent's own address, so
+/// a mock mounted at a different one must not be found.
+async fn mount_trc20_list_for(server: &MockServer, address: &str, transfers: Vec<serde_json::Value>) {
     Mock::given(method("GET"))
-        .and(path(format!("/v1/accounts/{CUSTODY}/transactions/trc20")))
+        .and(path(format!("/v1/accounts/{address}/transactions/trc20")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": transfers})))
         .mount(server)
         .await;
@@ -172,7 +198,7 @@ async fn mount_transaction_confirmed(server: &MockServer, tx_id: &str, confirmed
 async fn happy_path_approves_and_ledgers_custody_exactly_once_across_a_rerun() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-happy", CUSTODY, USDT, "1000173")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-happy", DEPOSIT_ADDR, USDT, "1000173")]).await;
     mount_transaction_confirmed(&server, "tx-happy", true).await;
     let config = test_config(server.uri());
 
@@ -222,7 +248,7 @@ async fn happy_path_approves_and_ledgers_custody_exactly_once_across_a_rerun() {
 async fn fallback_match_backfills_deposit_tx_id_and_approves() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-fallback", CUSTODY, USDT, "2000042")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-fallback", DEPOSIT_ADDR, USDT, "2000042")]).await;
     let config = test_config(server.uri());
 
     let id = seed_deposit_intent(&pool, 2_000_000, 2_000_042, "client-ref-fallback", None).await;
@@ -235,27 +261,27 @@ async fn fallback_match_backfills_deposit_tx_id_and_approves() {
         sqlx::query_as("SELECT deposit_tx_id FROM mint_intents WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
     assert_eq!(deposit_tx_id.as_deref(), Some("tx-fallback"), "fallback match must backfill the tx id it found");
 }
-
-/// The fallback must match the DISCRIMINATED amount exactly, never `>=` and never `amount_clt`.
+/// Evidence must never cross between two intents' addresses.
 ///
-/// This is the defect this test exists for: on the shared static custody address the discriminated
-/// amount is the only thing separating one payer from another. A `>=` match (or matching on
-/// `amount_clt`, which every depositor of the same round number shares) approves this intent on
-/// somebody else's larger transfer, ledgers that stranger's full amount as this deposit's custody,
-/// and locks the rightful depositor out of their own transfer via uq_mint_intents_deposit_tx.
-///
-/// A stranger's 50 USDT transfer is on-chain; our intent expects 2.000042. Nothing may be approved.
+/// This test used to assert the opposite-shaped rule: that a LARGER transfer could not satisfy the
+/// intent. That was correct only while every deposit shared one custody address, where the amount
+/// was the sole thing separating payers and `>=` would have let one user's bigger deposit back
+/// another's intent. With one address per intent that reasoning inverts — a larger transfer to THIS
+/// address IS this payer overpaying (covered below) — and the real hazard moves to the address
+/// itself: a transfer that landed somewhere else must never be claimed here.
 #[tokio::test]
-async fn fallback_must_not_claim_a_larger_transfer_from_another_payer() {
+async fn evidence_at_another_intents_address_is_never_claimed() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-someone-elses", CUSTODY, USDT, "50000000")]).await;
+    // A generous transfer, but at a DIFFERENT intent's address. Nothing at this intent's own.
+    mount_trc20_list_for(&server, OTHER_ADDR, vec![trc20_transfer_json("tx-someone-elses", OTHER_ADDR, USDT, "50000000")]).await;
+    mount_trc20_list(&server, vec![]).await;
     let config = test_config(server.uri());
 
     let id = seed_deposit_intent(&pool, 2_000_000, 2_000_042, "client-ref-bigger", None).await;
 
     let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
-    assert_eq!(approved, 0, "a larger transfer from another payer must not satisfy this intent");
+    assert_eq!(approved, 0, "a transfer to another intent's address must not satisfy this one");
     assert_eq!(
         status_of(&pool, id).await,
         "created",
@@ -265,7 +291,33 @@ async fn fallback_must_not_claim_a_larger_transfer_from_another_payer() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(events, 0, "no custody must be ledgered off a stranger's transfer");
+    assert_eq!(events, 0, "no custody event may be ledgered from someone else's address");
+}
+
+/// The other half of the inversion: an overpayment at the intent's OWN address now verifies, where
+/// the shared-address design had to send it to manual review. The ledger must record what ARRIVED,
+/// not what was expected — recording the expectation would build a permanent gap into the
+/// reconciliation cross-check against custody.
+#[tokio::test]
+async fn an_overpayment_at_the_intents_own_address_verifies_and_ledgers_what_arrived() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-generous", DEPOSIT_ADDR, USDT, "9000000")]).await;
+    let config = test_config(server.uri());
+
+    let id = seed_deposit_intent(&pool, 2_000_000, 2_000_000, "client-ref-generous", None).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 1, "an overpayment at this intent's own address is this payer's money");
+    assert_eq!(status_of(&pool, id).await, "approved");
+
+    let (observed,): (i64,) = sqlx::query_as(
+        "SELECT amount_usdt FROM treasury_events WHERE kind = 'custody_deposit' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observed, 9_000_000, "the ledger must record what arrived, not the expected figure");
 }
 
 /// Same amount, but the transfer predates the match window: discriminator slots are recycled once
@@ -280,7 +332,7 @@ async fn fallback_must_not_claim_a_transfer_older_than_the_match_window() {
         .timestamp_millis();
     mount_trc20_list(
         &server,
-        vec![trc20_transfer_json_at("tx-stale", CUSTODY, USDT, "4000077", stale_ms)],
+        vec![trc20_transfer_json_at("tx-stale", DEPOSIT_ADDR, USDT, "4000077", stale_ms)],
     )
     .await;
 
@@ -301,7 +353,7 @@ async fn approval_event_never_backs_a_mint() {
     let server = MockServer::start().await;
     mount_trc20_list(
         &server,
-        vec![trc20_event_json("tx-approval", CUSTODY, USDT, "6000088", "Approval")],
+        vec![trc20_event_json("tx-approval", DEPOSIT_ADDR, USDT, "6000088", "Approval")],
     )
     .await;
     mount_transaction_confirmed(&server, "tx-approval", true).await;
@@ -310,7 +362,10 @@ async fn approval_event_never_backs_a_mint() {
     // Both paths: the known-hash path rejects it outright as hard evidence...
     let known = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval", Some("tx-approval")).await;
     // ...and the fallback path must not select it at all.
-    let fallback = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval-fb", None).await;
+    // A second intent must live at its OWN address: uq_mint_intents_deposit_address forbids
+    // sharing, which is the point — one address, one claimant.
+    let fallback =
+        seed_deposit_intent_at(&pool, 6_000_000, 6_000_088, "client-ref-approval-fb", None, OTHER_ADDR).await;
 
     let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
     assert_eq!(approved, 0, "an Approval event must never approve a mint");
@@ -348,7 +403,7 @@ async fn wrong_recipient_rejects() {
 async fn wrong_token_contract_rejects() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-wrong-token", CUSTODY, "TWorthlessScamTokenXXXXXXXXXXXXXX", "1000000")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-wrong-token", DEPOSIT_ADDR, "TWorthlessScamTokenXXXXXXXXXXXXXX", "1000000")]).await;
     mount_transaction_confirmed(&server, "tx-wrong-token", true).await;
     let config = test_config(server.uri());
 
@@ -364,7 +419,7 @@ async fn wrong_token_contract_rejects() {
 async fn insufficient_amount_rejects() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-short", CUSTODY, USDT, "999999")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-short", DEPOSIT_ADDR, USDT, "999999")]).await;
     mount_transaction_confirmed(&server, "tx-short", true).await;
     let config = test_config(server.uri());
 
@@ -383,7 +438,7 @@ async fn transient_trongrid_failure_never_rejects() {
     let pool = pool().await;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/v1/accounts/{CUSTODY}/transactions/trc20")))
+        .and(path(format!("/v1/accounts/{DEPOSIT_ADDR}/transactions/trc20")))
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
@@ -405,7 +460,7 @@ async fn transient_trongrid_failure_never_rejects() {
 async fn not_yet_confirmed_is_transient_not_a_rejection() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-pending", CUSTODY, USDT, "1000000")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-pending", DEPOSIT_ADDR, USDT, "1000000")]).await;
     mount_transaction_confirmed(&server, "tx-pending", false).await;
     let config = test_config(server.uri());
 
@@ -422,7 +477,7 @@ async fn stuck_intent_past_24h_pages_p1() {
     let pool = pool().await;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/v1/accounts/{CUSTODY}/transactions/trc20")))
+        .and(path(format!("/v1/accounts/{DEPOSIT_ADDR}/transactions/trc20")))
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
@@ -430,11 +485,12 @@ async fn stuck_intent_past_24h_pages_p1() {
 
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt, created_at)
-         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, $2, 'orchestrator', 'client-ref-stuck', 'tx-stuck', 1000000, now() - interval '25 hours')",
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt, deposit_address, created_at)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, $2, 'orchestrator', 'client-ref-stuck', 'tx-stuck', 1000000, $3, now() - interval '25 hours')",
     )
     .bind(id)
     .bind(format!("ref-{id}"))
+    .bind(DEPOSIT_ADDR)
     .execute(&pool)
     .await
     .unwrap();
@@ -458,12 +514,15 @@ async fn unique_index_refuses_a_second_intent_claiming_the_same_deposit_tx() {
     assert_eq!(status_of(&pool, first).await, "created");
 
     let second_id = Uuid::new_v4();
+    // A DISTINCT address on purpose: without one, deposit_backed_needs_address fires first and this
+    // test would pass on the wrong constraint. The point is the tx-id index specifically.
     let err = sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt)
-         VALUES ($1, 'TBeneficiary2222222222222222222222', 1000000, $2, 'orchestrator', 'client-ref-b', 'tx-shared', 1000000)",
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt, deposit_address)
+         VALUES ($1, 'TBeneficiary2222222222222222222222', 1000000, $2, 'orchestrator', 'client-ref-b', 'tx-shared', 1000000, $3)",
     )
     .bind(second_id)
     .bind(format!("ref-{second_id}"))
+    .bind(OTHER_ADDR)
     .execute(&pool)
     .await
     .unwrap_err();
@@ -483,15 +542,21 @@ async fn unique_index_refuses_a_second_intent_claiming_the_same_deposit_tx() {
 async fn fallback_backfill_losing_the_race_rejects_not_approves() {
     let pool = pool().await;
     let server = MockServer::start().await;
-    mount_trc20_list(&server, vec![trc20_transfer_json("tx-claimed", CUSTODY, USDT, "3000000")]).await;
+    mount_trc20_list(&server, vec![trc20_transfer_json("tx-claimed", DEPOSIT_ADDR, USDT, "3000000")]).await;
+    // The SAME transaction id presented at a second address. Per-address deposits make this
+    // unreachable in normal operation — one transfer lands at exactly one address — so this is
+    // deliberately simulating the impossible to keep the uq_mint_intents_deposit_tx guard exercised.
+    // Defence in depth is only defence while something still proves it fires.
+    mount_trc20_list_for(&server, OTHER_ADDR, vec![trc20_transfer_json("tx-claimed", OTHER_ADDR, USDT, "3000000")])
+        .await;
     let config = test_config(server.uri());
 
     // Another intent already claimed this exact transfer.
     let _already_claimed = seed_deposit_intent(&pool, 3_000_000, 3_000_000, "client-ref-first-claim", Some("tx-claimed")).await;
 
-    // A second, different intent's fallback match finds the SAME transfer (e.g. two deposit
-    // intents that happen to land on the same amount, or an operational duplicate).
-    let racer = seed_deposit_intent(&pool, 3_000_000, 3_000_000, "client-ref-racer", None).await;
+    // A second, different intent's fallback match finds the SAME transfer id at its own address.
+    let racer =
+        seed_deposit_intent_at(&pool, 3_000_000, 3_000_000, "client-ref-racer", None, OTHER_ADDR).await;
 
     treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
 
@@ -557,7 +622,7 @@ async fn duplicate_client_ref_create_replays_instead_of_duplicating() {
             .header("authorization", "Bearer test-initiator")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000291,"client_ref":"deposit-intent-abc","deposit_tx_id":"tx-abc"}"#,
+                r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000291,"deposit_address":"TCustodyAddressXXXXXXXXXXXXXXXXXXX","client_ref":"deposit-intent-abc","deposit_tx_id":"tx-abc"}"#,
             ))
             .unwrap()
     };
@@ -602,7 +667,7 @@ async fn get_mint_intent_by_id_returns_intent_json_with_readonly_token() {
                 .header("authorization", "Bearer test-initiator")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000456,"client_ref":"deposit-getbyid","deposit_tx_id":"tx-getbyid"}"#,
+                    r#"{"beneficiary":"TBeneficiary1111111111111111111111","amount_clt":1000000,"expected_amount_usdt":1000456,"deposit_address":"TCustodyAddressXXXXXXXXXXXXXXXXXXX","client_ref":"deposit-getbyid","deposit_tx_id":"tx-getbyid"}"#,
                 ))
                 .unwrap(),
         )

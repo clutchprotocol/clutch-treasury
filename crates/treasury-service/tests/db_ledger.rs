@@ -57,7 +57,7 @@ async fn balances_derive_from_events() {
 async fn four_eyes_enforced_in_db() {
     let pool = pool().await;
     use treasury_service::intents::{approve_mint_intent, create_mint_intent};
-    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None)
+    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None, None)
         .await
         .unwrap();
     assert_eq!(intent.status, "created");

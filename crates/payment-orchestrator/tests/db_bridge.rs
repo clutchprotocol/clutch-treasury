@@ -86,24 +86,41 @@ fn test_config(treasury_url: String) -> OrchConfig {
 /// Windows it occasionally doesn't, and the row is silently skipped: the deposit never leaves
 /// `confirmed` and the test fails somewhere far from the cause. This was the ~1-in-8 flake in this
 /// file. Backdating puts the fixture unambiguously in the past and takes the clock out of it.
+/// Seeds a `confirmed` deposit carrying its own derived address, since that address is now part of
+/// the treasury contract. The address is the real derivation at the row's index, so the wire
+/// assertions below pin the value the signer would later derive a key for.
 async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, pay_amount_usdt: i64, tron_tx_id: Option<&str>) -> Uuid {
     let id = Uuid::new_v4();
+    let index = sqlx::query_scalar::<_, i64>("SELECT nextval('deposit_derivation_index_seq')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let address = test_deriver().address_at(u32::try_from(index).unwrap()).unwrap();
     sqlx::query(
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, status, client_key,
-             invoice_id, tron_tx_id, payment_window_closed, expires_at, next_attempt_at)
+             invoice_id, tron_tx_id, payment_window_closed, expires_at, next_attempt_at,
+             derivation_index, deposit_address)
          VALUES ($1, 'user-pk-1', 'TBeneficiary1111111111111111111111', $2, $3, $2, 'confirmed', $4,
-                 'inv-1', $5, TRUE, now() + interval '30 minutes', now() - interval '1 hour')",
+                 'inv-1', $5, TRUE, now() + interval '30 minutes', now() - interval '1 hour', $6, $7)",
     )
     .bind(id)
     .bind(amount_clt)
     .bind(pay_amount_usdt)
     .bind(format!("key-{id}"))
     .bind(tron_tx_id)
+    .bind(index)
+    .bind(&address)
     .execute(pool)
     .await
     .unwrap();
     id
+}
+
+/// The deposit address the bridge must have sent for `id` — read back from the row, so the
+/// assertion compares against what the user was actually told to pay.
+async fn address_of(pool: &PgPool, id: Uuid) -> String {
+    deposits::find_by_id(pool, id).await.unwrap().unwrap().deposit_address.unwrap()
 }
 
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
@@ -144,7 +161,14 @@ async fn post_sends_pay_amount_usdt_as_expected_amount_usdt_proven_on_the_wire()
         .and(body_json(json!({
             "beneficiary": "TBeneficiary1111111111111111111111",
             "amount_clt": 1_000_000,
-            "expected_amount_usdt": 1_000_391,
+            // The PLAIN amount now, not the discriminated one: the address identifies the payer, so
+            // this is a sufficiency threshold rather than an identity.
+            "expected_amount_usdt": 1_000_000,
+            // THE line that matters most now. The treasury's verifier gathers evidence at THIS
+            // address rather than one from its own config, so a bridge that omitted or altered it
+            // would have the approver checking somewhere nothing was ever paid. Pinned on the wire,
+            // against the row's own address — the same discipline the discriminated amount had.
+            "deposit_address": address_of(&pool, deposit_id).await,
             "client_ref": deposit_id.to_string(),
             "deposit_tx_id": "tron-tx-abc",
         })))
@@ -177,7 +201,8 @@ async fn post_sends_null_deposit_tx_id_when_not_yet_known() {
         .and(body_json(json!({
             "beneficiary": "TBeneficiary1111111111111111111111",
             "amount_clt": 2_000_000,
-            "expected_amount_usdt": 2_000_042,
+            "expected_amount_usdt": 2_000_000,
+            "deposit_address": address_of(&pool, deposit_id).await,
             "client_ref": deposit_id.to_string(),
             "deposit_tx_id": serde_json::Value::Null,
         })))

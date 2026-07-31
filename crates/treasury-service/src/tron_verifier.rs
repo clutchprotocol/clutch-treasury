@@ -293,11 +293,11 @@ enum Evidence {
 fn check_transfer(
     transfer: &Trc20Transfer,
     confirmed: bool,
-    custody_tron_address: &str,
+    deposit_address: &str,
     usdt_contract: &str,
     expected_amount_usdt: i64,
 ) -> Result<i64, String> {
-    let recipient_ok = transfer.to == custody_tron_address;
+    let recipient_ok = transfer.to == deposit_address;
     let contract_ok = transfer.token_info.address == usdt_contract;
     let observed_amount: i64 = transfer.value.parse().unwrap_or(0);
     let amount_ok = observed_amount >= expected_amount_usdt;
@@ -310,7 +310,10 @@ fn check_transfer(
         ));
     }
     if !recipient_ok {
-        return Err(format!("transfer {} recipient '{}' != custody '{custody_tron_address}'", transfer.transaction_id, transfer.to));
+        return Err(format!(
+            "transfer {} recipient '{}' != this intent's deposit address '{deposit_address}'",
+            transfer.transaction_id, transfer.to
+        ));
     }
     if !contract_ok {
         return Err(format!(
@@ -337,6 +340,10 @@ struct DepositBackedIntent {
     /// against it approves an intent on whoever's money happened to land first. Keeping it out of
     /// reach means no code path here can make that mistake again.
     expected_amount_usdt: Option<i64>,
+    /// The address THIS deposit was expected at. Read from the intent, never from config: the
+    /// verifier is the approver, and approving on evidence gathered at an address of its own
+    /// choosing would defeat the point of the four-eyes split.
+    deposit_address: Option<String>,
     deposit_tx_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -363,7 +370,18 @@ async fn evaluate(
         ));
     };
 
-    let transfers = match client.trc20_transfers(&config.custody_tron_address, &config.usdt_contract).await {
+    // Same rule as expected_amount_usdt: deposit-backed with no address is unverifiable, and
+    // Transient rather than HardMismatch because it is OUR data missing, not evidence against the
+    // user's money. Migration 0004's CHECK plus api.rs's 400 should make this unreachable for new
+    // rows; pre-per-address rows land here and escalate to a human via the stuck sweep.
+    let Some(deposit_address) = intent.deposit_address.clone() else {
+        return Evidence::Transient(format!(
+            "intent {} is deposit-backed but has no deposit_address — unverifiable",
+            intent.id
+        ));
+    };
+
+    let transfers = match client.trc20_transfers(&deposit_address, &config.usdt_contract).await {
         Ok(t) => t,
         Err(e) => return Evidence::Transient(format!("trongrid trc20 list: {e}")),
     };
@@ -384,23 +402,26 @@ async fn evaluate(
                 Ok(c) => c,
                 Err(e) => return Evidence::Transient(format!("trongrid get_transaction: {e}")),
             };
-            match check_transfer(transfer, confirmed, &config.custody_tron_address, &config.usdt_contract, expected_amount_usdt) {
+            match check_transfer(transfer, confirmed, &deposit_address, &config.usdt_contract, expected_amount_usdt) {
                 Ok(observed) => Evidence::Pass { tx_id: tx_id.clone(), observed_amount_usdt: observed },
                 Err(reason) if reason == "not yet confirmed" => Evidence::Transient(reason),
                 Err(reason) => Evidence::HardMismatch(reason),
             }
         }
         None => {
-            // Fallback, used only when Bitcart gave us no tx hash. This is the WEAKER evidence
-            // path: with no hash, the discriminated amount is all we have to identify the
-            // payment by, so the match is EXACT (not >=) and bounded in time.
+            // Fallback, used when the detector recorded no tx hash. Per-address deposits make
+            // this path materially STRONGER than it was.
             //
-            // Exact, because >= matches a different user's larger deposit — the amount is the
-            // only thing separating payers on the shared custody address. Time-bounded, because
-            // discriminator slots are recycled once an invoice goes terminal, so an old unclaimed
-            // transfer at the same amount could otherwise be swept up to back a stranger's later
-            // intent. An overpayment with no hash therefore does NOT auto-verify; it ages into
-            // the stuck sweep and a human, which is the right side to fail on.
+            // It used to require an EXACT amount match, because on one shared custody address the
+            // amount was the only thing separating payers and `>=` would have matched a different
+            // user's larger deposit. An address has exactly one intended payer, so `>=` is now
+            // safe — and an overpayment with no hash verifies instead of ageing into manual review.
+            //
+            // The time bound is KEPT even though derivation indices are never reused. It costs
+            // nothing and it still bounds the blast radius of an address being reused by mistake,
+            // whether by a restored-from-mnemonic signer scanning old indices or by a future bug.
+            // Removing a cheap guard because the current design makes it redundant is how the
+            // redundancy stops being there when the design shifts again.
             //
             // `only_confirmed=true` already restricts this list to confirmed transfers, so no
             // separate depth call is needed here.
@@ -408,15 +429,18 @@ async fn evaluate(
             let earliest_ms = (intent.created_at - window).timestamp_millis();
             let candidate = transfers.iter().find(|t| {
                 t.event_type == TRC20_TRANSFER_EVENT
-                    && t.to == config.custody_tron_address
+                    && t.to == deposit_address
                     && t.token_info.address == config.usdt_contract
-                    && t.value.parse::<i64>().ok() == Some(expected_amount_usdt)
+                    && t.value.parse::<i64>().ok().is_some_and(|v| v >= expected_amount_usdt)
                     && t.block_timestamp >= earliest_ms
             });
             match candidate {
+                // Ledger the OBSERVED amount, not the expected one — an overpayment recorded as
+                // the intended figure would build a permanent gap into the reconciliation
+                // cross-check against custody.
                 Some(transfer) => Evidence::Pass {
                     tx_id: transfer.transaction_id.clone(),
-                    observed_amount_usdt: expected_amount_usdt,
+                    observed_amount_usdt: transfer.value.parse::<i64>().unwrap_or(expected_amount_usdt),
                 },
                 // No matching transfer yet is exactly "the deposit hasn't been observed
                 // on-chain yet" — transient by construction, not a mismatch. Nothing here
@@ -563,20 +587,22 @@ async fn stuck_intent_sweep(pool: &PgPool, intents: &[DepositBackedIntent]) {
 /// evaluating or acting on ONE intent are alerted and skipped rather than aborting the batch.
 pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, String> {
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
-    let rows: Vec<(Uuid, Option<i64>, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT id, expected_amount_usdt, deposit_tx_id, created_at FROM mint_intents
-         WHERE status = 'created' AND client_ref IS NOT NULL
-         ORDER BY created_at",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at FROM mint_intents
+             WHERE status = 'created' AND client_ref IS NOT NULL
+             ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
-        .map(|(id, expected_amount_usdt, deposit_tx_id, created_at)| DepositBackedIntent {
+        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at)| DepositBackedIntent {
             id,
             expected_amount_usdt,
+            deposit_address,
             deposit_tx_id,
             created_at,
         })

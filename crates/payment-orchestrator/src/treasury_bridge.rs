@@ -68,8 +68,14 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
     let body = json!({
         "beneficiary": intent.clt_address,
         "amount_clt": intent.amount_clt,
-        // THE line: the DISCRIMINATED pay amount, never amount_clt. See module docs.
-        "expected_amount_usdt": intent.pay_amount_usdt,
+        // The amount the deposit had to reach. Now a SUFFICIENCY test rather than an identity:
+        // the address identifies the payer, so this only has to be met or exceeded.
+        "expected_amount_usdt": intent.amount_usdt,
+        // THE line that matters most now. The treasury's verifier is the approver, and it checks
+        // evidence at THIS address rather than one from its own config — approving on an address
+        // of its own choosing would defeat the four-eyes split. Sent from the row, so the address
+        // verified is the address the user was actually told to pay.
+        "deposit_address": intent.deposit_address,
         "client_ref": intent.id.to_string(),
         "deposit_tx_id": intent.tron_tx_id,
     });

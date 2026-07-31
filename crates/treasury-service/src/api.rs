@@ -75,6 +75,7 @@ struct CreateMintIntentBody {
     /// from another's. Rejected with 400 rather than defaulted, so a bridge that forgets to send
     /// it fails loudly instead of silently widening the verifier's match to `amount_clt`.
     expected_amount_usdt: Option<i64>,
+    deposit_address: Option<String>,
 }
 
 /// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
@@ -112,6 +113,11 @@ async fn create_mint_intent_handler(
         // verifier would have nothing to match on-chain transfers against but `amount_clt`,
         // which every user depositing the same round number shares. The DB CHECK also refuses
         // this; failing here makes the reason legible instead of a 500.
+        // A deposit-backed intent with no address is unverifiable, and unverifiable must never
+        // be approvable — refuse at the door rather than let it age into manual review.
+        if body.deposit_address.as_deref().is_none_or(str::is_empty) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         if body.expected_amount_usdt.is_none_or(|a| a <= 0) {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -124,6 +130,7 @@ async fn create_mint_intent_handler(
         body.client_ref.as_deref(),
         body.deposit_tx_id.as_deref(),
         body.expected_amount_usdt,
+        body.deposit_address.clone(),
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

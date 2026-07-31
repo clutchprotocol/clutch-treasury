@@ -20,10 +20,13 @@ pub struct MintIntent {
     /// telling one user's payment from another's, so it — never `amount_clt` — is what the
     /// verifier matches transfers against. Required for deposit-backed intents by a DB CHECK.
     pub expected_amount_usdt: Option<i64>,
+    /// The address this deposit was expected at. Mandatory for deposit-backed intents
+    /// (migration 0004's CHECK); `None` only for Plan B's human-created ones.
+    pub deposit_address: Option<String>,
 }
 
 const MINT_COLS: &str = "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, \
-    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt";
+    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address";
 
 /// `client_ref` is the orchestrator's idempotency key (Plan C T5) — `None` for Plan B's
 /// direct/manual mint intents, `Some(deposit_intent_id)` for deposit-backed ones the
@@ -40,12 +43,14 @@ pub async fn create_mint_intent(
     client_ref: Option<&str>,
     deposit_tx_id: Option<&str>,
     expected_amount_usdt: Option<i64>,
+    deposit_address: Option<String>,
 ) -> Result<MintIntent, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query_as::<_, MintIntent>(&format!(
         "INSERT INTO mint_intents
-            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {MINT_COLS}"
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
+             deposit_address)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING {MINT_COLS}"
     ))
     .bind(id)
     .bind(beneficiary)
@@ -55,6 +60,7 @@ pub async fn create_mint_intent(
     .bind(client_ref)
     .bind(deposit_tx_id)
     .bind(expected_amount_usdt)
+    .bind(deposit_address)
     .fetch_one(pool)
     .await
 }

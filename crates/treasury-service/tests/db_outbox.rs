@@ -27,7 +27,7 @@ async fn pool() -> PgPool {
 #[tokio::test]
 async fn watcher_credit_is_idempotent() {
     let pool = pool().await;
-    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None).await.unwrap();
+    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None, None).await.unwrap();
     approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
 
     // Simulate the watcher seeing the tx twice (reorg replay / crash-restart).
