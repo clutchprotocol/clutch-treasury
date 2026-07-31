@@ -1,4 +1,4 @@
-//! Watching the custody address directly, which is what replaced Bitcart.
+//! Watching per-intent deposit addresses, which is what replaced Bitcart.
 //!
 //! # Why Bitcart is gone
 //!
@@ -11,27 +11,30 @@
 //! ```
 //!
 //! `request_addresses` is only populated by `set_request_address(req, address)`, so a request is
-//! detectable only once the payer's Tron address has been registered against it in advance. Our
-//! model is the inverse: one shared static custody address, payers unknown until they pay, and
-//! the amount discriminator as the identity. Nothing configurable reconciles those.
+//! detectable only once the payer's Tron address has been registered against it in advance — which
+//! we cannot know. Reproduced in isolation against Nile with a private daemon: it synced to the
+//! chain head, read balances correctly, emitted `new_block` events past the block containing a
+//! marked transfer, and produced zero payment events. Per-invoice addresses would not have fixed
+//! it either, because `TRX_ACCOUNT_PATH` is a fixed single-address derivation path and the matcher
+//! keys on the sender regardless of which address receives.
 //!
-//! Reproduced in isolation against Nile with a private daemon: it synced to the chain head, it
-//! read the custody balance correctly (4.001474 -> 4.124930 USDT across a marked payment), it
-//! emitted `new_block` events past the block containing the transfer — and produced zero payment
-//! events, leaving the request at `sent_amount: "0.000000"`. Per-invoice addresses would not have
-//! helped either: `TRX_ACCOUNT_PATH = "m/44'/195'/0'/0/0"` is a fixed path, one address per
-//! wallet, and the matcher keys on the sender regardless of which address receives.
+//! # How matching works now
 //!
-//! # What this does instead
+//! Each intent has its OWN derived address (`derive.rs`), so the destination address identifies the
+//! payer. That is a strictly better identity than the amount discriminator it replaced: it has no
+//! 999-slot ceiling, no cross-user collision risk from a freed slot, and a payer who rounds their
+//! amount is still correctly attributed.
 //!
-//! Reads confirmed TRC-20 transfers into the custody address from TronGrid and matches them to
-//! intents on the EXACT discriminated amount. That is the same evidence rule `treasury-service`'s
-//! `tron_verifier` already applies as the approver — this crate is now the detector for it rather
-//! than trusting a third party that was matching on something else entirely.
+//! # The unavoidable cost
 //!
-//! One list fetch serves a whole poll pass, not one call per intent. There is no TronGrid API key
-//! on stage, and unkeyed TronGrid throttles hard — N calls per tick would reintroduce a failure
-//! that looks exactly like "no payments are arriving".
+//! TronGrid can only list TRC-20 transfers PER ADDRESS, and Tron has no way to watch an xpub as a
+//! group — derived addresses are unrelated on-chain. So this is one request per address being
+//! watched, not one per poll pass as it was under a single shared custody address.
+//!
+//! What keeps that bounded is that only OPEN intents are polled: the set is the number of in-flight
+//! deposits inside the TTL, not the number ever created. The poller caps it per tick and says so
+//! when it does, because an unkeyed TronGrid throttles hard and a throttled watcher is
+//! indistinguishable from "nobody is paying" — a failure mode already paid for once.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -40,61 +43,88 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservedTransfer {
     pub tx_id: String,
-    /// Base units. USDT-TRC20 is 6 decimals, the same scale as micro-USD at par, so this is
-    /// directly comparable to `pay_amount_usdt` with no rate conversion.
+    /// Base units. USDT-TRC20 is 6 decimals, the same scale as micro-USD at par, so this compares
+    /// directly against the intent's expected amount with no rate conversion.
     pub amount_usdt: i64,
     pub to: String,
     pub contract: String,
-    /// Epoch MILLISECONDS, verified against the live endpoint (same field `tron_verifier` reads).
+    /// Epoch MILLISECONDS, verified against the live endpoint.
     pub block_timestamp: i64,
 }
 
 #[async_trait]
 pub trait CustodyWatcher: Send + Sync {
-    /// Confirmed transfers into the custody address, most recent first. One call per poll pass.
-    async fn recent_transfers(&self) -> Result<Vec<ObservedTransfer>, String>;
+    /// Confirmed TRC-20 transfers into ONE address.
+    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String>;
 }
 
-/// EXACT match, never `>=`.
+/// What the observed transfers to an intent's address add up to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaymentOutcome {
+    /// Nothing has arrived at this address yet.
+    None,
+    /// Something arrived but it is short of the expected amount. NOT creditable — crediting the
+    /// expected amount here would mint CLT the deposit does not back.
+    Partial { received_usdt: i64 },
+    /// At least the expected amount arrived. `tx_id` is the EARLIEST contributing transfer, which
+    /// is the evidence the treasury's verifier re-checks independently.
+    Settled { tx_id: String, received_usdt: i64 },
+}
+
+/// Decide an intent's payment state from the transfers observed at its address.
 ///
-/// The fractional tail IS the payer's identity on a shared address, so a near-miss is a different
-/// payment, not this one. `>=` would let a larger unrelated transfer satisfy a smaller intent and
-/// credit the wrong user — the defect class that produced commit cb497e3 in the verifier, which
-/// matched `>= amount_clt` and let the discriminator never reach the treasury at all.
+/// Amounts are SUMMED over distinct transaction ids, so a payer who sends in two parts settles once
+/// both land. Duplicate ids are collapsed: the same transfer appearing twice in a response (or
+/// across a retry) must not count twice, or a single payment could satisfy twice its value.
 ///
-/// `uq_active_pay_amount` guarantees at most one *active* intent per amount, so a match here is
-/// unambiguous. Ties are still resolved oldest-first for determinism rather than relying on
-/// TronGrid's ordering.
-pub fn match_exact<'a>(
-    transfers: &'a [ObservedTransfer],
-    expected_amount_usdt: i64,
-) -> Option<&'a ObservedTransfer> {
-    transfers
-        .iter()
-        .filter(|t| t.amount_usdt == expected_amount_usdt)
-        .min_by_key(|t| t.block_timestamp)
+/// Overpayment settles at the observed total, deliberately. The ledger records what arrived, not
+/// what was intended — the reconciliation cross-check compares against custody, so recording the
+/// intended figure would build in a permanent discrepancy.
+pub fn evaluate_payment(transfers: &[ObservedTransfer], expected_amount_usdt: i64) -> PaymentOutcome {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut total: i64 = 0;
+    let mut earliest: Option<&ObservedTransfer> = None;
+
+    for t in transfers {
+        if seen.contains(&t.tx_id.as_str()) {
+            continue;
+        }
+        seen.push(&t.tx_id);
+        // Saturating: a hostile or corrupt amount must not wrap into something that looks settled.
+        total = total.saturating_add(t.amount_usdt);
+        if earliest.is_none_or(|e| t.block_timestamp < e.block_timestamp) {
+            earliest = Some(t);
+        }
+    }
+
+    match earliest {
+        None => PaymentOutcome::None,
+        Some(e) if total >= expected_amount_usdt => {
+            PaymentOutcome::Settled { tx_id: e.tx_id.clone(), received_usdt: total }
+        }
+        Some(_) => PaymentOutcome::Partial { received_usdt: total },
+    }
 }
 
 pub struct TronGridWatcher {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
-    custody_address: String,
     usdt_contract: String,
 }
 
-/// TronGrid caps `limit` at 200 and defaults it to 20. Ask for the max: a busy custody address
-/// with more than one page of recent transfers could otherwise push a legitimate deposit off the
-/// only page we look at, and the intent would sit unmatched until it expired.
+/// TronGrid caps `limit` at 200 and defaults it to 20. A per-intent address should only ever see a
+/// handful of transfers, so this is headroom rather than a real bound — but the default of 20 is
+/// small enough to truncate a pathological case, and a truncated page reads as a missing payment.
 const PAGE_LIMIT: &str = "200";
 
 /// Only this TRC-20 event kind moves value. An `Approval` carries a `to` and a `value` too, so
-/// without this check an approval could satisfy an amount match with nothing having moved.
+/// without this check an approval could satisfy an amount check with nothing having moved.
 const TRANSFER_EVENT: &str = "Transfer";
 
 impl TronGridWatcher {
-    pub fn new(base_url: String, api_key: String, custody_address: String, usdt_contract: String) -> Self {
-        Self { http: reqwest::Client::new(), base_url, api_key, custody_address, usdt_contract }
+    pub fn new(base_url: String, api_key: String, usdt_contract: String) -> Self {
+        Self { http: reqwest::Client::new(), base_url, api_key, usdt_contract }
     }
 }
 
@@ -102,8 +132,8 @@ impl TronGridWatcher {
 struct Trc20Row {
     transaction_id: String,
     to: String,
-    /// Decimal STRING in base units — verified against the live endpoint. Parsed as an integer;
-    /// a float here would reintroduce the precision loss the integer peg exists to eliminate.
+    /// Decimal STRING in base units — verified against the live endpoint. Parsed as an integer; a
+    /// float here would reintroduce the precision loss the integer peg exists to eliminate.
     value: String,
     token_info: TokenInfo,
     #[serde(default, rename = "type")]
@@ -125,16 +155,16 @@ struct Trc20Response {
 
 #[async_trait]
 impl CustodyWatcher for TronGridWatcher {
-    async fn recent_transfers(&self) -> Result<Vec<ObservedTransfer>, String> {
-        let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, self.custody_address);
+    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String> {
+        let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, address);
         let resp = self
             .http
             .get(&url)
             .header("TRON-PRO-API-KEY", &self.api_key)
             .query(&[
-                // Confirmed only. This is also the confirmation gate: TronGrid excludes
-                // transfers from blocks that are not yet irreversible, so a transfer appearing
-                // here has the confirmed depth the verifier separately re-checks.
+                // Confirmed only. This doubles as the confirmation gate: TronGrid excludes
+                // transfers from blocks that are not yet irreversible, so anything appearing here
+                // already has the depth the treasury's verifier separately re-checks.
                 ("only_confirmed", "true"),
                 ("contract_address", self.usdt_contract.as_str()),
                 ("limit", PAGE_LIMIT),
@@ -145,33 +175,29 @@ impl CustodyWatcher for TronGridWatcher {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid trc20 list failed: {status} {text}"));
+            return Err(format!("trongrid trc20 list for {address} failed: {status} {text}"));
         }
         let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
         if parsed.data.len() >= PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX) {
-            tracing::warn!(
-                "trongrid returned a full page ({PAGE_LIMIT}) of custody transfers — older ones may \
-                 be truncated; paginate via meta.links.next if this becomes routine"
-            );
+            tracing::warn!("trongrid returned a full page of transfers for {address} — older ones may be truncated");
         }
-        Ok(rows_to_transfers(parsed.data, &self.custody_address, &self.usdt_contract))
+        Ok(rows_to_transfers(parsed.data, address, &self.usdt_contract))
     }
 }
 
 /// Filter and convert, kept pure so the parsing rules are testable without HTTP.
 ///
-/// Re-checks recipient and contract even though the query already filters by contract: this is
-/// the money path, the filter is a remote system's promise, and a mismatch here would attribute a
-/// stranger's transfer to one of our intents.
-fn rows_to_transfers(rows: Vec<Trc20Row>, custody: &str, contract: &str) -> Vec<ObservedTransfer> {
+/// Re-checks the recipient even though the request was scoped to that address, and the contract
+/// even though the query filters by it. Both are a remote system's promise about a money path; a
+/// mismatch would attribute a stranger's transfer, or a worthless token, to one of our intents.
+fn rows_to_transfers(rows: Vec<Trc20Row>, expected_to: &str, contract: &str) -> Vec<ObservedTransfer> {
     rows.into_iter()
         .filter(|r| r.event_type == TRANSFER_EVENT)
-        .filter(|r| r.to == custody)
+        .filter(|r| r.to == expected_to)
         .filter(|r| r.token_info.address == contract)
         .filter_map(|r| {
-            // An unparseable amount is dropped, not defaulted to 0: a 0 would compare equal to
-            // nothing and silently vanish, but it would also pollute the unattributed-payment
-            // alert with a phantom zero-value transfer.
+            // An unparseable amount is dropped, not defaulted to 0: a phantom zero would pollute
+            // the sum's provenance while contributing nothing.
             let amount = r.value.parse::<i64>().ok()?;
             Some(ObservedTransfer {
                 tx_id: r.transaction_id,
@@ -188,7 +214,8 @@ fn rows_to_transfers(rows: Vec<Trc20Row>, custody: &str, contract: &str) -> Vec<
 mod tests {
     use super::*;
 
-    const CUSTODY: &str = "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX";
+    const ADDR: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+    const OTHER: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
     const USDT: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
 
     fn row(tx: &str, to: &str, contract: &str, value: &str, event: &str, ts: i64) -> Trc20Row {
@@ -202,94 +229,108 @@ mod tests {
         }
     }
 
-    fn transfer(tx: &str, amount: i64, ts: i64) -> ObservedTransfer {
-        ObservedTransfer {
-            tx_id: tx.into(),
-            amount_usdt: amount,
-            to: CUSTODY.into(),
-            contract: USDT.into(),
-            block_timestamp: ts,
+    fn t(tx: &str, amount: i64, ts: i64) -> ObservedTransfer {
+        ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: ADDR.into(), contract: USDT.into(), block_timestamp: ts }
+    }
+
+    #[test]
+    fn nothing_observed_is_none() {
+        assert_eq!(evaluate_payment(&[], 1_000_000), PaymentOutcome::None);
+    }
+
+    #[test]
+    fn exact_amount_settles() {
+        let got = evaluate_payment(&[t("a", 1_000_000, 10)], 1_000_000);
+        assert_eq!(got, PaymentOutcome::Settled { tx_id: "a".into(), received_usdt: 1_000_000 });
+    }
+
+    /// A rounded payment settles now, where the amount discriminator would have left it unmatched
+    /// and stranded. This is the practical win of address-based identity.
+    #[test]
+    fn a_rounded_payment_settles_instead_of_stranding() {
+        let got = evaluate_payment(&[t("round", 1_000_000, 10)], 1_000_000);
+        assert!(matches!(got, PaymentOutcome::Settled { .. }));
+    }
+
+    /// Overpayment records what ARRIVED, not what was intended — the reconciliation cross-check
+    /// compares the ledger against custody, so recording the intended figure builds in a permanent
+    /// discrepancy.
+    #[test]
+    fn overpayment_settles_at_the_observed_total() {
+        let got = evaluate_payment(&[t("over", 5_000_000, 10)], 1_000_000);
+        assert_eq!(got, PaymentOutcome::Settled { tx_id: "over".into(), received_usdt: 5_000_000 });
+    }
+
+    /// Underpayment must NOT settle. Crediting the expected amount here mints CLT the deposit does
+    /// not back.
+    #[test]
+    fn underpayment_is_partial_never_settled() {
+        let got = evaluate_payment(&[t("short", 999_999, 10)], 1_000_000);
+        assert_eq!(got, PaymentOutcome::Partial { received_usdt: 999_999 });
+    }
+
+    #[test]
+    fn two_part_payment_settles_once_the_sum_reaches_expected() {
+        let parts = vec![t("p1", 400_000, 10), t("p2", 600_000, 20)];
+        let got = evaluate_payment(&parts, 1_000_000);
+        assert_eq!(got, PaymentOutcome::Settled { tx_id: "p1".into(), received_usdt: 1_000_000 },
+                   "evidence must name the EARLIEST contributing transfer");
+    }
+
+    /// The same transfer seen twice — a duplicated response, or a retry — must not count twice, or
+    /// one payment could satisfy twice its value.
+    #[test]
+    fn a_duplicate_transaction_id_is_counted_once() {
+        let dupes = vec![t("same", 600_000, 10), t("same", 600_000, 10)];
+        assert_eq!(evaluate_payment(&dupes, 1_000_000), PaymentOutcome::Partial { received_usdt: 600_000 });
+    }
+
+    /// A corrupt or hostile amount must not wrap into something that looks settled.
+    #[test]
+    fn absurd_amounts_saturate_rather_than_overflow() {
+        let huge = vec![t("h1", i64::MAX, 10), t("h2", i64::MAX, 20)];
+        match evaluate_payment(&huge, 1_000_000) {
+            PaymentOutcome::Settled { received_usdt, .. } => assert_eq!(received_usdt, i64::MAX),
+            other => panic!("expected saturated Settled, got {other:?}"),
         }
     }
 
     #[test]
-    fn exact_amount_matches() {
-        let ts = vec![transfer("a", 1_000_133, 10), transfer("b", 1_000_219, 20)];
-        assert_eq!(match_exact(&ts, 1_000_219).unwrap().tx_id, "b");
-    }
-
-    /// The whole point of the discriminator: one micro-unit off is a DIFFERENT payment.
-    #[test]
-    fn near_miss_is_not_a_match() {
-        let ts = vec![transfer("a", 1_000_133, 10)];
-        assert!(match_exact(&ts, 1_000_132).is_none());
-        assert!(match_exact(&ts, 1_000_134).is_none());
-    }
-
-    /// A larger transfer must never satisfy a smaller intent — that is cb497e3's defect class,
-    /// and on a shared custody address it credits the wrong user.
-    #[test]
-    fn a_larger_transfer_never_satisfies_a_smaller_intent() {
-        let ts = vec![transfer("whale", 50_000_000, 10)];
-        assert!(match_exact(&ts, 1_000_133).is_none());
-    }
-
-    /// Underpayment must not match either: it is not this deposit, it is an unattributed payment.
-    #[test]
-    fn underpayment_does_not_match() {
-        let ts = vec![transfer("short", 999_999, 10)];
-        assert!(match_exact(&ts, 1_000_133).is_none());
-    }
-
-    #[test]
-    fn duplicate_amounts_resolve_oldest_first_deterministically() {
-        let ts = vec![transfer("newer", 1_000_133, 999), transfer("older", 1_000_133, 5)];
-        assert_eq!(match_exact(&ts, 1_000_133).unwrap().tx_id, "older");
-    }
-
-    #[test]
-    fn empty_list_matches_nothing() {
-        assert!(match_exact(&[], 1_000_133).is_none());
-    }
-
-    #[test]
     fn approval_events_are_dropped() {
-        let rows = vec![row("appr", CUSTODY, USDT, "1000133", "Approval", 1)];
-        assert!(rows_to_transfers(rows, CUSTODY, USDT).is_empty(), "an Approval moves no value");
+        let rows = vec![row("appr", ADDR, USDT, "1000000", "Approval", 1)];
+        assert!(rows_to_transfers(rows, ADDR, USDT).is_empty(), "an Approval moves no value");
     }
 
-    /// A missing `type` must fail closed rather than be assumed to be a Transfer.
     #[test]
     fn absent_event_type_is_dropped() {
-        let rows = vec![row("none", CUSTODY, USDT, "1000133", "", 1)];
-        assert!(rows_to_transfers(rows, CUSTODY, USDT).is_empty());
+        let rows = vec![row("none", ADDR, USDT, "1000000", "", 1)];
+        assert!(rows_to_transfers(rows, ADDR, USDT).is_empty());
+    }
+
+    /// The request is scoped to one address, but a response naming a different recipient must still
+    /// be discarded — otherwise a stranger's transfer could be attributed to this intent.
+    #[test]
+    fn a_transfer_to_a_different_address_is_dropped() {
+        let rows = vec![row("elsewhere", OTHER, USDT, "1000000", "Transfer", 1)];
+        assert!(rows_to_transfers(rows, ADDR, USDT).is_empty());
     }
 
     #[test]
-    fn transfers_to_another_address_are_dropped() {
-        let rows = vec![row("other", "TSomeoneElseAddressXXXXXXXXXXXXXXX", USDT, "1000133", "Transfer", 1)];
-        assert!(rows_to_transfers(rows, CUSTODY, USDT).is_empty());
-    }
-
-    /// Defence in depth: the query filters by contract, but a remote system's filter is a promise,
-    /// not a guarantee, and the wrong token would credit CLT against a worthless deposit.
-    #[test]
-    fn transfers_of_another_token_are_dropped() {
-        let rows = vec![row("wrongtok", CUSTODY, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", "1000133", "Transfer", 1)];
-        assert!(rows_to_transfers(rows, CUSTODY, USDT).is_empty());
+    fn a_transfer_of_another_token_is_dropped() {
+        let rows = vec![row("wrongtok", ADDR, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", "1000000", "Transfer", 1)];
+        assert!(rows_to_transfers(rows, ADDR, USDT).is_empty());
     }
 
     #[test]
-    fn unparseable_amount_is_dropped_not_zeroed() {
-        let rows = vec![row("bad", CUSTODY, USDT, "1.000133", "Transfer", 1)];
-        assert!(rows_to_transfers(rows, CUSTODY, USDT).is_empty(), "base units are integers");
+    fn a_non_integer_amount_is_dropped() {
+        let rows = vec![row("bad", ADDR, USDT, "1.000000", "Transfer", 1)];
+        assert!(rows_to_transfers(rows, ADDR, USDT).is_empty(), "base units are integers");
     }
 
     #[test]
     fn a_good_row_survives_with_every_field_intact() {
-        let rows = vec![row("good", CUSTODY, USDT, "1000133", "Transfer", 1785465765000)];
-        let out = rows_to_transfers(rows, CUSTODY, USDT);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0], transfer("good", 1_000_133, 1785465765000));
+        let rows = vec![row("good", ADDR, USDT, "1000000", "Transfer", 1785465765000)];
+        let out = rows_to_transfers(rows, ADDR, USDT);
+        assert_eq!(out, vec![t("good", 1_000_000, 1785465765000)]);
     }
 }

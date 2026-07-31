@@ -29,14 +29,12 @@ async fn main() {
     let watcher: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(
         config.trongrid_url.clone(),
         config.trongrid_api_key.clone(),
-        config.custody_tron_address.clone(),
         config.usdt_contract.clone(),
     ));
 
     // The ONLY detection path. Bitcart is gone: its TRX daemon attributes payments by the sender's
-    // address, which cannot work for a shared custody address with payers unknown until they pay
-    // (see custody.rs). This watches the custody address directly and matches on the exact
-    // discriminated amount.
+    // address, which we cannot know in advance (see custody.rs). This polls each open intent's OWN
+    // derived address and matches by destination.
     tokio::spawn(payment_orchestrator::poller::run(pool.clone(), watcher, config.poll_interval_secs));
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the

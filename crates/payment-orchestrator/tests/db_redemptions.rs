@@ -23,13 +23,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Public test material; never holds funds.
 const TEST_XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
 
-/// `&'static` so call sites can pass it without creating a temporary that is dropped while
-/// borrowed, and so the xpub is parsed once per test binary rather than per call.
-fn test_deriver() -> &'static payment_orchestrator::derive::AddressDeriver {
-    static D: std::sync::OnceLock<payment_orchestrator::derive::AddressDeriver> = std::sync::OnceLock::new();
-    D.get_or_init(|| payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap())
-}
-
 const JWT_SECRET: &str = "test-jwt-secret";
 
 /// A genuinely base58check-valid Tron mainnet address (the widely-published USDT-TRC20
