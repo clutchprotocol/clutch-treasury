@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use payment_orchestrator::adapter::BitcartAdapter;
+use payment_orchestrator::custody::{CustodyWatcher, TronGridWatcher};
 use payment_orchestrator::api;
 use payment_orchestrator::configuration::OrchConfig;
 
@@ -18,24 +18,24 @@ async fn main() {
         .expect("connect postgres");
     sqlx::migrate!("./migrations").run(&pool).await.expect("migrations");
 
-    let adapter: Arc<dyn payment_orchestrator::adapter::PaymentAdapter> = Arc::new(BitcartAdapter {
-        http: reqwest::Client::new(),
-        base_url: config.bitcart_url.clone(),
-        token: config.bitcart_token.clone(),
-        store_id: config.bitcart_store_id.clone(),
-        deposit_ttl_minutes: config.deposit_ttl_minutes,
-        invoice_currency: config.bitcart_invoice_currency.clone(),
-    });
+    let watcher: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(
+        config.trongrid_url.clone(),
+        config.trongrid_api_key.clone(),
+        config.custody_tron_address.clone(),
+        config.usdt_contract.clone(),
+    ));
 
-    // The poller is the reliability path (Bitcart's IPN is unsigned and never retried) — every
-    // state the webhook can reach must also be reachable here alone, on a plain timer.
-    tokio::spawn(payment_orchestrator::poller::run(pool.clone(), adapter.clone(), config.poll_interval_secs));
+    // The ONLY detection path. Bitcart is gone: its TRX daemon attributes payments by the sender's
+    // address, which cannot work for a shared custody address with payers unknown until they pay
+    // (see custody.rs). This watches the custody address directly and matches on the exact
+    // discriminated amount.
+    tokio::spawn(payment_orchestrator::poller::run(pool.clone(), watcher, config.poll_interval_secs));
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
-    // treasury's private zone. Same poll-interval convention as the Bitcart poller above.
+    // treasury's private zone. Same poll-interval convention as the poller above.
     tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));
 
-    let app = api::router(pool, config.clone(), adapter);
+    let app = api::router(pool, config.clone());
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("payment-orchestrator listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");

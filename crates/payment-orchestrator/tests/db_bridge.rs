@@ -30,7 +30,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, webhook_events, alerts RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, alerts RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -43,15 +43,13 @@ fn test_config(treasury_url: String) -> OrchConfig {
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: "test-jwt-secret".into(),
         allowed_origins: "*".into(),
-        bitcart_url: "http://unused".into(),
-        bitcart_token: "t".into(),
-        bitcart_store_id: "s".into(),
-        bitcart_invoice_currency: "USDT".into(),
-        public_base_url: "http://unused".into(),
         treasury_url,
         treasury_initiator_token: "test-treasury-initiator".into(),
         treasury_readonly_token: "test-treasury-readonly".into(),
         custody_tron_address: "Tunused".into(),
+        trongrid_url: "http://localhost:0".to_string(),
+        trongrid_api_key: "test-key".to_string(),
+        usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
         deposit_ttl_minutes: 30,
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
@@ -81,7 +79,7 @@ async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, pay_amount_usdt:
     sqlx::query(
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, status, client_key,
-             invoice_id, tron_tx_id, bitcart_terminal, expires_at, next_attempt_at)
+             invoice_id, tron_tx_id, payment_window_closed, expires_at, next_attempt_at)
          VALUES ($1, 'user-pk-1', 'TBeneficiary1111111111111111111111', $2, $3, $2, 'confirmed', $4,
                  'inv-1', $5, TRUE, now() + interval '30 minutes', now() - interval '1 hour')",
     )
@@ -504,19 +502,7 @@ async fn a_successful_call_resets_the_consecutive_failure_streak() {
 /// rather than proceeding to call Bitcart — proven via the FakeAdapter panicking if invoked.
 #[tokio::test]
 async fn headroom_check_refuses_when_insufficient() {
-    use async_trait::async_trait;
-    use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
-
-    struct PanicsIfCalledAdapter;
-    #[async_trait]
-    impl PaymentAdapter for PanicsIfCalledAdapter {
-        async fn create_invoice(&self, _: &str, _: i64, _: &str) -> Result<PaymentInstructions, String> {
-            panic!("Bitcart must never be called when headroom is insufficient — fail closed BEFORE creating any invoice");
-        }
-        async fn get_invoice(&self, _: &str) -> Result<InvoiceStatus, String> {
-            unimplemented!("not exercised by this test")
-        }
-    }
+    
 
     let pool = pool().await;
     let server = MockServer::start().await;
@@ -530,12 +516,10 @@ async fn headroom_check_refuses_when_insufficient() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
-        &PanicsIfCalledAdapter,
         "user-pk-headroom",
         "clt-addr-headroom",
         1_000_000, // exceeds the 500_000 headroom reported above
         "key-headroom-insufficient",
-        "http://unused/webhooks/bitcart",
     )
     .await;
 
@@ -555,19 +539,7 @@ async fn headroom_check_refuses_when_insufficient() {
 /// refuse (503-shaped), never silently proceed as if headroom were fine.
 #[tokio::test]
 async fn headroom_check_refuses_when_treasury_unreachable() {
-    use async_trait::async_trait;
-    use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
-
-    struct PanicsIfCalledAdapter;
-    #[async_trait]
-    impl PaymentAdapter for PanicsIfCalledAdapter {
-        async fn create_invoice(&self, _: &str, _: i64, _: &str) -> Result<PaymentInstructions, String> {
-            panic!("Bitcart must never be called when the treasury is unreachable — fail closed");
-        }
-        async fn get_invoice(&self, _: &str) -> Result<InvoiceStatus, String> {
-            unimplemented!("not exercised by this test")
-        }
-    }
+    
 
     let pool = pool().await;
     // No MockServer at all for this one — a bare unroutable URL simulates a treasury that is
@@ -579,12 +551,10 @@ async fn headroom_check_refuses_when_treasury_unreachable() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
-        &PanicsIfCalledAdapter,
         "user-pk-unreachable",
         "clt-addr-unreachable",
         1_000_000,
         "key-headroom-unreachable",
-        "http://unused/webhooks/bitcart",
     )
     .await;
 
@@ -598,24 +568,7 @@ async fn headroom_check_refuses_when_treasury_unreachable() {
 /// proven by reaching a real 201 Respond via a working FakeAdapter.
 #[tokio::test]
 async fn headroom_check_allows_through_when_sufficient() {
-    use async_trait::async_trait;
-    use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
-
-    struct WorkingAdapter;
-    #[async_trait]
-    impl PaymentAdapter for WorkingAdapter {
-        async fn create_invoice(&self, order_id: &str, pay_amount_usdt: i64, _: &str) -> Result<PaymentInstructions, String> {
-            Ok(PaymentInstructions {
-                invoice_id: format!("inv-{order_id}"),
-                pay_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".to_string(),
-                pay_amount_usdt,
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            })
-        }
-        async fn get_invoice(&self, _: &str) -> Result<InvoiceStatus, String> {
-            unimplemented!("not exercised by this test")
-        }
-    }
+    
 
     let pool = pool().await;
     let server = MockServer::start().await;
@@ -629,12 +582,10 @@ async fn headroom_check_allows_through_when_sufficient() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
-        &WorkingAdapter,
         "user-pk-sufficient",
         "clt-addr-sufficient",
         1_000_000,
         "key-headroom-sufficient",
-        "http://unused/webhooks/bitcart",
     )
     .await;
 

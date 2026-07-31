@@ -6,23 +6,23 @@
 //! per the comment there (sqlx's `_sqlx_migrations` bookkeeping table has no configurable
 //! name, so two crates' migrators would corrupt each other's history on ONE shared DB).
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
 use payment_orchestrator::configuration::OrchConfig;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const JWT_SECRET: &str = "test-jwt-secret";
+
+/// `pay_address` is now read straight from config rather than returned by a payment
+/// gateway, so the response must echo exactly this.
+const TEST_CUSTODY: &str = "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX";
 
 /// Plan C 5b landed the daily-headroom check inside `create_and_invoice` — every deposit create
 /// now GETs the treasury's `/internal/reserve-status` before ever calling Bitcart. This file's
@@ -50,7 +50,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, webhook_events RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -63,15 +63,13 @@ fn test_config(treasury_url: String) -> OrchConfig {
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: JWT_SECRET.into(),
         allowed_origins: "*".into(),
-        bitcart_url: "http://unused".into(),
-        bitcart_token: "t".into(),
-        bitcart_store_id: "s".into(),
-        bitcart_invoice_currency: "USDT".into(),
-        public_base_url: "https://orchestrator.example".into(),
         treasury_url,
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
-        custody_tron_address: "Tunused".into(),
+        custody_tron_address: TEST_CUSTODY.into(),
+        trongrid_url: "http://localhost:0".to_string(),
+        trongrid_api_key: "test-key".to_string(),
+        usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
         deposit_ttl_minutes: 30,
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
@@ -96,42 +94,8 @@ fn bearer_for(pk: &str) -> String {
     format!("Bearer {token}")
 }
 
-/// Canned adapter: always returns the same invoice shape, and counts calls so a test can
-/// assert Bitcart was (or was not) actually invoked — e.g. a replay must NOT call it again.
-struct FakeAdapter {
-    calls: AtomicUsize,
-}
-
-impl FakeAdapter {
-    fn new() -> Self {
-        Self { calls: AtomicUsize::new(0) }
-    }
-}
-
-#[async_trait]
-impl PaymentAdapter for FakeAdapter {
-    async fn create_invoice(
-        &self,
-        order_id: &str,
-        pay_amount_usdt: i64,
-        _notification_url: &str,
-    ) -> Result<PaymentInstructions, String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(PaymentInstructions {
-            invoice_id: format!("inv-{order_id}"),
-            pay_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".to_string(),
-            pay_amount_usdt,
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-        })
-    }
-
-    async fn get_invoice(&self, _invoice_id: &str) -> Result<InvoiceStatus, String> {
-        unimplemented!("not exercised by T2b's routes")
-    }
-}
-
-fn router_with(pool: PgPool, config: OrchConfig, adapter: Arc<dyn PaymentAdapter>) -> axum::Router {
-    payment_orchestrator::api::router(pool, config, adapter)
+fn router_with(pool: PgPool, config: OrchConfig) -> axum::Router {
+    payment_orchestrator::api::router(pool, config)
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -141,14 +105,14 @@ async fn body_json(resp: axum::response::Response) -> Value {
 
 /// Core end-to-end replay property (spec §6, the reason this task exists): the SAME
 /// Idempotency-Key + SAME body must return the ORIGINAL status and body on a second call —
-/// not a fresh 201, and not the adapter being invoked a second time.
+/// not a fresh 201. (There is no longer any gateway call to double-invoke — the second
+/// half of that original property is now structurally impossible.)
 #[tokio::test]
 async fn replay_same_key_same_body_returns_original_status_and_body() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter.clone());
+    let app = router_with(pool.clone(), config.clone());
     let auth = bearer_for("0xalice");
 
     let make_request = || {
@@ -165,8 +129,10 @@ async fn replay_same_key_same_body_returns_original_status_and_body() {
     let first = app.clone().oneshot(make_request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::CREATED, "first call must create and return 201");
     let first_body = body_json(first).await;
-    assert_eq!(first_body["pay_address"], "TCustodyAddressXXXXXXXXXXXXXXXXXXX");
-    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1, "Bitcart must be called exactly once so far");
+    assert_eq!(
+        first_body["pay_address"], TEST_CUSTODY,
+        "pay_address must be the configured custody address"
+    );
 
     // Second call: identical key, identical body.
     let second = app.oneshot(make_request()).await.unwrap();
@@ -177,11 +143,6 @@ async fn replay_same_key_same_body_returns_original_status_and_body() {
     );
     let second_body = body_json(second).await;
     assert_eq!(second_body, first_body, "replay must return the ORIGINAL stored body verbatim");
-    assert_eq!(
-        adapter.calls.load(Ordering::SeqCst),
-        1,
-        "replay must NOT call Bitcart again — the stored response is served, not a fresh invoice"
-    );
 }
 
 /// Same Idempotency-Key, DIFFERENT body — the client is confused about what it asked for;
@@ -191,8 +152,7 @@ async fn same_key_different_body_returns_409() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter.clone());
+    let app = router_with(pool.clone(), config.clone());
     let auth = bearer_for("0xalice");
 
     let first = app
@@ -244,8 +204,7 @@ async fn retry_while_processing_returns_409_with_retry_after() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter.clone());
+    let app = router_with(pool.clone(), config.clone());
     let auth = bearer_for("0xbob");
 
     // First call creates the row for (user_pk="0xbob", client_key="key-stillproc-1").
@@ -307,8 +266,7 @@ async fn get_deposit_rejects_non_owner() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter.clone());
+    let app = router_with(pool.clone(), config.clone());
 
     let create_res = app
         .clone()
@@ -370,8 +328,7 @@ async fn out_of_bounds_amount_returns_400() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter);
+    let app = router_with(pool.clone(), config.clone());
 
     let res = app
         .oneshot(
@@ -396,8 +353,7 @@ async fn missing_idempotency_key_returns_400() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter);
+    let app = router_with(pool.clone(), config.clone());
 
     let res = app
         .oneshot(
@@ -420,8 +376,7 @@ async fn missing_auth_returns_401() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri());
-    let adapter = Arc::new(FakeAdapter::new());
-    let app = router_with(pool.clone(), config.clone(), adapter);
+    let app = router_with(pool.clone(), config.clone());
 
     let res = app
         .oneshot(

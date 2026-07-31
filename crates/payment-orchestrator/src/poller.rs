@@ -1,102 +1,187 @@
-//! The reliability path (T4 brief): Bitcart's IPN is unsigned and never retried, so the
-//! webhook (`webhook.rs`) is only latency reduction — every state it can reach must also be
-//! reachable by this poller alone, on a plain timer, with no dependency on Bitcart having
-//! delivered anything. It calls the exact same `apply_invoice_update` the webhook does, so
-//! that property holds by construction rather than by keeping two code paths in sync by hand.
+//! The detection path. One TronGrid fetch per pass, matched against every intent still able to
+//! take a payment.
+//!
+//! This replaced a Bitcart-refetch loop. There is no webhook any more and nothing to reduce
+//! latency against, so this timer is not an "also" path — it is the only path, which is simpler to
+//! reason about than the previous arrangement where a webhook could in principle reach a state the
+//! poller had to be kept able to reach too.
+//!
+//! Ordering inside a pass is deliberate: match BEFORE sweeping expiry, so a payment that landed
+//! moments before the TTL is credited rather than raced into `expired` by our own timer.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
 
-use crate::adapter::PaymentAdapter;
-use crate::webhook::apply_invoice_update;
+use crate::alerts::alert;
+use crate::custody::{match_exact, CustodyWatcher, ObservedTransfer};
+use crate::deposits;
 
-/// `webhook_events` rows exist for idempotency-layer-2 dedup on recent deliveries; nothing
-/// reads one 30 days later, so this bounds the table instead of growing it forever.
-const WEBHOOK_EVENT_RETENTION_DAYS: i64 = 30;
+/// How long after an intent stops being payable its discriminator slot stays reserved.
+///
+/// The slot cannot be freed the moment we stop crediting: a payer whose transaction is already in
+/// flight would land on an amount a DIFFERENT user has since been allocated, and on a shared
+/// custody address the amount is the only thing telling them apart — cross-user misattribution,
+/// the invariant migration 0003 exists to protect. Held for a full day so a late or slow payment
+/// is still identifiable by a human reconciling custody.
+const SLOT_HOLD_HOURS: i64 = 24;
 
-/// `created` intents this old with an invoice on file are as stuck as `invoiced` ones — this
-/// only matters for a create-flow that stored `invoice_id` without also flipping `status` to
-/// `invoiced` (shouldn't happen given `store_invoice`'s single UPDATE, but the brief calls out
-/// this set explicitly as a belt-and-braces catch-up).
-const STUCK_CREATED_MINUTES: i64 = 2;
+/// One pass: fetch confirmed custody transfers once, credit exact matches, close stale payment
+/// windows, and report anything that arrived for no intent at all.
+pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
+    let transfers = match watcher.recent_transfers().await {
+        Ok(t) => t,
+        Err(e) => {
+            // Transient by assumption — TronGrid down, throttled, or a network blip. Nothing is
+            // persisted from a failed fetch and no intent is advanced or expired on the strength
+            // of an unread chain, which would be indistinguishable from "nobody paid".
+            alert(pool, "warn", "poller", &format!("custody fetch failed: {e}")).await;
+            return;
+        }
+    };
 
-/// One poll pass: refetch every non-terminal invoiced/paying/late-expired intent, soft-expire
-/// anything past `expires_at`, and sweep old webhook_events. Runs on `poll_interval_secs.`
-pub async fn poll_once(pool: &PgPool, adapter: &dyn PaymentAdapter) {
-    for invoice_id in due_invoice_ids(pool).await {
-        apply_invoice_update(pool, adapter, &invoice_id).await;
-    }
+    match_due_intents(pool, &transfers).await;
     sweep_expired(pool).await;
-    sweep_old_webhook_events(pool).await;
+    close_stale_payment_windows(pool).await;
+    report_unattributed(pool, &transfers).await;
 }
 
-/// Selects `invoice_id`s for every intent this poll pass must refetch:
-/// - `invoiced` / `paying`: normal in-flight polling.
-/// - `expired` with `bitcart_terminal = FALSE`: the late-payment window (Decisions block —
-///   our soft expiry does not mean Bitcart's invoice is dead; refetch until Bitcart says so).
-/// - `created` older than `STUCK_CREATED_MINUTES` that somehow already has an invoice_id.
-/// - `needs_manual` / `failed` with `bitcart_terminal = FALSE`: NOT to change their status —
-///   `apply_invoice_update`'s from-sets deliberately never move a `needs_manual` row, so the
-///   human's flag stands. These are polled purely so `bitcart_terminal` eventually gets set,
-///   which is what releases the discriminator slot those rows are holding (migration 0003).
-///   Without this, an underpaid deposit would reserve its amount forever.
-async fn due_invoice_ids(pool: &PgPool) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT invoice_id FROM deposit_intents
-         WHERE invoice_id IS NOT NULL
-           AND (
-             status IN ('invoiced', 'paying')
-             OR (status IN ('expired', 'needs_manual', 'failed') AND NOT bitcart_terminal)
-             OR (status = 'created' AND created_at < now() - ($1 || ' minutes')::interval)
-           )",
+/// Credit every payable intent whose exact discriminated amount is present on chain.
+async fn match_due_intents(pool: &PgPool, transfers: &[ObservedTransfer]) {
+    let due = match sqlx::query_as::<_, (uuid::Uuid, i64)>(
+        // `expired` is included on purpose: our expiry is a soft local timer, and at par there is
+        // no FX risk in honouring a late payment. It stops being creditable when the payment
+        // window closes below, not when the TTL lapses.
+        "SELECT id, pay_amount_usdt FROM deposit_intents
+         WHERE status IN ('created', 'invoiced', 'paying', 'expired')
+           AND NOT payment_window_closed",
     )
-    .bind(STUCK_CREATED_MINUTES.to_string())
     .fetch_all(pool)
     .await
-    .unwrap_or_else(|e| {
-        tracing::error!("poller: failed to select due invoices: {e}");
-        Vec::new()
-    })
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("poller: failed to select payable intents: {e}");
+            return;
+        }
+    };
+
+    for (id, pay_amount_usdt) in due {
+        let Some(observed) = match_exact(transfers, pay_amount_usdt) else { continue };
+
+        // Store the hash first. If the transition below fails or this process dies here, the next
+        // pass re-matches the same transfer and re-stores the same hash — whereas transitioning
+        // first could leave a `confirmed` intent with no evidence recorded, which the verifier
+        // would then have to resolve down its weaker no-hash path.
+        if let Err(e) = deposits::set_tron_tx_id(pool, id, &observed.tx_id).await {
+            tracing::error!("poller: failed to store tx id for intent {id}: {e}");
+            continue;
+        }
+
+        // Guarded from-set, so a row that has already moved past this is a silent no-op rather
+        // than being walked backwards.
+        match deposits::transition(pool, id, &["created", "invoiced", "paying", "expired"], "confirmed").await {
+            Ok(true) => {
+                tracing::info!(
+                    "deposit {id} confirmed: {} micro-USDT observed in {}",
+                    observed.amount_usdt,
+                    observed.tx_id
+                );
+            }
+            Ok(false) => {} // already past `confirmed`; nothing to do.
+            Err(e) => tracing::error!("poller: failed to confirm intent {id}: {e}"),
+        }
+    }
 }
 
-/// Soft-expire anything past its pay-in window that hasn't already moved on. Deliberately
-/// only `created`/`invoiced`/`paying` — `expired` is idempotent (no-op to re-set), and this
-/// must never touch `confirmed`/`mint_requested`/`credited`/`failed`/`needs_manual`, all of
-/// which are further along than a mere timeout should ever move them.
+/// Soft-expire anything past its pay-in window that has not moved on.
+///
+/// Deliberately only `created`/`invoiced`/`paying`: this must never touch
+/// `confirmed`/`mint_requested`/`credited`/`failed`/`needs_manual`, all of which are further along
+/// than a mere timeout should move them.
 async fn sweep_expired(pool: &PgPool) {
-    let result = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE deposit_intents SET status = 'expired', updated_at = now()
          WHERE status IN ('created', 'invoiced', 'paying') AND expires_at < now()",
     )
     .execute(pool)
-    .await;
-    if let Err(e) = result {
+    .await
+    {
         tracing::error!("poller: failed to sweep expired intents: {e}");
     }
 }
 
-async fn sweep_old_webhook_events(pool: &PgPool) {
-    let result = sqlx::query(
-        "DELETE FROM webhook_events WHERE received_at < now() - ($1 || ' days')::interval",
+/// Release discriminator slots whose payment window has closed.
+///
+/// This is what Bitcart's terminal status used to decide, now driven by a clock we own rather
+/// than a third party's opinion about an invoice we can no longer create. Never closes the window on a row a human is holding
+/// (`needs_manual`) — that money may still be sitting in custody awaiting a decision, and freeing
+/// its amount would let a later user be allocated it.
+async fn close_stale_payment_windows(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "UPDATE deposit_intents
+         SET payment_window_closed = TRUE, updated_at = now()
+         WHERE NOT payment_window_closed
+           AND status IN ('expired', 'failed')
+           AND expires_at < now() - ($1 || ' hours')::interval",
     )
-    .bind(WEBHOOK_EVENT_RETENTION_DAYS.to_string())
+    .bind(SLOT_HOLD_HOURS.to_string())
     .execute(pool)
-    .await;
-    if let Err(e) = result {
-        tracing::error!("poller: failed to sweep old webhook_events: {e}");
+    .await
+    {
+        tracing::error!("poller: failed to close stale payment windows: {e}");
     }
 }
 
-/// Spawned once from `main.rs`. Runs forever on `poll_interval_secs` — no backoff/jitter here
-/// (unlike T5's treasury-bridge worker, this loop has no outbound dependency that fails as a
-/// unit; each intent's refetch failure is handled and logged individually inside
-/// `apply_invoice_update`, so a bad interval only delays the next attempt by one tick).
-pub async fn run(pool: PgPool, adapter: Arc<dyn PaymentAdapter>, poll_interval_secs: u64) {
+/// Alert on money that arrived for no intent.
+///
+/// Nothing watched for this before, and it is the exact shape of the loss found during the first
+/// real deposit run: a confirmed payment of a discriminated amount whose intent had expired, left
+/// stranded in custody with no automatic recovery and nothing reporting it. The reserve
+/// cross-check that should have noticed was independently returning zero. Two silent failures
+/// lining up is how a paying user gets nothing and nobody finds out.
+///
+/// Reported, never auto-credited: attributing an unmatched payment would be a guess, and guessing
+/// on the mint path is what the discriminator exists to avoid.
+async fn report_unattributed(pool: &PgPool, transfers: &[ObservedTransfer]) {
+    for t in transfers {
+        // Any intent at all, in any state — a transfer matching a long-credited intent is that
+        // deposit, not an orphan.
+        let known = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM deposit_intents WHERE pay_amount_usdt = $1",
+        )
+        .bind(t.amount_usdt)
+        .fetch_one(pool)
+        .await;
+
+        match known {
+            Ok(0) => {
+                // Deduplicated by the alerts table's own uniqueness on message, so a standing
+                // orphan does not re-page every tick.
+                alert(
+                    pool,
+                    "warn",
+                    "poller",
+                    &format!(
+                        "unattributed custody payment: {} micro-USDT in tx {} matches no deposit intent \
+                         — funds are in custody with no claim against them",
+                        t.amount_usdt, t.tx_id
+                    ),
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("poller: failed to check attribution for {}: {e}", t.tx_id),
+        }
+    }
+}
+
+/// Spawned once from `main.rs`; runs forever on `poll_interval_secs`.
+pub async fn run(pool: PgPool, watcher: Arc<dyn CustodyWatcher>, poll_interval_secs: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
     loop {
         interval.tick().await;
-        poll_once(&pool, adapter.as_ref()).await;
+        poll_once(&pool, watcher.as_ref()).await;
     }
 }

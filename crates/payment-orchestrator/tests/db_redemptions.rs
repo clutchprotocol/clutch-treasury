@@ -10,13 +10,11 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use payment_orchestrator::adapter::{InvoiceStatus, PaymentAdapter, PaymentInstructions};
 use payment_orchestrator::configuration::OrchConfig;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
-use std::sync::Arc;
 use tower::ServiceExt;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -38,7 +36,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, webhook_events, alerts, redemption_map RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, alerts, redemption_map RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -51,15 +49,13 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: JWT_SECRET.into(),
         allowed_origins: "*".into(),
-        bitcart_url: "http://unused".into(),
-        bitcart_token: "t".into(),
-        bitcart_store_id: "s".into(),
-        bitcart_invoice_currency: "USDT".into(),
-        public_base_url: "https://orchestrator.example".into(),
         treasury_url,
         treasury_initiator_token: "test-treasury-initiator".into(),
         treasury_readonly_token: "test-treasury-readonly".into(),
         custody_tron_address: "Tunused".into(),
+        trongrid_url: "http://localhost:0".to_string(),
+        trongrid_api_key: "test-key".to_string(),
+        usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
         deposit_ttl_minutes: 30,
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
@@ -82,23 +78,11 @@ fn bearer_for(pk: &str) -> String {
     format!("Bearer {token}")
 }
 
-/// This crate's routes never call the Bitcart adapter for the redemption path — it's required
-/// by `api::router`'s signature only. Panics if ever invoked, so a wiring mistake that somehow
-/// routed a redemption through the deposit/Bitcart path fails loudly instead of silently.
-struct UnusedAdapter;
-#[async_trait::async_trait]
-impl PaymentAdapter for UnusedAdapter {
-    async fn create_invoice(&self, _: &str, _: i64, _: &str) -> Result<PaymentInstructions, String> {
-        panic!("redemption routes must never call the payment adapter");
-    }
-    async fn get_invoice(&self, _: &str) -> Result<InvoiceStatus, String> {
-        panic!("redemption routes must never call the payment adapter");
-    }
-}
-
+/// `api::router` no longer takes a payment adapter — there is no gateway to inject. The stub that
+/// used to be passed here (panicking if invoked, to catch a redemption routed through the deposit
+/// path) is gone with it: that wiring mistake is now impossible to express.
 fn router_with(pool: PgPool, config: OrchConfig) -> axum::Router {
-    let adapter: Arc<dyn PaymentAdapter> = Arc::new(UnusedAdapter);
-    payment_orchestrator::api::router(pool, config, adapter)
+    payment_orchestrator::api::router(pool, config)
 }
 
 async fn body_json_of(resp: axum::response::Response) -> Value {

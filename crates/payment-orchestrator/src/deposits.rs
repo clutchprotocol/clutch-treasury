@@ -1,8 +1,9 @@
 //! Deposit intents: the record of "a user intends to pay us USDT" and the idempotency
 //! that keeps one payment from being credited twice. This module owns the row-level
 //! mechanics and (below, `create_and_invoice`) the create-flow orchestration — no HTTP
-//! itself (that's `api.rs`), but it does call the `PaymentAdapter` (T3) to turn a fresh
-//! intent into a live Bitcart invoice, and (T2b's deferral, landed in 5b) the treasury's
+//! itself (that's `api.rs`). It used to call a `PaymentAdapter` to turn a fresh intent into a
+//! live Bitcart invoice; there is no gateway any more (see `custody.rs`), so the pay address and
+//! window are read straight from config. It still calls (T2b's deferral, landed in 5b) the treasury's
 //! `reserve-status` for the daily-headroom check. The bridge worker that crosses into the
 //! treasury's private zone to actually request a mint lives in `treasury_bridge.rs`, not here —
 //! this module only owns the row and its guarded transitions.
@@ -16,7 +17,6 @@ use serde_json::json;
 use sqlx::{Acquire, PgPool};
 use uuid::Uuid;
 
-use crate::adapter::PaymentAdapter;
 use crate::configuration::OrchConfig;
 
 const DISCRIMINATOR_RANGE_END: i64 = 999;
@@ -35,7 +35,7 @@ pub struct DepositIntent {
     pub tron_tx_id: Option<String>,
     pub response_status: Option<i16>,
     pub response_body: Option<serde_json::Value>,
-    pub bitcart_terminal: bool,
+    pub payment_window_closed: bool,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     /// Set once `treasury_bridge`'s POST to `/internal/mint-intents` succeeds (migration 0004)
     /// — the id the bridge polls `GET /internal/mint-intents/:id` against. `None` until then.
@@ -49,7 +49,7 @@ pub struct DepositIntent {
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, \
-    status, client_key, invoice_id, tron_tx_id, response_status, response_body, bitcart_terminal, expires_at, \
+    status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, expires_at, \
     treasury_intent_id, attempts, next_attempt_at";
 
 #[derive(Debug)]
@@ -164,12 +164,11 @@ pub async fn create(
         }
         _ => {
             // response_body IS NULL: a previous attempt died between `create` and
-            // `store_invoice` (a crash, or an adapter error/timeout where Bitcart may
-            // still have created the invoice). Resume on the SAME pay_amount_usdt.
+            // `store_invoice`. Resume on the SAME pay_amount_usdt.
             //
             // Reusing the amount is what keeps this safe, not what makes it risky. This
             // row is the only holder of that slot under uq_active_pay_amount, and the
-            // schema's invariant is that a slot stays reserved until Bitcart itself can
+            // schema's invariant is that a slot stays reserved until we ourselves can
             // no longer match a payment to it. Moving the row to a fresh slot would
             // release the old amount while a possibly-live orphan invoice still carries
             // it, letting a LATER, DIFFERENT intent be allocated that amount — the
@@ -178,7 +177,7 @@ pub async fn create(
             //
             // Two live invoices at one amount for THIS SAME intent is not that hazard:
             // both carry this intent's order_id, this user, this credit, and whichever
-            // one Bitcart matches, `store_invoice`'s compare-and-set plus the per-invoice
+            // one we match against, `store_invoice`'s compare-and-set plus the per-invoice
             // webhook event key still credit exactly once. A second genuine payment at
             // the same amount strands on the `transition` guards and lands in
             // needs_manual — funds held and flagged, never paid to a stranger.
@@ -262,7 +261,7 @@ async fn insert_new(
     Err(ApiError::NoDiscriminatorSlot)
 }
 
-/// Idempotency layer 4: Bitcart has no server-side order_id dedup, so this compare-and-set
+/// Idempotency layer 4: nothing upstream dedupes for us, so this compare-and-set
 /// on invoice_id is what makes "store the created invoice" exactly-once. Zero rows affected
 /// means a concurrent writer already stored a different invoice first; that writer's
 /// response is canonical, so the caller should re-fetch and replay it rather than treat
@@ -294,7 +293,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<DepositIntent>
         .await
 }
 
-/// The webhook/poller lookup key (T4): Bitcart's IPN and `get_invoice` both key on
+/// Historical lookup key: the webhook and per-invoice refetch both keyed on
 /// `invoice_id`, never on our own `id`. An invoice_id no row holds returns `None` — the
 /// caller's job (spam resistance: store nothing, call nothing for an unknown id).
 pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Option<DepositIntent>, sqlx::Error> {
@@ -304,19 +303,19 @@ pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Optio
         .await
 }
 
-/// Sets `bitcart_terminal = TRUE` — the ONLY thing that frees the discriminator slot
-/// (`uq_active_pay_amount`'s `WHERE ... AND NOT bitcart_terminal` clause). Deliberately
-/// unconditional (no status guard): terminality is a fact about the Bitcart invoice, not
+/// Sets `payment_window_closed = TRUE` — the ONLY thing that frees the discriminator slot
+/// (`uq_active_pay_amount`'s `WHERE ... AND NOT payment_window_closed` clause). Deliberately
+/// unconditional (no status guard): a closed payment window is a fact about the clock, not
 /// about our own state machine, and setting it twice is harmless.
-pub async fn mark_bitcart_terminal(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE deposit_intents SET bitcart_terminal = TRUE, updated_at = now() WHERE id = $1")
+pub async fn mark_payment_window_closed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE deposit_intents SET payment_window_closed = TRUE, updated_at = now() WHERE id = $1")
         .bind(id)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-/// Records the on-chain tx id once Bitcart's refetch surfaces one (`Confirmed`/`PaidOver`).
+/// Records the on-chain tx id once the custody poller matches a transfer to this intent.
 /// `WHERE tron_tx_id IS NULL` keeps the first-seen hash rather than letting a later refetch
 /// (e.g. the poller re-confirming an already-confirmed intent) overwrite it.
 pub async fn set_tron_tx_id(pool: &PgPool, id: Uuid, tron_tx_id: &str) -> Result<(), sqlx::Error> {
@@ -455,7 +454,7 @@ pub enum DepositOutcome {
     /// amount — a clear 4xx, not a 503: asking again immediately won't help, tomorrow's headroom
     /// (or a smaller amount) will.
     InsufficientHeadroom { headroom_clt: i64 },
-    /// Bitcart call or DB write failed — caller 5xx's without leaking internals.
+    /// A DB write failed — caller 5xx's without leaking internals.
     Failed(String),
 }
 
@@ -496,19 +495,18 @@ async fn check_headroom(config: &OrchConfig, amount_usdt: i64) -> Result<(), Dep
 /// layer 1 + the discriminator, Task 2) through `adapter.create_invoice` and the
 /// compare-and-set store (idempotency layer 4) — the two mechanisms meeting the wire.
 ///
-/// Ordering that keeps money safe: the intent row is created BEFORE calling Bitcart, and
+/// Ordering that keeps money safe: the intent row is created BEFORE any pay instructions are
+/// handed out, and
 /// `store_invoice`'s compare-and-set runs AFTER — so a crash between the two leaves an
 /// orphan invoice (accepted; see `deposits::create`'s resume branch), never a lost intent
 /// row with no corresponding invoice attempt recorded.
 pub async fn create_and_invoice(
     pool: &PgPool,
     config: &OrchConfig,
-    adapter: &dyn PaymentAdapter,
     user_pk: &str,
     clt_address: &str,
     amount_usdt: i64,
     client_key: &str,
-    notification_url: &str,
 ) -> DepositOutcome {
     let outcome = match create(pool, config, user_pk, clt_address, amount_usdt, client_key).await {
         Ok(o) => o,
@@ -527,7 +525,7 @@ pub async fn create_and_invoice(
     };
 
     // Headroom is checked here, AFTER create()'s idempotency resolution and BEFORE ever calling
-    // Bitcart: a replay/resume of an already-`Created` row must not re-refuse on today's
+    // handing out pay instructions: a replay/resume of an already-`Created` row must not re-refuse on today's
     // headroom (the row already exists; this may be a resume of a genuinely earlier attempt),
     // and no invoice/custody exposure has been created yet for a brand-new row, so refusing here
     // costs nothing but the row itself (soft-expires like any other unpaid intent).
@@ -535,27 +533,27 @@ pub async fn create_and_invoice(
         return outcome;
     }
 
-    // Bitcart has no server-side order_id dedup (module docs, adapter.rs module docs) —
-    // the intent id is unique per row regardless of how many times this call is retried,
-    // so passing it as order_id is informational only; store_invoice's CAS below is what
-    // actually makes this exactly-once, not Bitcart's own idempotency.
-    let instructions = match adapter
-        .create_invoice(&intent.id.to_string(), intent.pay_amount_usdt, notification_url)
-        .await
-    {
-        Ok(i) => i,
-        Err(e) => return DepositOutcome::Failed(e),
-    };
+    // No external gateway to call. Every value the old Bitcart adapter contributed here is a
+    // local fact: the pay address is the one static custody address from config, the window is
+    // our own TTL (already applied by `create`), and the reference is the intent's own id.
+    //
+    // That removes a whole failure mode. This step used to be able to fail with the intent row
+    // already committed, leaving a `created` row with no invoice for the poller to catch up on;
+    // now the only thing between the row and the response is a DB write.
+    //
+    // `store_invoice`'s CAS below is still what makes this exactly-once — that was never Bitcart's
+    // idempotency doing the work, and it is unchanged.
+    let invoice_ref = intent.id.to_string();
 
     let body = json!({
         "id": intent.id,
-        "pay_address": instructions.pay_address,
-        "pay_amount_usdt": instructions.pay_amount_usdt,
-        "expires_at": instructions.expires_at,
+        "pay_address": config.custody_tron_address,
+        "pay_amount_usdt": intent.pay_amount_usdt,
+        "expires_at": intent.expires_at,
         "status": "invoiced",
     });
 
-    match store_invoice(pool, intent.id, &instructions.invoice_id, 201, &body).await {
+    match store_invoice(pool, intent.id, &invoice_ref, 201, &body).await {
         Ok(true) => DepositOutcome::Respond { status: 201, body },
         // Lost the compare-and-set: another writer already stored a (possibly different)
         // invoice for this same intent row first. Their invoice is canonical — re-fetch

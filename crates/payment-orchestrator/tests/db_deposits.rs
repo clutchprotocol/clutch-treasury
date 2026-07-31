@@ -29,7 +29,7 @@ async fn pool() -> PgPool {
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     // Each test file starts clean — order-independent tests. This crate's own database
     // now holds only this crate's own tables.
-    sqlx::query("TRUNCATE deposit_intents, webhook_events RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -42,15 +42,13 @@ fn test_config() -> OrchConfig {
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: "test-jwt-secret".into(),
         allowed_origins: "*".into(),
-        bitcart_url: "http://unused".into(),
-        bitcart_token: "t".into(),
-        bitcart_store_id: "s".into(),
-        bitcart_invoice_currency: "USDT".into(),
-        public_base_url: "http://unused".into(),
         treasury_url: "http://unused".into(),
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
         custody_tron_address: "Tunused".into(),
+        trongrid_url: "http://localhost:0".to_string(),
+        trongrid_api_key: "test-key".to_string(),
+        usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
         deposit_ttl_minutes: 30,
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
@@ -242,11 +240,11 @@ async fn concurrent_same_amount_intents_get_different_pay_amounts() {
 
 /// Proves the partial unique index's `expired`-but-not-terminal clause: our soft 30-minute
 /// expiry does NOT free the amount slot, because Bitcart may still be able to match a late
-/// payment to that invoice. Only bitcart_terminal = TRUE frees it. This is the exact
+/// payment to that invoice. Only payment_window_closed = TRUE frees it. This is the exact
 /// property named in the brief's escalation clause — tested against the live index, not
 /// asserted by reading the SQL.
 #[tokio::test]
-async fn expired_but_not_bitcart_terminal_keeps_amount_slot_reserved() {
+async fn expired_but_not_payment_window_closed_keeps_amount_slot_reserved() {
     let pool = pool().await;
     let cfg = test_config();
     let amount = 7_000_000i64;
@@ -283,7 +281,7 @@ async fn expired_but_not_bitcart_terminal_keeps_amount_slot_reserved() {
     );
 
     // Now mark it terminal on Bitcart's side — THIS is what must free the slot.
-    sqlx::query("UPDATE deposit_intents SET bitcart_terminal = TRUE WHERE id = $1")
+    sqlx::query("UPDATE deposit_intents SET payment_window_closed = TRUE WHERE id = $1")
         .bind(intent.id)
         .execute(&pool)
         .await
@@ -298,7 +296,7 @@ async fn expired_but_not_bitcart_terminal_keeps_amount_slot_reserved() {
     .bind(claimed_pay_amount)
     .execute(&pool)
     .await;
-    assert!(now_free.is_ok(), "once bitcart_terminal = TRUE, the amount slot must be free for reuse");
+    assert!(now_free.is_ok(), "once payment_window_closed = TRUE, the amount slot must be free for reuse");
 }
 
 #[tokio::test]

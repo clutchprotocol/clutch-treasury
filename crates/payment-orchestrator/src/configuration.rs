@@ -17,16 +17,16 @@ pub struct OrchConfig {
     /// own before this change, so there was nothing to mirror until now.
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: String,
-    pub bitcart_url: String,
-    pub bitcart_token: String,
-    pub bitcart_store_id: String,
-    /// Must be the payment TOKEN (e.g. "USDT"), never a fiat code — see
-    /// `BitcartAdapter::invoice_currency` for what a fiat value silently destroys.
-    pub bitcart_invoice_currency: String,
-    /// This service's own externally-reachable base URL — used only to build the
-    /// `notification_url` passed to `adapter.create_invoice` (Bitcart's IPN webhook
-    /// target, T4's handler). Not a secret.
-    pub public_base_url: String,
+    /// TronGrid, for watching the custody address. MUST name the same network as
+    /// `usdt_contract` lives on, or every deposit goes unmatched forever.
+    pub trongrid_url: String,
+    /// Optional but strongly advised: unkeyed TronGrid throttles hard, and a throttled watcher
+    /// looks exactly like "nobody is paying".
+    #[serde(default)]
+    pub trongrid_api_key: String,
+    /// The TRC-20 contract deposits arrive in. Checked against every observed transfer, so a
+    /// wrong value here silently matches nothing rather than crediting the wrong token.
+    pub usdt_contract: String,
     pub treasury_url: String,
     pub treasury_initiator_token: String,
     pub treasury_readonly_token: String,
@@ -59,7 +59,6 @@ impl OrchConfig {
         // its own four secrets get the identical treatment).
         for (name, v) in [
             ("APP_JWT_SECRET", &cfg.jwt_secret),
-            ("APP_BITCART_TOKEN", &cfg.bitcart_token),
             ("APP_TREASURY_INITIATOR_TOKEN", &cfg.treasury_initiator_token),
             ("APP_TREASURY_READONLY_TOKEN", &cfg.treasury_readonly_token),
         ] {
