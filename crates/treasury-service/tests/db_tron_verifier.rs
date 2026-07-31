@@ -146,10 +146,19 @@ async fn mount_trc20_list(server: &MockServer, transfers: Vec<serde_json::Value>
         .await;
 }
 
+/// Mocks `POST /walletsolidity/gettransactionbyid`, which is how confirmed depth is established:
+/// the solidity node only serves irreversible blocks, so the transaction being ECHOED BACK is the
+/// proof, and `{}` means "not final yet".
+///
+/// This previously mocked `GET /v1/transactions/{tx_id}` returning `{"confirmed": bool}`. Neither
+/// the endpoint nor the field exists — TronGrid answers 404 — so these tests passed against a
+/// fiction while the real has-tx_id path could never confirm anything. A mock is only evidence if
+/// the shape it returns is the shape the service really receives.
 async fn mount_transaction_confirmed(server: &MockServer, tx_id: &str, confirmed: bool) {
-    Mock::given(method("GET"))
-        .and(path(format!("/v1/transactions/{tx_id}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"confirmed": confirmed})))
+    let body = if confirmed { json!({"txID": tx_id}) } else { json!({}) };
+    Mock::given(method("POST"))
+        .and(path("/walletsolidity/gettransactionbyid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(server)
         .await;
 }

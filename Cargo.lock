@@ -2820,6 +2820,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bs58",
  "chrono",
  "clutch-chain",
  "config",

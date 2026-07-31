@@ -14,15 +14,23 @@
 //! TronGrid shapes for the trc20 list are VERIFIED against a live call to
 //! `api.trongrid.io` (T7): `transaction_id`, `to`, `value` (decimal STRING in base units),
 //! `token_info.address`, `type`, and `block_timestamp` (epoch MILLISECONDS) all confirmed
-//! present with those exact names. `/v1/transactions/{id}`'s `confirmed` flag is still assumed.
-//! The two calls:
+//! present with those exact names.
+//!
+//! Every endpoint below is now verified against a real confirmed TRC-20 transfer on Nile. Two
+//! previously carried an ASSUMED note and both turned out to be wrong — see the doc comments on
+//! `SolidityTransaction` and `get_custody_balance` for what each one silently did. The lesson
+//! worth keeping: an assumption about an external API is not a small comment, it is an untested
+//! branch on the money path.
+//!
+//! The three calls:
 //!   - `GET /v1/accounts/{address}/transactions/trc20?only_confirmed=true&contract_address={c}`
 //!     — TRC-20 transfer history for the custody address. Used for BOTH the has-tx_id path
 //!     (find and validate this specific transfer) and the fallback path (find any transfer
 //!     that matches by amount when Bitcart never returned a hash).
-//!   - `GET /v1/transactions/{tx_id}` — used only to confirm the transaction's confirmed depth
-//!     when `deposit_tx_id` is known, since the trc20 list alone (per TronGrid docs) does not
-//!     reliably expose a confirmations count.
+//!   - `POST /walletsolidity/gettransactionbyid` — confirmed depth for a known `deposit_tx_id`.
+//!     The solidity node only serves irreversible blocks, so presence is the proof.
+//!   - `POST /wallet/triggerconstantcontract` calling `balanceOf(address)` — the custody
+//!     reserve read for reconciliation's cross-check.
 
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -65,15 +73,24 @@ struct Trc20TransfersResponse {
     data: Vec<Trc20Transfer>,
 }
 
-/// ASSUMED shape of `/v1/transactions/{id}` — used only for `ret[0].contractRet` (whether the
-/// underlying contract call succeeded, TronGrid's usual place for this) is NOT what we need
-/// here; what we need is confirmed depth, which TronGrid exposes via the separate
-/// `/wallet/gettransactioninfobyid`-style `confirmed` boolean this endpoint's docs describe on
-/// the top-level response. Modeled minimally — only the field this module reads.
+/// Response of `POST /walletsolidity/gettransactionbyid`, modeled minimally.
+///
+/// The SOLIDITY node only serves blocks that are already irreversible (≈19 blocks, 2/3+1 SR
+/// confirmations), so a transaction being present here IS the confirmed-depth proof. When it is
+/// not yet final the node answers `{}` — hence `Option`, which is how "not confirmed yet" is
+/// told apart from a transport failure.
+///
+/// This replaces `GET /v1/transactions/{id}` and its `confirmed` boolean. That endpoint and that
+/// field never existed: the module previously documented them as ASSUMED, and a live call
+/// against Nile returns **HTTP 404**. Since a 404 became `Err` and every `Err` here maps to
+/// `Evidence::Transient`, the has-tx_id path could never reach `Pass` — every deposit with a
+/// known hash retried until the 24h stuck-sweep handed it to a human. Verified against a real
+/// confirmed TRC-20 transfer on Nile before this change.
 #[derive(Debug, Deserialize)]
-struct TronTransaction {
-    #[serde(default)]
-    confirmed: bool,
+struct SolidityTransaction {
+    /// Absent when the transaction is not yet in an irreversible block.
+    #[serde(default, rename = "txID")]
+    tx_id: Option<String>,
 }
 
 pub struct TronClient {
@@ -124,22 +141,36 @@ impl TronClient {
         Ok(parsed.data)
     }
 
+    /// Is `tx_id` in an irreversible block?
+    ///
+    /// Asks the SOLIDITY node, which by definition only serves finalised blocks — presence is the
+    /// proof. Deliberately a different endpoint from `trc20_transfers`' `only_confirmed=true`, so
+    /// this stays a genuinely independent second observation rather than the same read twice.
+    ///
+    /// Returns `Ok(false)` (not `Err`) when the node answers `{}`: not-yet-final is a normal
+    /// waiting state that should surface as "not yet confirmed", while `Err` is reserved for our
+    /// infrastructure failing. The caller maps both to `Transient`, but only one of them is worth
+    /// alerting about.
     async fn transaction_confirmed(&self, tx_id: &str) -> Result<bool, String> {
-        let url = format!("{}/v1/transactions/{}", self.base_url, tx_id);
+        let url = format!("{}/walletsolidity/gettransactionbyid", self.base_url);
         let resp = self
             .http
-            .get(&url)
+            .post(&url)
             .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&serde_json::json!({ "value": tx_id }))
             .send()
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid get_transaction failed: {status} {text}"));
+            return Err(format!("trongrid gettransactionbyid failed: {status} {text}"));
         }
-        let parsed: TronTransaction = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(parsed.confirmed)
+        let parsed: SolidityTransaction = resp.json().await.map_err(|e| e.to_string())?;
+        // Compare the echoed id rather than merely checking presence: a response for some other
+        // transaction must not be read as confirmation of this one. Tron hex ids are
+        // case-insensitive, hence the eq_ignore_ascii_case.
+        Ok(parsed.tx_id.is_some_and(|got| got.eq_ignore_ascii_case(tx_id)))
     }
 
     /// Reconciliation's cross-check read (spec's fourth-source stand-in until a PSP exists):
@@ -147,44 +178,90 @@ impl TronClient {
     /// our own ledger. A mismatch against `custody_reported` is logged as an early smell, not
     /// wired into the breaker (brief: "not a halt").
     ///
-    /// ASSUMED shape of `/v1/accounts/{address}` — `trc20` is documented as an array of
-    /// single-key maps `{contract_address: balance_string}`; balance is base-unit decimal
-    /// string, same 6-decimal scale as everywhere else in this file.
+    /// The custody address's USDT balance, read by calling `balanceOf(address)` on the token
+    /// contract.
+    ///
+    /// This used to read `GET /v1/accounts/{address}` and pick the contract out of a `trc20`
+    /// array. That endpoint answers `{"data":[]}` for an address Tron has never *created*, and
+    /// receiving only TRC-20 tokens does NOT create an account — only receiving TRX does. A
+    /// receive-only custody address is therefore absent from the account index no matter how much
+    /// USDT it holds, and the old chain ended `.unwrap_or(0)`, so it returned a confident `Ok(0)`.
+    ///
+    /// Verified on Nile against this exact custody address: `/v1/accounts/{addr}` returned
+    /// `{"data":[]}` while `balanceOf` returned 2.000699 USDT — two real payments the reserve
+    /// cross-check would have reported as zero reserve.
+    ///
+    /// `balanceOf` asks the token's own ledger, so account activation is irrelevant.
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {
         #[derive(Deserialize)]
-        struct AccountResponse {
+        struct ConstantCallResponse {
             #[serde(default)]
-            data: Vec<AccountData>,
-        }
-        #[derive(Deserialize)]
-        struct AccountData {
-            #[serde(default)]
-            trc20: Vec<std::collections::HashMap<String, String>>,
+            constant_result: Vec<String>,
         }
 
-        let url = format!("{}/v1/accounts/{}", self.base_url, custody_address);
+        let url = format!("{}/wallet/triggerconstantcontract", self.base_url);
         let resp = self
             .http
-            .get(&url)
+            .post(&url)
             .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&serde_json::json!({
+                // A constant call executes nothing and costs nothing, so owner can be the address
+                // being queried; no key is involved and no state changes.
+                "owner_address": custody_address,
+                "contract_address": usdt_contract,
+                "function_selector": "balanceOf(address)",
+                "parameter": abi_encode_address(custody_address)?,
+                "visible": true,
+            }))
             .send()
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid get_account failed: {status} {text}"));
+            return Err(format!("trongrid balanceOf failed: {status} {text}"));
         }
-        let parsed: AccountResponse = resp.json().await.map_err(|e| e.to_string())?;
-        let balance = parsed
-            .data
+        let parsed: ConstantCallResponse = resp.json().await.map_err(|e| e.to_string())?;
+        // Err, never Ok(0), when the call produced no result. Conflating "could not read the
+        // reserve" with "the reserve is empty" is the whole bug being fixed here: one is an
+        // outage, the other is an emergency, and they must not look alike.
+        let word = parsed
+            .constant_result
             .first()
-            .and_then(|d| d.trc20.iter().find_map(|m| m.get(usdt_contract)))
-            .map(|v| v.parse::<i64>().unwrap_or(0))
-            .unwrap_or(0);
-        Ok(balance)
+            .ok_or_else(|| "trongrid balanceOf returned no constant_result".to_string())?;
+        let trimmed = word.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Ok(0); // a genuine zero balance: all 64 nibbles were '0'
+        }
+        // A uint256 above i64::MAX cannot be a balance we can represent; refuse rather than
+        // truncate a reserve figure into something plausible-looking.
+        i64::from_str_radix(trimmed, 16)
+            .map_err(|_| format!("balanceOf returned an unrepresentable uint256: 0x{word}"))
     }
 }
+
+/// Left-pad a Tron base58check address into the 32-byte ABI word `balanceOf(address)` expects.
+///
+/// Decodes with `with_check(Some(0x41))`, so a mistyped custody address fails the double-SHA256
+/// checksum here instead of silently querying the balance of some other account — the same
+/// reasoning as `payment_orchestrator::redemptions::is_valid_tron_address`.
+fn abi_encode_address(address: &str) -> Result<String, String> {
+    let bytes = bs58::decode(address)
+        .with_check(Some(TRON_ADDRESS_VERSION))
+        .into_vec()
+        .map_err(|e| format!("custody address failed base58check: {e}"))?;
+    if bytes.len() != DECODED_LEN_WITH_VERSION {
+        return Err(format!("custody address decoded to {} bytes, want {DECODED_LEN_WITH_VERSION}", bytes.len()));
+    }
+    // Drop the 0x41 version byte: the ABI wants the bare 20-byte address, right-aligned in 32.
+    Ok(format!("{:0>64}", hex::encode(&bytes[1..])))
+}
+
+/// Tron address version byte (base58check payload's first byte).
+const TRON_ADDRESS_VERSION: u8 = 0x41;
+/// Version byte (1) + address (20), the length `bs58` hands back once the 4-byte checksum is
+/// stripped. `bs58` verifies checksum and version but not total length.
+const DECODED_LEN_WITH_VERSION: usize = 21;
 
 /// TronGrid caps `limit` at 200 and defaults it to 20. Ask for the max.
 const TRC20_PAGE_LIMIT: &str = "200";
@@ -575,6 +652,45 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real Nile custody address this was reproduced against, and its 20-byte body.
+    const NILE_CUSTODY: &str = "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX";
+
+    /// `balanceOf(address)` takes the bare 20-byte address right-aligned in a 32-byte word. Get
+    /// the padding or the version-byte strip wrong and the call silently reads a DIFFERENT
+    /// account's balance — a wrong reserve figure, not an error.
+    #[test]
+    fn abi_encodes_the_custody_address_into_one_right_aligned_word() {
+        let word = abi_encode_address(NILE_CUSTODY).expect("valid Tron address must encode");
+        assert_eq!(word.len(), 64, "an ABI word is exactly 32 bytes / 64 hex chars, got: {word}");
+        assert!(word.starts_with(&"0".repeat(24)), "20-byte address must be right-aligned: {word}");
+        // The 0x41 version byte must NOT survive into the word.
+        let body = &word[24..];
+        assert_eq!(body.len(), 40);
+        let expected = bs58::decode(NILE_CUSTODY).with_check(Some(0x41)).into_vec().unwrap();
+        assert_eq!(body, hex::encode(&expected[1..]), "body must be the address without the 0x41 prefix");
+    }
+
+    /// A single mistyped character must fail the checksum here rather than encode into a valid-
+    /// looking word for some other account.
+    #[test]
+    fn mistyped_custody_address_is_refused_not_encoded() {
+        // Flip one MIDDLE character to a definitely-different base58 char. The first version of
+        // this test replaced the last character with 'X' — which this address already ends in, so
+        // it rebuilt the identical string, encoded fine, and asserted nothing.
+        let mut chars: Vec<char> = NILE_CUSTODY.chars().collect();
+        chars[10] = if chars[10] == 'a' { 'b' } else { 'a' };
+        let bad: String = chars.into_iter().collect();
+        assert_ne!(bad, NILE_CUSTODY, "the mutation must actually change the address");
+
+        let err = abi_encode_address(&bad).expect_err("a bad checksum must not encode");
+        assert!(err.contains("base58check"), "the error must name the checksum, got: {err}");
+    }
+
+    #[test]
+    fn empty_address_is_refused() {
+        assert!(abi_encode_address("").is_err());
+    }
 
     fn transfer(to: &str, contract: &str, value: &str) -> Trc20Transfer {
         Trc20Transfer {
