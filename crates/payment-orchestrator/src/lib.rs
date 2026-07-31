@@ -4,6 +4,7 @@ pub mod auth;
 pub mod configuration;
 pub mod custody;
 pub mod deposits;
+pub mod derive;
 pub mod poller;
 pub mod redemptions;
 pub mod treasury_bridge;
