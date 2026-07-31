@@ -1,0 +1,28 @@
+[package]
+name = "tron-signer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7.5"
+config = "0.14.0"
+dotenv = "0.15"
+# BIP32/BIP39: the signer is the only thing in the system that turns a mnemonic into spending keys.
+# Crates, not hand-rolled — the same reasoning as payment-orchestrator's derive.rs, with more at
+# stake because these keys can move money.
+bip32 = "0.5"
+# bip32's own mnemonic support accepts 24-word phrases ONLY, which silently rejects the 12-word
+# wallets most people actually use — including the fixture the orchestrator pins. Use the dedicated
+# crate for phrase -> seed and bip32 purely for derivation.
+bip39 = "2"
+bs58 = { version = "0.5", features = ["check"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+sha3 = "0.10.1"
+reqwest = { version = "0.12.7", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
