@@ -118,6 +118,10 @@ async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, _unused: i64, tr
 
 /// The deposit address the bridge must have sent for `id` — read back from the row, so the
 /// assertion compares against what the user was actually told to pay.
+async fn index_of(pool: &PgPool, id: Uuid) -> i64 {
+    deposits::find_by_id(pool, id).await.unwrap().unwrap().derivation_index.unwrap()
+}
+
 async fn address_of(pool: &PgPool, id: Uuid) -> String {
     deposits::find_by_id(pool, id).await.unwrap().unwrap().deposit_address.unwrap()
 }
@@ -168,6 +172,9 @@ async fn post_sends_the_deposit_address_and_plain_amount_proven_on_the_wire() {
             // would have the approver checking somewhere nothing was ever paid. Pinned on the wire,
             // against the row's own address — the same discipline the discriminated amount had.
             "deposit_address": address_of(&pool, deposit_id).await,
+            // The sweeper names the signing key by index; without this on the wire a deposit can be
+            // verified but never swept, which is exactly the gap step 4 left.
+            "derivation_index": index_of(&pool, deposit_id).await,
             "client_ref": deposit_id.to_string(),
             "deposit_tx_id": "tron-tx-abc",
         })))
@@ -202,6 +209,7 @@ async fn post_sends_null_deposit_tx_id_when_not_yet_known() {
             "amount_clt": 2_000_000,
             "expected_amount_usdt": 2_000_000,
             "deposit_address": address_of(&pool, deposit_id).await,
+            "derivation_index": index_of(&pool, deposit_id).await,
             "client_ref": deposit_id.to_string(),
             "deposit_tx_id": serde_json::Value::Null,
         })))

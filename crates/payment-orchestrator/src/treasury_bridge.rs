@@ -76,6 +76,9 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
         // of its own choosing would defeat the four-eyes split. Sent from the row, so the address
         // verified is the address the user was actually told to pay.
         "deposit_address": intent.deposit_address,
+        // The sweeper names the signing key by INDEX, never by address (recovering one from the
+        // other means scanning) and never by key (keys do not leave the signer).
+        "derivation_index": intent.derivation_index,
         "client_ref": intent.id.to_string(),
         "deposit_tx_id": intent.tron_tx_id,
     });

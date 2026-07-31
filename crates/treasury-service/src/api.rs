@@ -76,6 +76,7 @@ struct CreateMintIntentBody {
     /// it fails loudly instead of silently widening the verifier's match to `amount_clt`.
     expected_amount_usdt: Option<i64>,
     deposit_address: Option<String>,
+    derivation_index: Option<i64>,
 }
 
 /// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
@@ -131,6 +132,7 @@ async fn create_mint_intent_handler(
         body.deposit_tx_id.as_deref(),
         body.expected_amount_usdt,
         body.deposit_address.clone(),
+        body.derivation_index,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

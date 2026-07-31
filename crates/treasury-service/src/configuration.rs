@@ -31,6 +31,14 @@ pub struct AppConfig {
     /// goes terminal, so without a limit an old unclaimed transfer at the same amount could be
     /// swept up to back a stranger's later deposit.
     pub deposit_match_window_hours: i64,
+    /// Sweep a deposit address once it holds at least this much (micro-USDT). A sweep costs TRX for
+    /// energy, so per-deposit sweeping can cost more than it moves at the $1 minimum.
+    pub sweep_threshold_usdt: i64,
+    /// ...or once it is this old, whatever the balance. Without this a sub-threshold balance sits
+    /// forever and the reserve fragments across addresses nobody revisits.
+    pub sweep_max_age_hours: i64,
+    pub signer_url: String,
+    pub signer_token: String,
 }
 
 impl AppConfig {

@@ -23,10 +23,12 @@ pub struct MintIntent {
     /// The address this deposit was expected at. Mandatory for deposit-backed intents
     /// (migration 0004's CHECK); `None` only for Plan B's human-created ones.
     pub deposit_address: Option<String>,
+    /// BIP32 index the address was derived at — what the sweeper names the key by.
+    pub derivation_index: Option<i64>,
 }
 
 const MINT_COLS: &str = "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, \
-    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address";
+    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address, derivation_index";
 
 /// `client_ref` is the orchestrator's idempotency key (Plan C T5) — `None` for Plan B's
 /// direct/manual mint intents, `Some(deposit_intent_id)` for deposit-backed ones the
@@ -44,13 +46,14 @@ pub async fn create_mint_intent(
     deposit_tx_id: Option<&str>,
     expected_amount_usdt: Option<i64>,
     deposit_address: Option<String>,
+    derivation_index: Option<i64>,
 ) -> Result<MintIntent, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query_as::<_, MintIntent>(&format!(
         "INSERT INTO mint_intents
             (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
-             deposit_address)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING {MINT_COLS}"
+             deposit_address, derivation_index)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING {MINT_COLS}"
     ))
     .bind(id)
     .bind(beneficiary)
@@ -61,6 +64,7 @@ pub async fn create_mint_intent(
     .bind(deposit_tx_id)
     .bind(expected_amount_usdt)
     .bind(deposit_address)
+    .bind(derivation_index)
     .fetch_one(pool)
     .await
 }

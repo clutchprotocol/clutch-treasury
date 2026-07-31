@@ -80,6 +80,10 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         usdt_contract: USDT.into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,
+        sweep_threshold_usdt: 100_000_000,
+        sweep_max_age_hours: 168,
+        signer_url: "http://unused".into(),
+        signer_token: "s".into(),
     }
 }
 

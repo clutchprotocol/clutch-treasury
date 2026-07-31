@@ -6,5 +6,6 @@ pub mod intents;
 pub mod outbox;
 pub mod payout;
 pub mod reconciliation;
+pub mod sweeper;
 pub mod tron_verifier;
 pub mod watcher;

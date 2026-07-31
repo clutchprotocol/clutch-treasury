@@ -47,6 +47,10 @@ fn test_config() -> AppConfig {
         usdt_contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,
+        sweep_threshold_usdt: 100_000_000,
+        sweep_max_age_hours: 168,
+        signer_url: "http://unused".into(),
+        signer_token: "s".into(),
     }
 }
 

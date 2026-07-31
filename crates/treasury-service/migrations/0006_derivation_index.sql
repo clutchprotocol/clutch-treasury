@@ -1,0 +1,14 @@
+-- The BIP32 index the deposit address was derived at.
+--
+-- The sweeper tells the signer WHICH KEY to derive, and it does so by index — never by address,
+-- because recovering an index from an address means scanning, and never by handing over a key,
+-- because the whole point of the signer is that keys do not leave it.
+--
+-- Step 4 sent `deposit_address` but not this, which was enough to VERIFY a deposit (the address is
+-- what evidence is gathered at) and not enough to SWEEP one. The gap only became visible when the
+-- worker went to call the signer and had nothing to name the key with.
+--
+-- Nullable and unconstrained on purpose: Plan B's human-created intents (client_ref IS NULL) have
+-- no derived address at all, and pre-per-address rows have neither. The sweeper skips anything
+-- without both.
+ALTER TABLE mint_intents ADD COLUMN derivation_index BIGINT;

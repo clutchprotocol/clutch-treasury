@@ -348,61 +348,9 @@ mod tests {
     }
 }
 
-/// Is this address worth sweeping yet?
-///
-/// Threshold rather than per-deposit, because on Tron a sweep is not free: the address must first
-/// be funded with TRX for energy, then the transfer itself costs. Against a $1 minimum deposit,
-/// sweeping each one as it arrives can cost more than it moves.
-///
-/// The age escape valve is what stops that becoming "small deposits never move". Without it a
-/// balance below the threshold sits at its address indefinitely, permanently fragmenting the
-/// reserve across addresses nobody revisits — the reserve sum would stay correct, but the funds
-/// would be unusable in practice and the fragmentation would only grow.
-pub fn should_sweep(balance_usdt: i64, threshold_usdt: i64, age_hours: i64, max_age_hours: i64) -> bool {
-    if balance_usdt <= 0 {
-        return false;
-    }
-    balance_usdt >= threshold_usdt || age_hours >= max_age_hours
-}
-
-#[cfg(test)]
-mod threshold_tests {
-    use super::should_sweep;
-
-    const THRESHOLD: i64 = 100_000_000; // $100
-    const MAX_AGE: i64 = 168; // a week
-
-    #[test]
-    fn sweeps_once_the_balance_reaches_the_threshold() {
-        assert!(should_sweep(THRESHOLD, THRESHOLD, 0, MAX_AGE));
-        assert!(should_sweep(THRESHOLD + 1, THRESHOLD, 0, MAX_AGE));
-    }
-
-    #[test]
-    fn leaves_a_small_fresh_balance_alone() {
-        assert!(!should_sweep(THRESHOLD - 1, THRESHOLD, 0, MAX_AGE));
-    }
-
-    /// The escape valve. Without it, anything under the threshold sits at its address forever and
-    /// the reserve fragments permanently across addresses nobody revisits.
-    #[test]
-    fn sweeps_a_small_balance_once_it_is_old_enough() {
-        assert!(should_sweep(1, THRESHOLD, MAX_AGE, MAX_AGE));
-        assert!(should_sweep(1, THRESHOLD, MAX_AGE + 100, MAX_AGE));
-    }
-
-    /// An empty address is never worth a transaction, however old. A sweep here would spend TRX to
-    /// move nothing.
-    #[test]
-    fn never_sweeps_an_empty_address_however_old() {
-        assert!(!should_sweep(0, THRESHOLD, MAX_AGE * 10, MAX_AGE));
-        assert!(!should_sweep(-1, THRESHOLD, MAX_AGE * 10, MAX_AGE), "a negative balance is nonsense, not a sweep");
-    }
-
-    /// A zero threshold means "sweep everything immediately" — valid, and worth pinning so nobody
-    /// assumes a floor is implied.
-    #[test]
-    fn a_zero_threshold_sweeps_any_positive_balance() {
-        assert!(should_sweep(1, 0, 0, MAX_AGE));
-    }
-}
+// NOTE: the "is this address worth sweeping yet" decision deliberately does NOT live here.
+//
+// This service knows HOW to sweep; it has no idea WHEN. The threshold needs a balance, an age and
+// the sweep bookkeeping, all of which live in treasury-service — and putting the decision here
+// would mean linking the mnemonic-handling code into whatever else wanted to reason about it. See
+// treasury-service's `sweeper.rs`.

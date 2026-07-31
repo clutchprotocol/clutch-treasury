@@ -25,6 +25,14 @@ async fn main() {
         let pool = pool.clone();
         let node = node.clone();
         let cfg = config.clone();
+        // Threshold sweep: move credited deposits off their derived addresses into the treasury.
+        // Decides WHEN here; tron-signer knows HOW and owns the keys.
+        tokio::spawn(treasury_service::sweeper::run(
+            pool.clone(),
+            config.clone(),
+            config.reconciliation_interval_secs.min(3600),
+        ));
+
         tokio::spawn(async move {
             loop {
                 match treasury_service::reconciliation::run_once(
