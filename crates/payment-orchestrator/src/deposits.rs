@@ -36,6 +36,12 @@ pub struct DepositIntent {
     pub response_status: Option<i16>,
     pub response_body: Option<serde_json::Value>,
     pub payment_window_closed: bool,
+    /// BIP32 non-hardened index this intent's deposit address was derived at (`<account>/0/index`).
+    /// `None` only on discriminator-era rows that predate per-intent addresses.
+    pub derivation_index: Option<i64>,
+    /// The Tron address derived at `derivation_index` — this intent's own receive address, not a
+    /// shared custody address. `None` only on legacy rows.
+    pub deposit_address: Option<String>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     /// Set once `treasury_bridge`'s POST to `/internal/mint-intents` succeeds (migration 0004)
     /// — the id the bridge polls `GET /internal/mint-intents/:id` against. `None` until then.
@@ -49,7 +55,8 @@ pub struct DepositIntent {
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, \
-    status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, expires_at, \
+    status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
+    derivation_index, deposit_address, expires_at, \
     treasury_intent_id, attempts, next_attempt_at";
 
 #[derive(Debug)]
@@ -80,6 +87,24 @@ impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         ApiError::Db(e)
     }
+}
+
+/// Claim the next BIP32 derivation index for a deposit address.
+///
+/// `nextval` is the entire safety argument. It never returns a value twice — not across concurrent
+/// transactions, and not when the caller's transaction later rolls back, because sequences are
+/// deliberately non-transactional. Two intents sharing an index would share a deposit ADDRESS, and
+/// the signer derives spending keys from the index, so that is two users with a claim on one pot of
+/// money.
+///
+/// Called OUTSIDE the insert transaction, on purpose: the address has to be derived from the index
+/// before the row can be written, and a row must never exist without its address. The cost is that
+/// a subsequently-failed insert burns an index. Gaps are harmless; reuse is not. Do not be tempted
+/// to reclaim one.
+pub async fn allocate_derivation_index(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT nextval('deposit_derivation_index_seq')")
+        .fetch_one(pool)
+        .await
 }
 
 /// Postgres default-generated name for the table's plain `UNIQUE (user_pk, client_key)`.
