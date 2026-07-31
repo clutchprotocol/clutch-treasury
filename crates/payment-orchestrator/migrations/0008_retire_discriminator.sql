@@ -1,0 +1,21 @@
+-- Retire the amount discriminator.
+--
+-- Its entire job was telling payers apart on ONE shared custody address, where the fractional tail
+-- was the only identity available. Each intent now has its own derived address (migration 0007), so
+-- the destination is the identity and the amount is back to being just an amount.
+--
+-- Worth recording what this mechanism cost, because it looked cheap:
+--   * a hard ceiling of 999 concurrent deposits per whole-dollar amount;
+--   * `uq_active_pay_amount` and the slot lifecycle around it, whose whole purpose was stopping a
+--     freed slot being reissued while a stranger's payment was still in flight to it — four
+--     Critical bugs in this project came out of that one hazard;
+--   * a payer who rounded their amount was never matched at all, and their money stranded in
+--     custody with nothing watching for it. That happened to real USDT on Nile.
+-- None of those exist per-address.
+--
+-- DELIBERATELY NOT deleting discriminator-era rows to force derivation_index/deposit_address NOT
+-- NULL. Those rows are already inert — `create_and_invoice` refuses to resume one and the poller
+-- skips them — and deleting user records in a migration is irreversible for a tidiness gain. The
+-- NULL handling exists and is tested; it can go when the rows are aged out deliberately.
+DROP INDEX IF EXISTS uq_active_pay_amount;
+ALTER TABLE deposit_intents DROP COLUMN pay_amount_usdt;

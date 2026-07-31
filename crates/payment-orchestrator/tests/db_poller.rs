@@ -77,13 +77,12 @@ async fn seed(pool: &PgPool, key: &str, address: &str, amount: i64, status: &str
         .unwrap();
     sqlx::query(
         "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, status,
+            (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, status,
              expires_at, derivation_index, deposit_address)
-         VALUES ($1, 'pk', 'clt', $2, $3, $2, $4, $5, now() + interval '30 min', $6, $7)",
+         VALUES ($1, 'pk', 'clt', $2, $2, $3, $4, now() + interval '30 min', $5, $6)",
     )
     .bind(id)
     .bind(amount)
-    .bind(amount + index + 1) // vestigial discriminator column, still NOT NULL until step 5
     .bind(key)
     .bind(status)
     .bind(index)
@@ -275,8 +274,8 @@ async fn legacy_rows_without_an_address_are_skipped() {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-         VALUES ($1, 'pk', 'clt', 2000000, 2000123, 2000000, 'k-legacy', now() + interval '30 min')",
+            (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, expires_at)
+         VALUES ($1, 'pk', 'clt', 2000000, 2000000, 'k-legacy', now() + interval '30 min')",
     )
     .bind(id)
     .execute(&pool)

@@ -89,7 +89,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
 /// Seeds a `confirmed` deposit carrying its own derived address, since that address is now part of
 /// the treasury contract. The address is the real derivation at the row's index, so the wire
 /// assertions below pin the value the signer would later derive a key for.
-async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, pay_amount_usdt: i64, tron_tx_id: Option<&str>) -> Uuid {
+async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, _unused: i64, tron_tx_id: Option<&str>) -> Uuid {
     let id = Uuid::new_v4();
     let index = sqlx::query_scalar::<_, i64>("SELECT nextval('deposit_derivation_index_seq')")
         .fetch_one(pool)
@@ -98,15 +98,14 @@ async fn seed_confirmed_deposit(pool: &PgPool, amount_clt: i64, pay_amount_usdt:
     let address = test_deriver().address_at(u32::try_from(index).unwrap()).unwrap();
     sqlx::query(
         "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, status, client_key,
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
              invoice_id, tron_tx_id, payment_window_closed, expires_at, next_attempt_at,
              derivation_index, deposit_address)
-         VALUES ($1, 'user-pk-1', 'TBeneficiary1111111111111111111111', $2, $3, $2, 'confirmed', $4,
-                 'inv-1', $5, TRUE, now() + interval '30 minutes', now() - interval '1 hour', $6, $7)",
+         VALUES ($1, 'user-pk-1', 'TBeneficiary1111111111111111111111', $2, $2, 'confirmed', $3,
+                 'inv-1', $4, TRUE, now() + interval '30 minutes', now() - interval '1 hour', $5, $6)",
     )
     .bind(id)
     .bind(amount_clt)
-    .bind(pay_amount_usdt)
     .bind(format!("key-{id}"))
     .bind(tron_tx_id)
     .bind(index)
@@ -150,7 +149,7 @@ fn mint_intent_response(id: Uuid, status: &str) -> serde_json::Value {
 /// would 404 the request and this test would fail on the resulting treasury-unreachable path
 /// (deposit stuck at `confirmed`), not silently pass.
 #[tokio::test]
-async fn post_sends_pay_amount_usdt_as_expected_amount_usdt_proven_on_the_wire() {
+async fn post_sends_the_deposit_address_and_plain_amount_proven_on_the_wire() {
     let pool = pool().await;
     let server = MockServer::start().await;
     let treasury_id = Uuid::new_v4();

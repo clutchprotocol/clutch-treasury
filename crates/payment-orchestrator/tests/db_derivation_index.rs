@@ -98,25 +98,25 @@ async fn a_rolled_back_transaction_burns_its_index_rather_than_reusing_it() {
 /// The database, not the allocator, is the last line of defence: even a buggy caller must not be
 /// able to write two intents at one index or one address.
 ///
-/// Every insert uses a DISTINCT pay_amount_usdt. The first version reused one, so the final
-/// "distinct pair still inserts" case collided on the legacy `uq_active_pay_amount` instead — which
-/// also meant the duplicate-rejection assertions could have been passing because of the OLD index
-/// rather than the new ones. Hence the constraint name is asserted, not just the failure.
+/// The constraint NAME is asserted, not just the failure. An earlier version of this test shared one
+/// pay_amount across inserts, so the rejections could have been coming from the legacy
+/// `uq_active_pay_amount` rather than the new indexes — passing for the wrong reason. That index is
+/// now gone entirely, but naming the constraint is what made the problem visible and is worth
+/// keeping.
 #[tokio::test]
 async fn the_database_refuses_a_duplicate_index_or_address() {
     let pool = pool().await;
 
-    let insert = |key: &'static str, pay_amount: i64, index: i64, addr: &'static str| {
+    let insert = |key: &'static str, index: i64, addr: &'static str| {
         let pool = pool.clone();
         async move {
             sqlx::query(
                 "INSERT INTO deposit_intents
-                    (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key,
+                    (id, user_pk, clt_address, amount_usdt, amount_clt, client_key,
                      expires_at, derivation_index, deposit_address)
-                 VALUES ($1, 'pk', 'clt', 1000000, $2, 1000000, $3, now() + interval '30 min', $4, $5)",
+                 VALUES ($1, 'pk', 'clt', 1000000, 1000000, $2, now() + interval '30 min', $3, $4)",
             )
             .bind(uuid::Uuid::new_v4())
-            .bind(pay_amount)
             .bind(key)
             .bind(index)
             .bind(addr)
@@ -129,20 +129,20 @@ async fn the_database_refuses_a_duplicate_index_or_address() {
         e.as_database_error().and_then(|d| d.constraint()).unwrap_or("<none>").to_string()
     };
 
-    insert("k-first", 1_000_101, 7, "TFirstAddress").await.expect("first insert");
+    insert("k-first", 7, "TFirstAddress").await.expect("first insert");
 
-    let by_index = insert("k-dup-index", 1_000_202, 7, "TOtherAddress")
+    let by_index = insert("k-dup-index", 7, "TOtherAddress")
         .await
         .expect_err("a second intent at index 7 must be refused");
     assert_eq!(violated(by_index), "uq_deposit_derivation_index", "must fail on the INDEX constraint");
 
-    let by_addr = insert("k-dup-addr", 1_000_303, 8, "TFirstAddress")
+    let by_addr = insert("k-dup-addr", 8, "TFirstAddress")
         .await
         .expect_err("a second intent at one address must be refused");
     assert_eq!(violated(by_addr), "uq_deposit_address", "must fail on the ADDRESS constraint");
 
     // A genuinely distinct triple still goes in — the constraints must not be blanket-blocking.
-    insert("k-ok", 1_000_404, 8, "TSecondAddress").await.expect("distinct index+address");
+    insert("k-ok", 8, "TSecondAddress").await.expect("distinct index+address");
 }
 
 /// Legacy discriminator-era rows carry NULL for both columns, and Postgres allows many NULLs in a
@@ -151,16 +151,13 @@ async fn the_database_refuses_a_duplicate_index_or_address() {
 #[tokio::test]
 async fn multiple_legacy_rows_with_null_index_and_address_coexist() {
     let pool = pool().await;
-    // Distinct pay_amounts: these rows still fall under the old uq_active_pay_amount index, and
-    // the first version of this test derived the amount from key.len() — identical for all three.
-    for (key, pay_amount) in [("legacy-a", 1_000_101i64), ("legacy-b", 1_000_202), ("legacy-c", 1_000_303)] {
+    for key in ["legacy-a", "legacy-b", "legacy-c"] {
         sqlx::query(
             "INSERT INTO deposit_intents
-                (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-             VALUES ($1, 'pk', 'clt', 1000000, $2, 1000000, $3, now() + interval '30 min')",
+                (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, expires_at)
+             VALUES ($1, 'pk', 'clt', 1000000, 1000000, $2, now() + interval '30 min')",
         )
         .bind(uuid::Uuid::new_v4())
-        .bind(pay_amount)
         .bind(key)
         .execute(&pool)
         .await

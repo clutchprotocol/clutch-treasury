@@ -11,7 +11,6 @@
 //! At par (1 USD = 1,000,000 CLT, USDT also 6 decimals) amount_usdt == amount_clt is an
 //! integer identity — no rate arithmetic anywhere in this file.
 
-use rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{Acquire, PgPool};
@@ -20,15 +19,12 @@ use uuid::Uuid;
 use crate::configuration::OrchConfig;
 use crate::derive::AddressDeriver;
 
-const DISCRIMINATOR_RANGE_END: i64 = 999;
-
 #[derive(Debug, sqlx::FromRow, Serialize)]
 pub struct DepositIntent {
     pub id: Uuid,
     pub user_pk: String,
     pub clt_address: String,
     pub amount_usdt: i64,
-    pub pay_amount_usdt: i64,
     pub amount_clt: i64,
     pub status: String,
     pub client_key: String,
@@ -55,7 +51,7 @@ pub struct DepositIntent {
     pub next_attempt_at: chrono::DateTime<chrono::Utc>,
 }
 
-const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, \
+const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
     treasury_intent_id, attempts, next_attempt_at";
@@ -79,8 +75,6 @@ pub enum CreateOutcome {
 pub enum ApiError {
     /// amount_usdt outside [min_deposit_usdt, max_deposit_usdt].
     OutOfBounds { min: i64, max: i64 },
-    /// All 999 discriminator slots for this amount are occupied by other active intents.
-    NoDiscriminatorSlot,
     Db(sqlx::Error),
 }
 
@@ -125,9 +119,9 @@ fn same_body(intent: &DepositIntent, clt_address: &str, amount_usdt: i64) -> boo
     intent.clt_address == clt_address && intent.amount_usdt == amount_usdt
 }
 
-/// Idempotency layers 1 + the discriminator: look up `(user_pk, client_key)`, and either
-/// replay a stored response, reject a body mismatch, resume a crashed attempt with a fresh
-/// discriminator, or insert a brand new intent — one function, spec §6's semantics exactly.
+/// Idempotency layer 1: look up `(user_pk, client_key)`, and either replay a stored response,
+/// reject a body mismatch, resume a crashed attempt (on its EXISTING derived address), or insert a
+/// brand new intent — one function, spec §6's semantics exactly.
 pub async fn create(
     pool: &PgPool,
     config: &OrchConfig,
@@ -191,7 +185,7 @@ pub async fn create(
         }
         _ => {
             // response_body IS NULL: a previous attempt died between `create` and
-            // `store_invoice`. Resume on the SAME pay_amount_usdt.
+            // `store_invoice`. Resume on the SAME derived address.
             //
             // Reusing the amount is what keeps this safe, not what makes it risky. This
             // row is the only holder of that slot under uq_active_pay_amount, and the
@@ -251,65 +245,55 @@ async fn insert_new(
         ApiError::Db(sqlx::Error::Protocol(format!("deriving address at index {derivation_index}: {e}")))
     })?;
 
-    let mut shuffled: Vec<i64> = (1..=DISCRIMINATOR_RANGE_END).collect();
-    shuffled.shuffle(&mut rand::thread_rng());
+    // One insert, no retry loop. The amount can no longer collide with anything: identity is the
+    // derived address, and that is unique by construction (migration 0007's sequence) rather than
+    // by searching a 999-wide space for a free slot.
+    let mut attempt = tx.begin().await?;
+    let row = sqlx::query_as::<_, DepositIntent>(&format!(
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, expires_at,
+             derivation_index, deposit_address)
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)
+         RETURNING {INTENT_COLS}"
+    ))
+    .bind(id)
+    .bind(user_pk)
+    .bind(clt_address)
+    .bind(amount_usdt)
+    .bind(client_key)
+    .bind(expires_at)
+    .bind(derivation_index)
+    .bind(&deposit_address)
+    .fetch_one(&mut *attempt)
+    .await;
 
-    for d in shuffled {
-        let pay_amount = amount_usdt + d;
-        // SAVEPOINT per attempt: a failed INSERT poisons the rest of the enclosing
-        // transaction in Postgres (every later statement errors "current transaction is
-        // aborted" until rollback), so retrying the shuffled range needs a nested
-        // transaction to roll back to, not just `continue` inside one `tx`.
-        let mut attempt = tx.begin().await?;
-        let row = sqlx::query_as::<_, DepositIntent>(&format!(
-            "INSERT INTO deposit_intents
-                (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at,
-                 derivation_index, deposit_address)
-             VALUES ($1, $2, $3, $4, $5, $4, $6, $7, $8, $9)
-             RETURNING {INTENT_COLS}"
-        ))
-        .bind(id)
-        .bind(user_pk)
-        .bind(clt_address)
-        .bind(amount_usdt)
-        .bind(pay_amount)
-        .bind(client_key)
-        .bind(expires_at)
-        .bind(derivation_index)
-        .bind(&deposit_address)
-        .fetch_one(&mut *attempt)
-        .await;
-
-        match row {
-            Ok(intent) => {
-                attempt.commit().await?;
-                tx.commit().await?;
-                return Ok(Some(intent));
-            }
-            Err(e) => match unique_violation_constraint(&e) {
-                // Lost a genuine create-vs-create race for this exact idempotency key —
-                // not a discriminator collision. Retrying the amount loop would just fail
-                // 999 more times against the same (user_pk, client_key) row; stop now and
-                // let the caller re-run create(), which will see the now-committed row and
-                // resolve Replay/Conflict/StillProcessing correctly (brief: "Insert race
-                // resolved by the unique index (ON CONFLICT catch -> re-fetch -> compare)").
-                Some(c) if c == IDEMPOTENCY_KEY_CONSTRAINT => {
-                    attempt.rollback().await?;
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                // uq_active_pay_amount (or any other unique index on this table): a
-                // different amount collision, keep iterating the shuffled range.
-                Some(_) => {
-                    attempt.rollback().await?;
-                    continue;
-                }
-                None => return Err(e.into()),
-            },
+    match row {
+        Ok(intent) => {
+            attempt.commit().await?;
+            tx.commit().await?;
+            Ok(Some(intent))
         }
+        Err(e) => match unique_violation_constraint(&e) {
+            // Lost a genuine create-vs-create race for this exact idempotency key. Stop and let the
+            // caller re-run create(), which will see the now-committed row and resolve
+            // Replay/Conflict/StillProcessing correctly (brief: "Insert race resolved by the unique
+            // index (ON CONFLICT catch -> re-fetch -> compare)").
+            Some(c) if c == IDEMPOTENCY_KEY_CONSTRAINT => {
+                attempt.rollback().await?;
+                tx.rollback().await?;
+                Ok(None)
+            }
+            // Any OTHER unique violation is now a genuine bug, not a slot collision to retry
+            // around. uq_deposit_derivation_index or uq_deposit_address firing here means an index
+            // was reissued or an address reused — the one thing that must never happen silently, so
+            // it surfaces as an error rather than being swallowed by a retry loop.
+            Some(_) | None => {
+                attempt.rollback().await?;
+                tx.rollback().await?;
+                Err(e.into())
+            }
+        },
     }
-    tx.rollback().await?;
-    Err(ApiError::NoDiscriminatorSlot)
 }
 
 /// Idempotency layer 4: nothing upstream dedupes for us, so this compare-and-set
@@ -563,9 +547,6 @@ pub async fn create_and_invoice(
     let outcome = match create(pool, config, deriver, user_pk, clt_address, amount_usdt, client_key).await {
         Ok(o) => o,
         Err(ApiError::OutOfBounds { min, max }) => return DepositOutcome::OutOfBounds { min, max },
-        Err(ApiError::NoDiscriminatorSlot) => {
-            return DepositOutcome::Failed("no discriminator slot available for this amount".into())
-        }
         Err(ApiError::Db(e)) => return DepositOutcome::Failed(e.to_string()),
     };
 
@@ -614,7 +595,10 @@ pub async fn create_and_invoice(
     let body = json!({
         "id": intent.id,
         "pay_address": pay_address,
-        "pay_amount_usdt": intent.pay_amount_usdt,
+        // Key kept for wire compatibility with the demo app; it still means "the amount to
+        // pay". The value is now the plain amount — there is no discriminator to add, and the
+        // address identifies the payer, so this is a minimum rather than an exact figure.
+        "pay_amount_usdt": intent.amount_usdt,
         "expires_at": intent.expires_at,
         "status": "invoiced",
     });

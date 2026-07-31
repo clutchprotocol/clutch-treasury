@@ -97,7 +97,7 @@ async fn replay_same_body_returns_stored_response_and_status() {
     else {
         panic!("expected Created on first call");
     };
-    let body = json!({"id": intent.id, "pay_amount_usdt": intent.pay_amount_usdt, "status": "invoiced"});
+    let body = json!({"id": intent.id, "pay_amount_usdt": intent.amount_usdt, "status": "invoiced"});
     complete_invoice(&pool, intent.id, 201, &body).await;
 
     // Replay: identical (user_pk, client_key, clt_address, amount_usdt).
@@ -138,13 +138,18 @@ async fn same_key_different_body_is_conflict() {
 /// crash, or an adapter timeout where Bitcart may still hold a LIVE invoice at this
 /// amount that we never recorded the id of.
 ///
-/// Resume must keep the SAME pay_amount_usdt. Moving to a fresh discriminator would
+/// Resume must keep the SAME deposit address. Moving to a fresh one would
 /// release the old amount while that orphan invoice is still live, and the amount is the
 /// only thing Bitcart can match a payment by on the shared static custody address — so a
 /// later, DIFFERENT user allocated that amount would collide with a stranger's invoice.
-/// The second assertion is the one that matters: the slot stays reserved.
+/// The property with the money in it, now address-shaped: a resumed row must keep the address its
+/// user may already be paying to. Re-deriving would be the per-address form of a32a101.
+///
+/// The "another user cannot claim it" half is gone from here because it is no longer an amount
+/// slot that could be reissued — derivation indices are never reused (migration 0007), and the
+/// uniqueness of index and address is proven directly in db_derivation_index.rs.
 #[tokio::test]
-async fn crash_resume_keeps_orphan_amount_reserved_against_other_users() {
+async fn crash_resume_keeps_the_same_deposit_address() {
     let pool = pool().await;
     let cfg = test_config();
     let key = "idem-key-3";
@@ -154,7 +159,7 @@ async fn crash_resume_keeps_orphan_amount_reserved_against_other_users() {
     else {
         panic!("expected Created on first call");
     };
-    let orphan_amount = first.pay_amount_usdt;
+    let orphan_address = first.deposit_address.clone().expect("a fresh intent must carry an address");
     // No store_invoice call — response_body stays NULL, simulating the crash.
 
     let outcome = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, key).await.unwrap();
@@ -163,27 +168,8 @@ async fn crash_resume_keeps_orphan_amount_reserved_against_other_users() {
     };
     assert_eq!(resumed.id, first.id, "resume continues the SAME intent row, not a new one");
     assert_eq!(
-        resumed.pay_amount_usdt, orphan_amount,
+        resumed.deposit_address.as_deref(), Some(orphan_address.as_str()),
         "resume must keep the orphan's amount reserved, not move to a fresh discriminator"
-    );
-
-    // The property with the money in it: a DIFFERENT user must not be able to claim the
-    // amount a possibly-live orphan invoice still carries. Insert directly, so this tests
-    // uq_active_pay_amount itself rather than the allocator's willingness to pick it.
-    let err = sqlx::query(
-        "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-         VALUES ($1, 'other-user-pk', 'clt2address', 2000000, $2, 2000000, 'other-key', now() + interval '1 hour')",
-    )
-    .bind(Uuid::new_v4())
-    .bind(orphan_amount)
-    .execute(&pool)
-    .await
-    .expect_err("a second user must not be able to claim the orphan's amount");
-    assert_eq!(
-        err.as_database_error().and_then(|e| e.constraint()),
-        Some("uq_active_pay_amount"),
-        "rejection must come from the discriminator index, not some incidental constraint"
     );
 }
 
@@ -226,7 +212,7 @@ async fn store_invoice_compare_and_set_second_writer_loses() {
 }
 
 /// The core money-safety property: two DIFFERENT users depositing the exact same
-/// amount_usdt concurrently must never collide on pay_amount_usdt — that's the whole
+/// amount_usdt concurrently must never collide on deposit_address — that's the whole
 /// reason the discriminator exists (Tron/Bitcart watch-only matches by amount on one
 /// static address, not by per-invoice derived address).
 #[tokio::test]
@@ -245,71 +231,11 @@ async fn concurrent_same_amount_intents_get_different_pay_amounts() {
     assert_eq!(a.amount_usdt, amount);
     assert_eq!(b.amount_usdt, amount);
     assert_ne!(
-        a.pay_amount_usdt, b.pay_amount_usdt,
-        "two concurrent active intents for the same amount_usdt must never share pay_amount_usdt"
+        a.deposit_address, b.deposit_address,
+        "two concurrent active intents for the same amount_usdt must never share a deposit address"
     );
 }
 
-/// Proves the partial unique index's `expired`-but-not-terminal clause: our soft 30-minute
-/// expiry does NOT free the amount slot, because Bitcart may still be able to match a late
-/// payment to that invoice. Only payment_window_closed = TRUE frees it. This is the exact
-/// property named in the brief's escalation clause — tested against the live index, not
-/// asserted by reading the SQL.
-#[tokio::test]
-async fn expired_but_not_payment_window_closed_keeps_amount_slot_reserved() {
-    let pool = pool().await;
-    let cfg = test_config();
-    let amount = 7_000_000i64;
-
-    let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, test_deriver(), "user-x", "clt-addr-x", amount, "key-x").await.unwrap()
-    else {
-        panic!("expected Created")
-    };
-    let claimed_pay_amount = intent.pay_amount_usdt;
-
-    // Soft-expire it WITHOUT marking it Bitcart-terminal — exactly the dangerous window
-    // the brief describes: our expiry fired, but Bitcart might still credit a late payment.
-    let did_expire = deposits::transition(&pool, intent.id, &["created", "invoiced", "paying"], "expired")
-        .await
-        .unwrap();
-    assert!(did_expire);
-
-    // Directly attempt to INSERT a second row at the exact same pay_amount_usdt — this is
-    // the money-safety property itself, proven against the live unique index, not by
-    // reading the migration and trusting it. A second real user must be rejected outright.
-    let collision = sqlx::query(
-        "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-         VALUES ($1, 'user-y', 'clt-addr-y', $2, $2, $2, 'key-y', now() + interval '30 minutes')",
-    )
-    .bind(Uuid::new_v4())
-    .bind(claimed_pay_amount)
-    .execute(&pool)
-    .await;
-    assert!(
-        collision.is_err(),
-        "uq_active_pay_amount must still reject a second user claiming this amount while expired-but-not-terminal"
-    );
-
-    // Now mark it terminal on Bitcart's side — THIS is what must free the slot.
-    sqlx::query("UPDATE deposit_intents SET payment_window_closed = TRUE WHERE id = $1")
-        .bind(intent.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let now_free = sqlx::query(
-        "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-         VALUES ($1, 'user-y', 'clt-addr-y', $2, $2, $2, 'key-y', now() + interval '30 minutes')",
-    )
-    .bind(Uuid::new_v4())
-    .bind(claimed_pay_amount)
-    .execute(&pool)
-    .await;
-    assert!(now_free.is_ok(), "once payment_window_closed = TRUE, the amount slot must be free for reuse");
-}
 
 #[tokio::test]
 async fn transition_allows_expired_to_confirmed_late_honour() {
@@ -392,9 +318,6 @@ async fn amount_clt_equals_amount_usdt_at_par() {
         panic!("expected Created")
     };
     assert_eq!(intent.amount_clt, amount, "at par, amount_clt must equal amount_usdt exactly (integer identity)");
-    assert_eq!(intent.pay_amount_usdt - intent.amount_usdt >= 1, true);
-    assert!(
-        intent.pay_amount_usdt - intent.amount_usdt <= 999,
-        "discriminator must be within the specified 1..=999 range"
-    );
+    // The discriminator-range assertion that used to sit here is gone with the discriminator: the
+    // amount a user pays is now simply the amount they asked for.
 }

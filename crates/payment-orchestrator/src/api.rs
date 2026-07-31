@@ -150,7 +150,7 @@ async fn get_deposit_handler(
         "id": intent.id,
         "clt_address": intent.clt_address,
         "amount_usdt": intent.amount_usdt,
-        "pay_amount_usdt": intent.pay_amount_usdt,
+        "pay_amount_usdt": intent.amount_usdt,
         "status": intent.status,
         "invoice_id": intent.invoice_id,
         "expires_at": intent.expires_at,
