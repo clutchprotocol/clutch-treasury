@@ -24,7 +24,6 @@
 //! encoding are both right.
 
 use bip32::{ChildNumber, XPub};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use sha3::{Digest, Keccak256};
 
 /// BIP44 for Tron is `m/44'/195'/account'/0/index`. The xpub supplied is at the ACCOUNT level

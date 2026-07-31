@@ -36,8 +36,6 @@ bs58 = { version = "0.5", features = ["check"] }
 # BIP32 for per-intent address derivation (derive.rs). Deliberately a crate, not hand-rolled:
 # a subtly wrong derivation sends real USDT to addresses whose keys cannot be reconstructed.
 bip32 = "0.5"
-# Same curve crate bip32 resolves to; needed only for the SEC1 uncompressed encoding Tron hashes.
-k256 = "0.13"
 sha3 = "0.10.1"
 serde.workspace = true
 serde_json.workspace = true
