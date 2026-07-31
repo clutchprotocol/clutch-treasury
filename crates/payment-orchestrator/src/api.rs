@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
+use crate::derive::AddressDeriver;
 use crate::deposits::{self, DepositOutcome};
 use crate::redemptions::{self, RedemptionOutcome};
 
@@ -19,6 +21,8 @@ use crate::redemptions::{self, RedemptionOutcome};
 pub struct AppState {
     pub pool: PgPool,
     pub config: OrchConfig,
+    /// Shared so the account xpub is parsed once, at startup.
+    pub deriver: Arc<AddressDeriver>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -78,6 +82,7 @@ async fn create_deposit_handler(
     let outcome = deposits::create_and_invoice(
         &state.pool,
         &state.config,
+        state.deriver.as_ref(),
         &user_pk,
         &body.clt_address,
         body.amount_usdt,
@@ -279,9 +284,9 @@ async fn get_redemption_handler(
 // announce, and removing it also removes the only unauthenticated route this service exposed —
 // which was a standing DoS surface against a 5-connection pool shared with the deposit routes.
 
-pub fn router(pool: PgPool, config: OrchConfig) -> Router {
+pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) -> Router {
     let cors = build_cors(&config.allowed_origins);
-    let state = AppState { pool, config };
+    let state = AppState { pool, config, deriver };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler))

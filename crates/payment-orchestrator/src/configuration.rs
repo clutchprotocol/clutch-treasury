@@ -30,7 +30,13 @@ pub struct OrchConfig {
     pub treasury_url: String,
     pub treasury_initiator_token: String,
     pub treasury_readonly_token: String,
+    /// Where swept deposits land. NOT the address users pay into — each intent gets its own
+    /// derived address now (see `derive.rs`); this is the sweep destination.
     pub custody_tron_address: String,
+    /// ACCOUNT-level xpub, `m/44'/195'/0'`. Public material: it can derive receive addresses and
+    /// nothing else, which is why this service may hold it while the signer holds the mnemonic.
+    /// Parsed once at startup so a malformed value fails at boot rather than per request.
+    pub deposit_account_xpub: String,
     pub deposit_ttl_minutes: i64,
     pub min_deposit_usdt: i64,
     pub max_deposit_usdt: i64,

@@ -20,6 +20,17 @@ use uuid::Uuid;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Account xpub for the canonical public BIP39 all-"abandon" test mnemonic (m/44'/195'/0').
+/// Public test material; never holds funds.
+const TEST_XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
+
+/// `&'static` so call sites can pass it without creating a temporary that is dropped while
+/// borrowed, and so the xpub is parsed once per test binary rather than per call.
+fn test_deriver() -> &'static payment_orchestrator::derive::AddressDeriver {
+    static D: std::sync::OnceLock<payment_orchestrator::derive::AddressDeriver> = std::sync::OnceLock::new();
+    D.get_or_init(|| payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap())
+}
+
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
@@ -47,6 +58,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         treasury_initiator_token: "test-treasury-initiator".into(),
         treasury_readonly_token: "test-treasury-readonly".into(),
         custody_tron_address: "Tunused".into(),
+        deposit_account_xpub: TEST_XPUB.into(),
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
@@ -516,6 +528,7 @@ async fn headroom_check_refuses_when_insufficient() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
+       test_deriver(),
         "user-pk-headroom",
         "clt-addr-headroom",
         1_000_000, // exceeds the 500_000 headroom reported above
@@ -551,6 +564,7 @@ async fn headroom_check_refuses_when_treasury_unreachable() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
+       test_deriver(),
         "user-pk-unreachable",
         "clt-addr-unreachable",
         1_000_000,
@@ -582,6 +596,7 @@ async fn headroom_check_allows_through_when_sufficient() {
     let outcome = deposits::create_and_invoice(
         &pool,
         &config,
+       test_deriver(),
         "user-pk-sufficient",
         "clt-addr-sufficient",
         1_000_000,

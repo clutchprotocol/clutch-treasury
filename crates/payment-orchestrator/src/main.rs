@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use payment_orchestrator::custody::{CustodyWatcher, TronGridWatcher};
+use payment_orchestrator::derive::AddressDeriver;
 use payment_orchestrator::api;
 use payment_orchestrator::configuration::OrchConfig;
 
@@ -17,6 +18,13 @@ async fn main() {
         .await
         .expect("connect postgres");
     sqlx::migrate!("./migrations").run(&pool).await.expect("migrations");
+
+    // Fail at boot, not per request: a malformed xpub means no deposit can be addressed at all,
+    // and discovering that on a user's first request is strictly worse than not starting.
+    let deriver = Arc::new(
+        AddressDeriver::from_account_xpub(&config.deposit_account_xpub)
+            .expect("APP_DEPOSIT_ACCOUNT_XPUB must be a valid account-level xpub (m/44'/195'/0')"),
+    );
 
     let watcher: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(
         config.trongrid_url.clone(),
@@ -35,7 +43,7 @@ async fn main() {
     // treasury's private zone. Same poll-interval convention as the poller above.
     tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));
 
-    let app = api::router(pool, config.clone());
+    let app = api::router(pool, config.clone(), deriver);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("payment-orchestrator listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");

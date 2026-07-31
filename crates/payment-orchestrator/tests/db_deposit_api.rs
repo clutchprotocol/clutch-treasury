@@ -18,6 +18,17 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Account xpub for the canonical public BIP39 all-"abandon" test mnemonic (m/44'/195'/0').
+/// Public test material; never holds funds.
+const TEST_XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
+
+/// `&'static` so call sites can pass it without creating a temporary that is dropped while
+/// borrowed, and so the xpub is parsed once per test binary rather than per call.
+fn test_deriver() -> &'static payment_orchestrator::derive::AddressDeriver {
+    static D: std::sync::OnceLock<payment_orchestrator::derive::AddressDeriver> = std::sync::OnceLock::new();
+    D.get_or_init(|| payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap())
+}
+
 const JWT_SECRET: &str = "test-jwt-secret";
 
 /// `pay_address` is now read straight from config rather than returned by a payment
@@ -67,6 +78,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
         custody_tron_address: TEST_CUSTODY.into(),
+        deposit_account_xpub: TEST_XPUB.into(),
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
@@ -95,7 +107,7 @@ fn bearer_for(pk: &str) -> String {
 }
 
 fn router_with(pool: PgPool, config: OrchConfig) -> axum::Router {
-    payment_orchestrator::api::router(pool, config)
+    payment_orchestrator::api::router(pool, config, std::sync::Arc::new(payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap()))
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -129,9 +141,28 @@ async fn replay_same_key_same_body_returns_original_status_and_body() {
     let first = app.clone().oneshot(make_request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::CREATED, "first call must create and return 201");
     let first_body = body_json(first).await;
+    // pay_address is DERIVED per intent now, not read from config. Asserted against the row's own
+    // derivation_index rather than a literal, so this also proves the address the user was told
+    // matches the index the signer will later derive the sweeping key from — a mismatch there is
+    // funds nobody can move.
+    let (index, stored_address): (i64, String) = sqlx::query_as(
+        "SELECT derivation_index, deposit_address FROM deposit_intents WHERE client_key = 'key-replay-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the intent must carry an index and an address");
     assert_eq!(
+        first_body["pay_address"], stored_address,
+        "the response must echo the address stored on the row"
+    );
+    assert_eq!(
+        stored_address,
+        test_deriver().address_at(u32::try_from(index).unwrap()).unwrap(),
+        "stored address must be the one derived at the row's own index"
+    );
+    assert_ne!(
         first_body["pay_address"], TEST_CUSTODY,
-        "pay_address must be the configured custody address"
+        "must NOT be the shared custody address — that is the sweep destination, not a pay-in address"
     );
 
     // Second call: identical key, identical body.

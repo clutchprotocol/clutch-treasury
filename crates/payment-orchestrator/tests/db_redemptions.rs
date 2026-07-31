@@ -19,6 +19,17 @@ use tower::ServiceExt;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Account xpub for the canonical public BIP39 all-"abandon" test mnemonic (m/44'/195'/0').
+/// Public test material; never holds funds.
+const TEST_XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
+
+/// `&'static` so call sites can pass it without creating a temporary that is dropped while
+/// borrowed, and so the xpub is parsed once per test binary rather than per call.
+fn test_deriver() -> &'static payment_orchestrator::derive::AddressDeriver {
+    static D: std::sync::OnceLock<payment_orchestrator::derive::AddressDeriver> = std::sync::OnceLock::new();
+    D.get_or_init(|| payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap())
+}
+
 const JWT_SECRET: &str = "test-jwt-secret";
 
 /// A genuinely base58check-valid Tron mainnet address (the widely-published USDT-TRC20
@@ -53,6 +64,7 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         treasury_initiator_token: "test-treasury-initiator".into(),
         treasury_readonly_token: "test-treasury-readonly".into(),
         custody_tron_address: "Tunused".into(),
+        deposit_account_xpub: TEST_XPUB.into(),
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
@@ -82,7 +94,7 @@ fn bearer_for(pk: &str) -> String {
 /// used to be passed here (panicking if invoked, to catch a redemption routed through the deposit
 /// path) is gone with it: that wiring mistake is now impossible to express.
 fn router_with(pool: PgPool, config: OrchConfig) -> axum::Router {
-    payment_orchestrator::api::router(pool, config)
+    payment_orchestrator::api::router(pool, config, std::sync::Arc::new(payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap()))
 }
 
 async fn body_json_of(resp: axum::response::Response) -> Value {

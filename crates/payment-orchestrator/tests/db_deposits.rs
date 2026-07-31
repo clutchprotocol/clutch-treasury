@@ -5,6 +5,17 @@ use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
 
+/// Account xpub for the canonical public BIP39 all-"abandon" test mnemonic (m/44'/195'/0').
+/// Public test material; never holds funds.
+const TEST_XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
+
+/// `&'static` so call sites can pass it without creating a temporary that is dropped while
+/// borrowed, and so the xpub is parsed once per test binary rather than per call.
+fn test_deriver() -> &'static payment_orchestrator::derive::AddressDeriver {
+    static D: std::sync::OnceLock<payment_orchestrator::derive::AddressDeriver> = std::sync::OnceLock::new();
+    D.get_or_init(|| payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap())
+}
+
 /// docker-compose.test.yml points every crate's DATABASE_URL at ONE shared database
 /// (`treasury_test`) for simplicity — real dev/prod already gives each service its own
 /// database (.env.example: treasury on 5433/treasury, orchestrator on 5434/orchestrator).
@@ -46,6 +57,7 @@ fn test_config() -> OrchConfig {
         treasury_initiator_token: "i".into(),
         treasury_readonly_token: "r".into(),
         custody_tron_address: "Tunused".into(),
+        deposit_account_xpub: TEST_XPUB.into(),
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
@@ -81,7 +93,7 @@ async fn replay_same_body_returns_stored_response_and_status() {
     let key = "idem-key-1";
 
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), clt_address, amount, key).await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), clt_address, amount, key).await.unwrap()
     else {
         panic!("expected Created on first call");
     };
@@ -89,7 +101,7 @@ async fn replay_same_body_returns_stored_response_and_status() {
     complete_invoice(&pool, intent.id, 201, &body).await;
 
     // Replay: identical (user_pk, client_key, clt_address, amount_usdt).
-    let outcome = deposits::create(&pool, &cfg, &user_pk(), clt_address, amount, key).await.unwrap();
+    let outcome = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), clt_address, amount, key).await.unwrap();
     match outcome {
         CreateOutcome::Replay { status, body: replayed } => {
             assert_eq!(status, 201, "replay must return the ORIGINAL stored status, not a fresh 200/201");
@@ -106,7 +118,7 @@ async fn same_key_different_body_is_conflict() {
     let key = "idem-key-2";
 
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, key).await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, key).await.unwrap()
     else {
         panic!("expected Created on first call");
     };
@@ -114,11 +126,11 @@ async fn same_key_different_body_is_conflict() {
 
     // Same idempotency key, different amount_usdt this time — must not silently replay
     // the first request's outcome under a second user's intended amount.
-    let outcome = deposits::create(&pool, &cfg, &user_pk(), "clt1address", 3_000_000, key).await.unwrap();
+    let outcome = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 3_000_000, key).await.unwrap();
     assert!(matches!(outcome, CreateOutcome::Conflict), "different body under same key must be Conflict");
 
     // Also different clt_address, same amount — same rule.
-    let outcome2 = deposits::create(&pool, &cfg, &user_pk(), "clt-different-address", 2_000_000, key).await.unwrap();
+    let outcome2 = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt-different-address", 2_000_000, key).await.unwrap();
     assert!(matches!(outcome2, CreateOutcome::Conflict));
 }
 
@@ -138,14 +150,14 @@ async fn crash_resume_keeps_orphan_amount_reserved_against_other_users() {
     let key = "idem-key-3";
 
     let CreateOutcome::Created(first) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, key).await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, key).await.unwrap()
     else {
         panic!("expected Created on first call");
     };
     let orphan_amount = first.pay_amount_usdt;
     // No store_invoice call — response_body stays NULL, simulating the crash.
 
-    let outcome = deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, key).await.unwrap();
+    let outcome = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, key).await.unwrap();
     let CreateOutcome::Created(resumed) = outcome else {
         panic!("expected Created (resume) on NULL response_body, got {outcome:?}");
     };
@@ -183,7 +195,7 @@ async fn store_invoice_compare_and_set_second_writer_loses() {
     let pool = pool().await;
     let cfg = test_config();
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, "idem-key-4").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, "idem-key-4").await.unwrap()
     else {
         panic!("expected Created");
     };
@@ -205,7 +217,7 @@ async fn store_invoice_compare_and_set_second_writer_loses() {
     // The losing writer's caller replays the canonical response rather than treating this
     // as an error — proving that response is actually retrievable is the point of the test.
     let CreateOutcome::Replay { status, body } =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, "idem-key-4").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, "idem-key-4").await.unwrap()
     else {
         panic!("expected Replay of the canonical (first writer's) response");
     };
@@ -224,8 +236,8 @@ async fn concurrent_same_amount_intents_get_different_pay_amounts() {
     let amount = 5_000_000i64;
 
     let (a, b) = tokio::join!(
-        deposits::create(&pool, &cfg, "user-a", "clt-addr-a", amount, "key-a"),
-        deposits::create(&pool, &cfg, "user-b", "clt-addr-b", amount, "key-b"),
+        deposits::create(&pool, &cfg, test_deriver(), "user-a", "clt-addr-a", amount, "key-a"),
+        deposits::create(&pool, &cfg, test_deriver(), "user-b", "clt-addr-b", amount, "key-b"),
     );
     let CreateOutcome::Created(a) = a.unwrap() else { panic!("expected Created for user-a") };
     let CreateOutcome::Created(b) = b.unwrap() else { panic!("expected Created for user-b") };
@@ -250,7 +262,7 @@ async fn expired_but_not_payment_window_closed_keeps_amount_slot_reserved() {
     let amount = 7_000_000i64;
 
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, "user-x", "clt-addr-x", amount, "key-x").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), "user-x", "clt-addr-x", amount, "key-x").await.unwrap()
     else {
         panic!("expected Created")
     };
@@ -304,7 +316,7 @@ async fn transition_allows_expired_to_confirmed_late_honour() {
     let pool = pool().await;
     let cfg = test_config();
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, "idem-key-5").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, "idem-key-5").await.unwrap()
     else {
         panic!("expected Created")
     };
@@ -325,7 +337,7 @@ async fn transition_refuses_confirmed_to_failed() {
     let pool = pool().await;
     let cfg = test_config();
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", 2_000_000, "idem-key-6").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", 2_000_000, "idem-key-6").await.unwrap()
     else {
         panic!("expected Created")
     };
@@ -346,23 +358,23 @@ async fn bounds_are_enforced() {
     let pool = pool().await;
     let cfg = test_config();
 
-    let too_small = deposits::create(&pool, &cfg, &user_pk(), "clt1address", cfg.min_deposit_usdt - 1, "key-small").await;
+    let too_small = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", cfg.min_deposit_usdt - 1, "key-small").await;
     assert!(
         matches!(too_small, Err(deposits::ApiError::OutOfBounds { .. })),
         "below min_deposit_usdt must be rejected"
     );
 
-    let too_large = deposits::create(&pool, &cfg, &user_pk(), "clt1address", cfg.max_deposit_usdt + 1, "key-large").await;
+    let too_large = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", cfg.max_deposit_usdt + 1, "key-large").await;
     assert!(
         matches!(too_large, Err(deposits::ApiError::OutOfBounds { .. })),
         "above max_deposit_usdt must be rejected"
     );
 
     // Boundary values themselves are legal.
-    let at_min = deposits::create(&pool, &cfg, &user_pk(), "clt1address", cfg.min_deposit_usdt, "key-min").await;
+    let at_min = deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", cfg.min_deposit_usdt, "key-min").await;
     assert!(matches!(at_min, Ok(CreateOutcome::Created(_))), "exactly min_deposit_usdt must be accepted");
 
-    let at_max = deposits::create(&pool, &cfg, "user-max", "clt1address", cfg.max_deposit_usdt, "key-max").await;
+    let at_max = deposits::create(&pool, &cfg, test_deriver(), "user-max", "clt1address", cfg.max_deposit_usdt, "key-max").await;
     assert!(matches!(at_max, Ok(CreateOutcome::Created(_))), "exactly max_deposit_usdt must be accepted");
 }
 
@@ -375,7 +387,7 @@ async fn amount_clt_equals_amount_usdt_at_par() {
     let cfg = test_config();
     let amount = 12_345_678i64;
     let CreateOutcome::Created(intent) =
-        deposits::create(&pool, &cfg, &user_pk(), "clt1address", amount, "idem-key-par").await.unwrap()
+        deposits::create(&pool, &cfg, test_deriver(), &user_pk(), "clt1address", amount, "idem-key-par").await.unwrap()
     else {
         panic!("expected Created")
     };

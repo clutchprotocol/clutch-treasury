@@ -18,6 +18,7 @@ use sqlx::{Acquire, PgPool};
 use uuid::Uuid;
 
 use crate::configuration::OrchConfig;
+use crate::derive::AddressDeriver;
 
 const DISCRIMINATOR_RANGE_END: i64 = 999;
 
@@ -130,6 +131,7 @@ fn same_body(intent: &DepositIntent, clt_address: &str, amount_usdt: i64) -> boo
 pub async fn create(
     pool: &PgPool,
     config: &OrchConfig,
+    deriver: &AddressDeriver,
     user_pk: &str,
     clt_address: &str,
     amount_usdt: i64,
@@ -163,7 +165,7 @@ pub async fn create(
             tx.rollback().await?;
             return Ok(match unlocked {
                 Some(_) => CreateOutcome::StillProcessing,
-                None => match insert_new(pool, config, user_pk, clt_address, amount_usdt, client_key).await? {
+                None => match insert_new(pool, config, deriver, user_pk, clt_address, amount_usdt, client_key).await? {
                     Some(intent) => CreateOutcome::Created(intent),
                     // The unlocked check above raced a concurrent insert between the two
                     // reads; the unique (user_pk, client_key) index means that insert now
@@ -200,6 +202,11 @@ pub async fn create(
             // cross-user misattribution on the shared static custody address that the
             // discriminator exists to prevent.
             //
+            // The address dimension is simpler and safer: the row already holds its
+            // derivation_index and deposit_address, so a resume reuses the SAME address by
+            // construction — there is nothing to re-allocate and no way to hand this user a
+            // second address while they are paying the first.
+            //
             // Two live invoices at one amount for THIS SAME intent is not that hazard:
             // both carry this intent's order_id, this user, this credit, and whichever
             // one we match against, `store_invoice`'s compare-and-set plus the per-invoice
@@ -219,6 +226,7 @@ pub async fn create(
 async fn insert_new(
     pool: &PgPool,
     config: &OrchConfig,
+    deriver: &AddressDeriver,
     user_pk: &str,
     clt_address: &str,
     amount_usdt: i64,
@@ -227,6 +235,21 @@ async fn insert_new(
     let mut tx = pool.begin().await?;
     let id = Uuid::new_v4();
     let expires_at = chrono::Utc::now() + chrono::Duration::minutes(config.deposit_ttl_minutes);
+
+    // Allocate and derive BEFORE the insert, and once — not per discriminator attempt. The address
+    // is written in the same statement as the row, so a row can never exist without the address
+    // users were told to pay. A retry below re-uses this same index: the index is not what
+    // collides, and burning a fresh one per attempt would waste the sequence for no gain.
+    //
+    // A subsequently-failed insert burns this index. Gaps are harmless; see migration 0007.
+    let derivation_index = allocate_derivation_index(pool).await?;
+    let index_u32 = u32::try_from(derivation_index)
+        .map_err(|_| ApiError::Db(sqlx::Error::Protocol(format!(
+            "derivation index {derivation_index} does not fit u32; sequence MAXVALUE should have prevented this"
+        ))))?;
+    let deposit_address = deriver.address_at(index_u32).map_err(|e| {
+        ApiError::Db(sqlx::Error::Protocol(format!("deriving address at index {derivation_index}: {e}")))
+    })?;
 
     let mut shuffled: Vec<i64> = (1..=DISCRIMINATOR_RANGE_END).collect();
     shuffled.shuffle(&mut rand::thread_rng());
@@ -240,8 +263,9 @@ async fn insert_new(
         let mut attempt = tx.begin().await?;
         let row = sqlx::query_as::<_, DepositIntent>(&format!(
             "INSERT INTO deposit_intents
-                (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $4, $6, $7)
+                (id, user_pk, clt_address, amount_usdt, pay_amount_usdt, amount_clt, client_key, expires_at,
+                 derivation_index, deposit_address)
+             VALUES ($1, $2, $3, $4, $5, $4, $6, $7, $8, $9)
              RETURNING {INTENT_COLS}"
         ))
         .bind(id)
@@ -251,6 +275,8 @@ async fn insert_new(
         .bind(pay_amount)
         .bind(client_key)
         .bind(expires_at)
+        .bind(derivation_index)
+        .bind(&deposit_address)
         .fetch_one(&mut *attempt)
         .await;
 
@@ -528,12 +554,13 @@ async fn check_headroom(config: &OrchConfig, amount_usdt: i64) -> Result<(), Dep
 pub async fn create_and_invoice(
     pool: &PgPool,
     config: &OrchConfig,
+    deriver: &AddressDeriver,
     user_pk: &str,
     clt_address: &str,
     amount_usdt: i64,
     client_key: &str,
 ) -> DepositOutcome {
-    let outcome = match create(pool, config, user_pk, clt_address, amount_usdt, client_key).await {
+    let outcome = match create(pool, config, deriver, user_pk, clt_address, amount_usdt, client_key).await {
         Ok(o) => o,
         Err(ApiError::OutOfBounds { min, max }) => return DepositOutcome::OutOfBounds { min, max },
         Err(ApiError::NoDiscriminatorSlot) => {
@@ -570,9 +597,23 @@ pub async fn create_and_invoice(
     // idempotency doing the work, and it is unchanged.
     let invoice_ref = intent.id.to_string();
 
+    // From the ROW, never re-derived here. A crash-resumed row already carries the address its
+    // user was told to pay; deriving again on this path would be the per-address analogue of
+    // a32a101 — re-issuing an identity a payer may already be sending to.
+    //
+    // `None` means a discriminator-era row that predates per-intent addresses. Refuse rather than
+    // mint it a fresh address: the user was told a shared custody address, and quietly moving the
+    // goalposts could credit a payment that never arrives at the new one.
+    let Some(pay_address) = intent.deposit_address.clone() else {
+        return DepositOutcome::Failed(format!(
+            "intent {} predates per-intent deposit addresses and cannot be resumed",
+            intent.id
+        ));
+    };
+
     let body = json!({
         "id": intent.id,
-        "pay_address": config.custody_tron_address,
+        "pay_address": pay_address,
         "pay_amount_usdt": intent.pay_amount_usdt,
         "expires_at": intent.expires_at,
         "status": "invoiced",
