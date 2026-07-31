@@ -22,6 +22,13 @@ const DEPOSIT_ADDR: &str = "TCustodyAddressXXXXXXXXXXXXXXXXXXX";
 const OTHER_ADDR: &str = "TOtherIntentAddressYYYYYYYYYYYYYYY";
 const USDT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
+/// The balanceOf path base58check-DECODES the address it is given, so a mistyped one cannot read a
+/// stranger's balance. The DEPOSIT_ADDR/OTHER_ADDR placeholders above are opaque strings the trc20
+/// tests only ever compare, never decode — the reserve-sum tests need genuinely valid addresses.
+const REAL_MAIN: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+const REAL_UNSWEPT_A: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+const REAL_UNSWEPT_B: &str = "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx";
+
 async fn pool() -> PgPool {
     // Each test BINARY gets its own database. --test-threads=1 only serialises tests WITHIN a
     // binary; cargo runs binaries in PARALLEL, and every pool() here TRUNCATEs shared tables —
@@ -156,6 +163,16 @@ fn trc20_event_json(tx_id: &str, to: &str, contract: &str, value: &str, event_ty
     json!({"transaction_id": tx_id, "to": to, "value": value, "type": event_type,
            "token_info": {"address": contract},
            "block_timestamp": chrono::Utc::now().timestamp_millis()})
+}
+
+/// Mocks `POST /wallet/triggerconstantcontract` (balanceOf) with one canned 32-byte result word,
+/// answering for ANY address — enough to prove the sum walks every address it is given.
+async fn mount_balance_of(server: &MockServer, hex_word: &str) {
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [hex_word]})))
+        .mount(server)
+        .await;
 }
 
 async fn mount_trc20_list(server: &MockServer, transfers: Vec<serde_json::Value>) {
@@ -756,4 +773,43 @@ async fn reserve_status_reports_daily_headroom_that_shrinks_with_approved_mints(
 
     let after = get_headroom(app).await;
     assert_eq!(after, 6_000_000, "headroom must shrink by exactly the approved mint's amount");
+}
+
+/// The reserve is a SUM once deposits sit on per-intent addresses.
+///
+/// Reading only the main treasury address reports a reserve near zero while unswept deposits sit
+/// elsewhere. That is not a halt risk — `judge` keys on the LEDGER's `custody_reported`, and
+/// `trongrid_balance` is a cross-check column that plays no part in any branch — but a fourth source
+/// that is permanently wrong is worse than one that is absent: people stop reading it, and then
+/// disbelieve it on the day it is right.
+#[tokio::test]
+async fn reserve_balance_sums_the_main_address_and_every_unswept_deposit_address() {
+    let server = MockServer::start().await;
+    // balanceOf returns a 32-byte hex word; 1_000_000 = 0xF4240, 2_500_000 = 0x2625A0.
+    mount_balance_of(&server, "00000000000000000000000000000000000000000000000000000000000f4240").await;
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
+
+    let only_main = client.get_reserve_balance(REAL_MAIN, &[], USDT).await.unwrap();
+    assert_eq!(only_main, 1_000_000, "with nothing unswept the reserve is just the main address");
+
+    // Three addresses now, each answering the same mocked balance.
+    let with_unswept = client
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string(), REAL_UNSWEPT_B.to_string()], USDT)
+        .await
+        .unwrap();
+    assert_eq!(with_unswept, 3_000_000, "main + two unswept addresses must all be counted");
+}
+
+/// A failure on ANY address must fail the whole sum. A partial total understates the reserve, which
+/// looks exactly like a shortfall — the one direction a reserve figure must never silently err in.
+#[tokio::test]
+async fn a_single_unreadable_address_fails_the_whole_reserve_sum() {
+    let server = MockServer::start().await;
+    // No balanceOf mock mounted at all, so the very first read fails.
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
+    let err = client
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string()], USDT)
+        .await
+        .expect_err("an unreadable address must not yield a partial total");
+    assert!(!err.is_empty(), "the failure must be reported, not swallowed into a smaller number");
 }

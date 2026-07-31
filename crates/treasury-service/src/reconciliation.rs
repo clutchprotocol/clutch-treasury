@@ -117,10 +117,28 @@ pub async fn run_once(
     // reconciliation itself from running and judging the other three sources. Logged as
     // `None`/`null` in `detail.trongrid_balance` rather than aborting the whole run.
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
-    let trongrid_balance = match client.get_custody_balance(&config.custody_tron_address, &config.usdt_contract).await {
+    // Every address that still holds an unswept deposit. Read from our OWN rows — the orchestrator's
+    // database is not reachable from here, and mint_intents.deposit_address is the record of which
+    // addresses this service has ever approved a deposit at.
+    let unswept: Vec<String> = sqlx::query_scalar(
+        "SELECT deposit_address FROM mint_intents
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND status IN ('approved', 'submitted', 'credited')",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // Not fatal: the sum below just covers fewer addresses, and this is a cross-check.
+        tracing::warn!("reconciliation: could not list unswept deposit addresses: {e}");
+        Vec::new()
+    });
+
+    let trongrid_balance = match client
+        .get_reserve_balance(&config.custody_tron_address, &unswept, &config.usdt_contract)
+        .await
+    {
         Ok(bal) => Some(bal),
         Err(e) => {
-            tracing::warn!("reconciliation: trongrid custody balance read failed: {}", e);
+            tracing::warn!("reconciliation: trongrid reserve balance read failed: {}", e);
             None
         }
     };

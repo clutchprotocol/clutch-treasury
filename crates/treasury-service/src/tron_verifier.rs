@@ -192,6 +192,36 @@ impl TronClient {
     /// cross-check would have reported as zero reserve.
     ///
     /// `balanceOf` asks the token's own ledger, so account activation is irrelevant.
+    /// The whole reserve: the main treasury address plus every address still holding an unswept
+    /// deposit.
+    ///
+    /// Reading only the main address would report a reserve near zero while deposits sit on derived
+    /// addresses awaiting a sweep. That is not a halt risk — `judge` keys on the LEDGER's
+    /// `custody_reported`, and `trongrid_balance` is a cross-check column that plays no part in any
+    /// branch — but a fourth source that is permanently wrong is worse than one that is absent:
+    /// people stop reading it, and then disbelieve it on the day it is right.
+    ///
+    /// A failure on ANY address fails the whole sum. A partial total would understate the reserve
+    /// and look exactly like a shortfall, which is the one direction a reserve figure must never
+    /// silently err in.
+    pub async fn get_reserve_balance(
+        &self,
+        main_address: &str,
+        unswept_addresses: &[String],
+        usdt_contract: &str,
+    ) -> Result<i64, String> {
+        let mut total = self.get_custody_balance(main_address, usdt_contract).await?;
+        for addr in unswept_addresses {
+            let bal = self
+                .get_custody_balance(addr, usdt_contract)
+                .await
+                .map_err(|e| format!("unswept deposit address {addr}: {e}"))?;
+            // Saturating: a corrupt balance must not wrap the reserve into something small.
+            total = total.saturating_add(bal);
+        }
+        Ok(total)
+    }
+
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {
         #[derive(Deserialize)]
         struct ConstantCallResponse {
