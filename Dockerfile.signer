@@ -1,0 +1,17 @@
+# The signer holds the deposit-wallet mnemonic. Nothing else is in the image: no config directory
+# and nothing to mount, because every setting arrives as an environment variable so a mnemonic can
+# never end up on disk in a file someone copies or backs up.
+FROM rust:1.86-bookworm AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p tron-signer
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN useradd -m app
+USER app
+WORKDIR /app
+COPY --from=builder /app/target/release/tron-signer /usr/local/bin/tron-signer
+EXPOSE 8093
+HEALTHCHECK CMD curl -f http://localhost:8093/health || exit 1
+CMD ["tron-signer"]

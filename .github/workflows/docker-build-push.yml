@@ -1,4 +1,4 @@
-# Publish the two runtime images to GHCR so clutch-deploy's stage can consume them.
+# Publish the runtime images to GHCR so clutch-deploy's stage can consume them.
 #
 # Stage runs `compose pull` and deliberately never `--build` — it has no sibling source checkout.
 # Without these images a stage deploy fails at pull with "repository does not exist", and if the
@@ -38,6 +38,11 @@ jobs:
             dockerfile: Dockerfile
           - name: clutch-orchestrator
             dockerfile: Dockerfile.orchestrator
+          # The signer holds the deposit mnemonic. Its image carries no config directory and
+          # nothing mountable — every setting arrives as an environment variable, so a mnemonic
+          # cannot end up in a file on disk.
+          - name: clutch-tron-signer
+            dockerfile: Dockerfile.signer
     steps:
       - uses: actions/checkout@v4
 
