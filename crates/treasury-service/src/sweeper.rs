@@ -45,9 +45,14 @@ pub enum SignerReply {
     Swept { tx_id: String },
     /// Address already empty — the sweep is complete by definition.
     NothingToSweep,
-    /// Cannot pay its own transfer fee yet. NOT a failure: a fresh address holds no TRX, because
-    /// receiving tokens does not create a balance, so this is the expected first answer.
-    NeedsTrx { have_sun: i64, need_sun: i64 },
+    /// The signer just sent the address TRX so it can pay its own transfer fee. NOT a failure: a
+    /// fresh address holds no TRX, because receiving tokens does not create a balance, so this is
+    /// the expected first answer for every address. The funding has to confirm before the sweep, so
+    /// the address stays unswept for a later pass.
+    Funded { tx_id: String, amount_sun: i64 },
+    /// The wallet's TRX float has run out. Nothing here can fix it — an operator has to send TRX to
+    /// `fee_address` — and until they do, no address can be swept.
+    FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
     Failed(String),
 }
 
@@ -126,14 +131,31 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
                 }
             }
 
-            // Expected, not exceptional — every fresh address starts here. Logged rather than
-            // alerted so funding one does not read as an incident, but it does need to be visible:
-            // an address stuck here holds real money that cannot move.
-            SignerReply::NeedsTrx { have_sun, need_sun } => {
-                tracing::warn!(
-                    "sweeper: {address} holds {balance} micro-USDT but only {have_sun} sun of TRX \
-                     (needs {need_sun}) — fund it to release the sweep"
+            // Expected, not exceptional — every fresh address starts here, because receiving
+            // tokens does not create a TRX balance. Left unswept deliberately: the funding transfer
+            // has to confirm before the sweep can spend it, so the next pass finishes the job.
+            SignerReply::Funded { tx_id, amount_sun } => {
+                tracing::info!(
+                    "sweeper: funded {address} (index {index}) with {amount_sun} sun in {tx_id}; \
+                     sweeping {balance} micro-USDT on a later pass"
                 );
+            }
+
+            // The only outcome no retry resolves. Break rather than continue: every remaining
+            // address in this pass gets the same answer, and alerting once per address would bury
+            // the one fact that matters under a pass-sized burst of duplicates.
+            SignerReply::FeeAccountDry { fee_address, have_sun, need_sun } => {
+                alert(
+                    pool,
+                    "warn",
+                    "sweeper",
+                    &format!(
+                        "TRX float exhausted: {fee_address} holds {have_sun} sun, needs {need_sun}. \
+                         No deposit can be swept until it is topped up."
+                    ),
+                )
+                .await;
+                return;
             }
 
             SignerReply::Failed(e) => {
@@ -228,7 +250,15 @@ impl SweepSigner for HttpSigner {
                 None => SignerReply::Failed("signer reported swept with no tx_id".into()),
             },
             Some("nothing_to_sweep") => SignerReply::NothingToSweep,
-            Some("needs_trx") => SignerReply::NeedsTrx {
+            Some("funded") => match body["tx_id"].as_str() {
+                Some(tx) => SignerReply::Funded {
+                    tx_id: tx.to_string(),
+                    amount_sun: body["amount_sun"].as_i64().unwrap_or(0),
+                },
+                None => SignerReply::Failed("signer reported funded with no tx_id".into()),
+            },
+            Some("fee_account_dry") => SignerReply::FeeAccountDry {
+                fee_address: body["fee_address"].as_str().unwrap_or("unknown").to_string(),
                 have_sun: body["have_sun"].as_i64().unwrap_or(0),
                 need_sun: body["need_sun"].as_i64().unwrap_or(0),
             },

@@ -97,9 +97,14 @@ impl SweepSigner for FakeSigner {
         match &self.reply {
             SignerReply::Swept { tx_id } => SignerReply::Swept { tx_id: tx_id.clone() },
             SignerReply::NothingToSweep => SignerReply::NothingToSweep,
-            SignerReply::NeedsTrx { have_sun, need_sun } => {
-                SignerReply::NeedsTrx { have_sun: *have_sun, need_sun: *need_sun }
+            SignerReply::Funded { tx_id, amount_sun } => {
+                SignerReply::Funded { tx_id: tx_id.clone(), amount_sun: *amount_sun }
             }
+            SignerReply::FeeAccountDry { fee_address, have_sun, need_sun } => SignerReply::FeeAccountDry {
+                fee_address: fee_address.clone(),
+                have_sun: *have_sun,
+                need_sun: *need_sun,
+            },
             SignerReply::Failed(e) => SignerReply::Failed(e.clone()),
         }
     }
@@ -205,19 +210,69 @@ async fn a_small_but_old_balance_is_swept() {
     assert!(swept_at(&pool, id).await.is_some(), "an aged balance must eventually move");
 }
 
-/// A fresh address holds no TRX, so this is the EXPECTED first answer, not a failure. It must not
-/// be recorded as swept — the money is still sitting there.
+/// A fresh address holds no TRX, so the signer funds it first — the EXPECTED first answer for every
+/// address, not a failure. It must not be recorded as swept: the funding transfer still has to
+/// confirm, and the USDT has not moved.
 #[tokio::test]
-async fn needs_trx_leaves_the_address_unswept_for_a_later_pass() {
+async fn a_funded_address_is_left_unswept_for_a_later_pass() {
     let pool = pool().await;
     let server = MockServer::start().await;
     mount_balance(&server, 500_000_000).await;
     let id = seed(&pool, "credited", 3, 1).await;
 
-    let signer = FakeSigner::new(SignerReply::NeedsTrx { have_sun: 0, need_sun: 30_000_000 });
+    let signer = FakeSigner::new(SignerReply::Funded { tx_id: "tx-fund".into(), amount_sun: 30_000_000 });
     sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
 
     assert!(swept_at(&pool, id).await.is_none(), "funds are still there; this must be retried");
+}
+
+/// Funding is not an incident. It happens once per address, forever, so alerting on it would train
+/// whoever reads the alerts to ignore the queue that also carries the failures.
+#[tokio::test]
+async fn funding_an_address_does_not_raise_an_alert() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_balance(&server, 500_000_000).await;
+    seed(&pool, "credited", 9, 1).await;
+
+    let signer = FakeSigner::new(SignerReply::Funded { tx_id: "tx-fund".into(), amount_sun: 30_000_000 });
+    sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'sweeper'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts, 0, "routine funding must not look like a problem");
+}
+
+/// An exhausted TRX float stops the whole pass, not just the address that hit it.
+///
+/// Every remaining address would get the identical answer, so continuing would alert once per
+/// unswept address — burying the single actionable fact under a pass-sized burst of duplicates, and
+/// doing it again on every tick.
+#[tokio::test]
+async fn a_dry_fee_account_stops_the_pass_and_alerts_once() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_balance(&server, 500_000_000).await;
+    // Distinct addresses (uq_mint_intents_deposit_address) and distinct ages, so the order the
+    // worker walks them in is deterministic — the pass is ordered by created_at.
+    seed(&pool, "credited", 10, 5).await;
+    seed(&pool, "credited", 11, 1).await;
+
+    let signer = FakeSigner::new(SignerReply::FeeAccountDry {
+        fee_address: "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into(),
+        have_sun: 0,
+        need_sun: 31_000_000,
+    });
+    sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![10], "the pass must stop, not ask every remaining address");
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'sweeper'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts, 1, "one alert per pass, naming the account to top up");
 }
 
 /// A signer failure must not mark the address swept, or real funds are abandoned at an address

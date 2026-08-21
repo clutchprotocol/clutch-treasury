@@ -34,7 +34,18 @@ use sha3::{Digest, Keccak256};
 /// children from it; deriving anything else here silently produces addresses whose keys this
 /// service cannot reconstruct.
 const ACCOUNT_PATH: &str = "m/44'/195'/0'";
+/// Deposit addresses live at `0/i` — the "external" chain in BIP44 terms, which is what the
+/// orchestrator derives from the account xpub.
 const CHANGE_LEVEL: u32 = 0;
+/// The fee account lives on the INTERNAL chain, `1/0`.
+///
+/// A different change level, deliberately: deposit addresses are `0/i` for every i, so nothing at
+/// `1/0` can ever collide with one. Picking a high index on the external chain instead would have
+/// worked until the deposit sequence eventually reached it — and the failure then is the fee account
+/// being handed to a depositor, whose payment would be swept while our TRX float sits under someone
+/// else's claim.
+const FEE_CHANGE_LEVEL: u32 = 1;
+const FEE_INDEX: u32 = 0;
 const TRON_ADDRESS_VERSION: u8 = 0x41;
 
 pub struct Signer {
@@ -79,6 +90,30 @@ impl Signer {
     /// The signing key for a deposit address.
     pub fn signing_key_at(&self, index: u32) -> Result<SigningKey, String> {
         Ok(self.child(index)?.private_key().clone().into())
+    }
+
+    fn fee_child(&self) -> Result<XPrv, String> {
+        let change = ChildNumber::new(FEE_CHANGE_LEVEL, false).map_err(|e| e.to_string())?;
+        let idx = ChildNumber::new(FEE_INDEX, false).map_err(|e| e.to_string())?;
+        self.account
+            .derive_child(change)
+            .map_err(|e| format!("fee change-level derivation failed: {e}"))?
+            .derive_child(idx)
+            .map_err(|e| format!("fee index derivation failed: {e}"))
+    }
+
+    /// The TRX float account, `<account>/1/0`.
+    ///
+    /// A fresh deposit address holds no TRX — receiving tokens does not create a balance — so it
+    /// cannot pay for its own sweep. This account is topped up by an operator and pays those fees.
+    /// It is part of the same wallet, so no new key material and no second mnemonic to look after.
+    pub fn fee_address(&self) -> Result<String, String> {
+        let pubkey = self.fee_child()?.public_key().public_key().to_encoded_point(false);
+        Ok(tron_address_from_uncompressed(pubkey.as_bytes()))
+    }
+
+    pub fn fee_signing_key(&self) -> Result<SigningKey, String> {
+        Ok(self.fee_child()?.private_key().clone().into())
     }
 
     /// The address for `index` — MUST equal what the orchestrator derived from the xpub.
@@ -191,5 +226,56 @@ mod tests {
         let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
         assert!(s.address_at(0x8000_0000).is_err());
         assert!(s.signing_key_at(0x8000_0000).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// THE separation property. The fee account must never be a deposit address, or our TRX float
+    /// would sit at an address some depositor was told to pay into — and the sweep would move their
+    /// money out from under a balance we were treating as ours.
+    ///
+    /// Checked against a generous span of deposit indices rather than just the first few, because
+    /// the hazard is a COLLISION that only appears once the sequence has run far enough.
+    #[test]
+    fn the_fee_address_is_never_a_deposit_address() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let fee = s.fee_address().unwrap();
+        for i in 0..2000 {
+            assert_ne!(s.address_at(i).unwrap(), fee, "deposit index {i} collided with the fee account");
+        }
+    }
+
+    /// The fee key must control the fee address — proven by deriving the address back out of the
+    /// key, not by trusting two code paths.
+    #[test]
+    fn the_fee_key_controls_the_fee_address() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let key = s.fee_signing_key().unwrap();
+        let pubkey = key.verifying_key().to_encoded_point(false);
+        assert_eq!(tron_address_from_uncompressed(pubkey.as_bytes()), s.fee_address().unwrap());
+    }
+
+    /// Deterministic across instances: an operator funds this address once, and every later restart
+    /// must arrive at the same one or the float is stranded.
+    #[test]
+    fn the_fee_address_is_stable_across_instances() {
+        let a = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let b = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        assert_eq!(a.fee_address().unwrap(), b.fee_address().unwrap());
+    }
+
+    #[test]
+    fn the_fee_address_is_valid_base58check() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let addr = s.fee_address().unwrap();
+        let bytes = bs58::decode(&addr).with_check(Some(TRON_ADDRESS_VERSION)).into_vec().unwrap();
+        assert_eq!(bytes.len(), 21);
+        assert!(addr.starts_with('T'));
     }
 }

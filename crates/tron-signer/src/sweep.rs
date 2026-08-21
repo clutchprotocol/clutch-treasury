@@ -42,6 +42,13 @@ use crate::keys::Signer;
 /// room for the fee market moving. It is a floor for a preflight check, not a spend.
 const MIN_TRX_SUN_FOR_TRANSFER: i64 = 30_000_000;
 
+/// TRX the fee account must hold ON TOP of what it is about to send.
+///
+/// Funding is itself a transaction. A fee account allowed to drain to exactly the amount it sends
+/// would broadcast a transfer it cannot pay the bandwidth for — and the failure would land on the
+/// deposit address's sweep, several steps away from the account that actually ran dry.
+const FEE_ACCOUNT_RESERVE_SUN: i64 = 1_000_000;
+
 pub struct SweepConfig {
     pub trongrid_url: String,
     pub trongrid_api_key: String,
@@ -58,9 +65,30 @@ pub enum SweepOutcome {
     /// The address holds no USDT. Not an error: a sweep worker re-running over an
     /// already-swept address must be a no-op, not a failure.
     NothingToSweep,
-    /// The address cannot pay for its own transfer yet. Distinct from an error so a worker can
-    /// fund it and retry rather than treating the deposit as broken.
-    NeedsTrx { have_sun: i64, need_sun: i64 },
+    /// TRX was just sent to the address so it can pay for its own transfer. Not a failure and not
+    /// yet a sweep: the funding has to confirm first, so the next pass does the actual sweep.
+    ///
+    /// Two passes rather than waiting inline, because waiting means holding a request open across
+    /// Tron's confirmation time for every address in a batch.
+    Funded { tx_id: String, amount_sun: i64 },
+    /// The fee account has run out of TRX. The only outcome here that no automation can resolve —
+    /// an operator has to top the account up, and until they do every sweep stalls.
+    FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
+}
+
+/// The body for a native TRX transfer from the fee account to a deposit address.
+///
+/// Separate from the call so the argument order is testable. `owner_address` pays and `to_address`
+/// receives; swapped, this asks a deposit address that holds no TRX to fund the account that was
+/// supposed to fund it — which fails at broadcast, reads as "insufficient balance", and names the
+/// wrong account entirely.
+fn funding_body(fee_address: &str, deposit_address: &str, amount_sun: i64) -> serde_json::Value {
+    serde_json::json!({
+        "owner_address": fee_address,
+        "to_address": deposit_address,
+        "amount": amount_sun,
+        "visible": true,
+    })
 }
 
 /// ABI-encode a Tron address into the 32-byte word `transfer(address,uint256)` expects.
@@ -148,6 +176,68 @@ impl SweepClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Send `from` enough TRX to pay for its own sweep, out of the wallet's fee account.
+    ///
+    /// A fresh deposit address holds no TRX — receiving tokens does not create a balance — so it
+    /// cannot move the USDT sitting on it. The fee account (`<account>/1/0`) is the wallet's TRX
+    /// float, topped up by an operator, and this is the only thing that spends from it.
+    ///
+    /// Sends the full minimum rather than the shortfall. Topping up the difference would, for an
+    /// address already near the floor, broadcast a transaction worth less than its own bandwidth.
+    async fn fund(&self, signer: &Signer, deposit_address: &str) -> Result<SweepOutcome, String> {
+        let fee_address = signer.fee_address()?;
+        let have = self.trx_balance_sun(&fee_address).await?;
+        let need = MIN_TRX_SUN_FOR_TRANSFER + FEE_ACCOUNT_RESERVE_SUN;
+        if have < need {
+            return Ok(SweepOutcome::FeeAccountDry { fee_address, have_sun: have, need_sun: need });
+        }
+
+        let built = self
+            .post(
+                "/wallet/createtransaction",
+                funding_body(&fee_address, deposit_address, MIN_TRX_SUN_FOR_TRANSFER),
+            )
+            .await?;
+        // createtransaction returns the transaction at the top level and reports refusals as
+        // {"Error": ...} — checked explicitly so a rejection is not reported as a parse failure.
+        if let Some(err) = built["Error"].as_str() {
+            return Err(format!("trongrid refused to build the funding transfer: {err}"));
+        }
+        let tx: BuiltTx =
+            serde_json::from_value(built).map_err(|e| format!("unexpected createtransaction response: {e}"))?;
+
+        let tx_id = self.sign_and_broadcast(&signer.fee_signing_key()?, tx).await?;
+        tracing::info!("funded {deposit_address} with {MIN_TRX_SUN_FOR_TRANSFER} sun from {fee_address} in {tx_id}");
+        Ok(SweepOutcome::Funded { tx_id, amount_sun: MIN_TRX_SUN_FOR_TRANSFER })
+    }
+
+    /// Verify, sign and broadcast a transaction TronGrid built. Shared by the sweep and its funding
+    /// so both get the txID recomputation — a node that returned a txID for different raw_data would
+    /// otherwise walk away with a valid signature over a transaction nobody inspected.
+    async fn sign_and_broadcast(&self, key: &SigningKey, tx: BuiltTx) -> Result<String, String> {
+        let computed = hex::encode(Sha256::digest(hex::decode(&tx.raw_data_hex).map_err(|e| e.to_string())?));
+        if computed != tx.tx_id {
+            return Err(format!("txID mismatch: node said {} but raw_data hashes to {computed}", tx.tx_id));
+        }
+
+        let signature = sign_txid(key, &tx.tx_id)?;
+        let broadcast = serde_json::json!({
+            "txID": tx.tx_id,
+            "raw_data_hex": tx.raw_data_hex,
+            "signature": [signature],
+            "visible": true,
+        });
+
+        let res = self.post("/wallet/broadcasttransaction", broadcast).await?;
+        if res["result"].as_bool() != Some(true) {
+            let code = res["code"].as_str().unwrap_or("");
+            let msg = res["message"].as_str().unwrap_or("");
+            let decoded = hex::decode(msg).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+            return Err(format!("broadcast rejected: {code} {decoded}"));
+        }
+        Ok(tx.tx_id)
+    }
+
     /// USDT held at `address`, in base units.
     async fn usdt_balance(&self, address: &str) -> Result<i64, String> {
         let resp = self
@@ -197,11 +287,13 @@ impl SweepClient {
             return Ok(SweepOutcome::NothingToSweep);
         }
 
-        // Preflight, so "this address cannot pay its own fee" is reported as that rather than as a
-        // broadcast failure about bandwidth.
+        // Deliberately AFTER the balance check above: an address holding no USDT returns
+        // NothingToSweep without moving a single sun. That ordering is what bounds a caller who can
+        // reach this service — sweeping an arbitrary empty index costs nothing, so the TRX float
+        // cannot be dispersed across addresses by asking for sweeps that were never owed.
         let trx = self.trx_balance_sun(&from).await?;
         if trx < MIN_TRX_SUN_FOR_TRANSFER {
-            return Ok(SweepOutcome::NeedsTrx { have_sun: trx, need_sun: MIN_TRX_SUN_FOR_TRANSFER });
+            return self.fund(signer, &from).await;
         }
 
         let built: BuildResponse = serde_json::from_value(
@@ -222,34 +314,8 @@ impl SweepClient {
         .map_err(|e| format!("unexpected build response: {e}"))?;
         let tx = built.transaction.ok_or("trongrid returned no transaction to sign")?;
 
-        // Recompute the id rather than trusting the node's: it is the thing being signed, and a
-        // node that returned a txID for different raw_data would otherwise get a valid signature
-        // over a transaction we never inspected.
-        let computed = hex::encode(Sha256::digest(hex::decode(&tx.raw_data_hex).map_err(|e| e.to_string())?));
-        if computed != tx.tx_id {
-            return Err(format!("txID mismatch: node said {} but raw_data hashes to {computed}", tx.tx_id));
-        }
-
-        let signature = sign_txid(&signer.signing_key_at(index)?, &tx.tx_id)?;
-        let mut broadcast = serde_json::to_value(&serde_json::json!({
-            "txID": tx.tx_id,
-            "raw_data_hex": tx.raw_data_hex,
-            "signature": [signature],
-        }))
-        .map_err(|e| e.to_string())?;
-        // TronGrid wants the full transaction object back; carry through whatever else it built.
-        if let Some(obj) = broadcast.as_object_mut() {
-            obj.insert("visible".into(), serde_json::Value::Bool(true));
-        }
-
-        let res = self.post("/wallet/broadcasttransaction", broadcast).await?;
-        if res["result"].as_bool() != Some(true) {
-            let code = res["code"].as_str().unwrap_or("");
-            let msg = res["message"].as_str().unwrap_or("");
-            let decoded = hex::decode(msg).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
-            return Err(format!("broadcast rejected: {code} {decoded}"));
-        }
-        Ok(SweepOutcome::Swept { tx_id: tx.tx_id, amount_usdt: amount })
+        let tx_id = self.sign_and_broadcast(&signer.signing_key_at(index)?, tx).await?;
+        Ok(SweepOutcome::Swept { tx_id, amount_usdt: amount })
     }
 }
 
@@ -354,3 +420,31 @@ mod tests {
 // the sweep bookkeeping, all of which live in treasury-service — and putting the decision here
 // would mean linking the mnemonic-handling code into whatever else wanted to reason about it. See
 // treasury-service's `sweeper.rs`.
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+
+    const FEE: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+    const DEPOSIT: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+
+    /// The fee account PAYS and the deposit address RECEIVES. Reversed, this asks an address that
+    /// holds no TRX (that being the entire reason we are funding it) to fund the account that was
+    /// supposed to fund it — which fails at broadcast complaining about a balance, pointing at the
+    /// wrong account, on a path that only runs against a live chain.
+    #[test]
+    fn funding_pays_from_the_fee_account_to_the_deposit_address() {
+        let body = funding_body(FEE, DEPOSIT, MIN_TRX_SUN_FOR_TRANSFER);
+        assert_eq!(body["owner_address"], FEE, "the fee account pays");
+        assert_eq!(body["to_address"], DEPOSIT, "the deposit address receives");
+        assert_eq!(body["amount"], MIN_TRX_SUN_FOR_TRANSFER);
+    }
+
+    /// The fee account must be required to keep more than it sends. Funding is itself a transaction:
+    /// an account holding exactly the send amount would broadcast a transfer it cannot pay the
+    /// bandwidth for, and the failure would surface on some deposit address's sweep instead.
+    #[test]
+    fn the_fee_account_must_hold_more_than_it_sends() {
+        assert!(FEE_ACCOUNT_RESERVE_SUN > 0, "a zero reserve lets the account drain to unusable");
+    }
+}

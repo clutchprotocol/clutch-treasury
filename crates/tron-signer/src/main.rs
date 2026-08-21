@@ -46,12 +46,20 @@ fn authed(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
     }
 }
 
-/// The account xpub, so the orchestrator's config can be read off the service that owns the private
+/// The account xpub and the fee address, so both can be read off the service that owns the private
 /// half rather than transcribed by hand. Public material — a mistyped xpub over there means every
 /// deposit address is one this service cannot sweep.
+///
+/// `fee_address` is where an operator sends the TRX float. It is here rather than only in the log
+/// line that fires when the account runs dry, because it is needed BEFORE the first sweep: an
+/// unfunded fee account means no deposit can ever be moved.
 async fn xpub(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
     authed(&headers, &s.token)?;
-    Ok(Json(json!({ "account_xpub": s.signer.account_xpub() })))
+    let fee_address = s.signer.fee_address().map_err(|e| {
+        tracing::error!("fee address derivation failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({ "account_xpub": s.signer.account_xpub(), "fee_address": fee_address })))
 }
 
 /// ONLY an index. Adding `to`, `contract` or `amount` here would delete the reason this service
@@ -72,12 +80,19 @@ async fn sweep(
             tracing::info!("swept index {} : {amount_usdt} micro-USDT in {tx_id}", req.index);
             Ok(Json(json!({"status": "swept", "tx_id": tx_id, "amount_usdt": amount_usdt})))
         }
-        // Not errors: a worker re-running over an already-empty address, or one still waiting to be
-        // funded, must be able to tell those apart from a genuine failure and act differently.
+        // Not errors: a worker re-running over an already-empty address, or one that just had its
+        // fee funded, must be able to tell those apart from a genuine failure and act differently.
         Ok(SweepOutcome::NothingToSweep) => Ok(Json(json!({"status": "nothing_to_sweep"}))),
-        Ok(SweepOutcome::NeedsTrx { have_sun, need_sun }) => {
-            Ok(Json(json!({"status": "needs_trx", "have_sun": have_sun, "need_sun": need_sun})))
+        Ok(SweepOutcome::Funded { tx_id, amount_sun }) => {
+            Ok(Json(json!({"status": "funded", "tx_id": tx_id, "amount_sun": amount_sun})))
         }
+        // The one outcome no retry resolves: only an operator can top the account up.
+        Ok(SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun }) => Ok(Json(json!({
+            "status": "fee_account_dry",
+            "fee_address": fee_address,
+            "have_sun": have_sun,
+            "need_sun": need_sun,
+        }))),
         Err(e) => {
             tracing::error!("sweep of index {} failed: {e}", req.index);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
