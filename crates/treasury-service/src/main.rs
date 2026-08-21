@@ -27,6 +27,12 @@ async fn main() {
         let cfg = config.clone();
         // Threshold sweep: move credited deposits off their derived addresses into the treasury.
         // Decides WHEN here; tron-signer knows HOW and owns the keys.
+        //
+        // The interval must stay comfortably above Tron's block time. Funding an address and
+        // sweeping it are two separate passes -- the TRX has to confirm before it can be spent --
+        // and a pass that came round before the funding landed would read a zero balance and fund
+        // the same address again. An hour is not a latency requirement (the deposit is already
+        // credited; this is only consolidation), so there is no reason to shorten it.
         tokio::spawn(treasury_service::sweeper::run(
             pool.clone(),
             config.clone(),
