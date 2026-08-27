@@ -94,6 +94,52 @@ async fn main() {
     // ponytail: batch Mint tx submission if volume ever demands more than one per block.
     let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&config.mint_authority_secret)
         .expect("mint authority secret must decode to a valid secp256k1 key");
+
+    // Does the chain agree that we are the mint authority?
+    //
+    // The authority is fixed at genesis. Hold a different key and every Mint is signed correctly,
+    // accepted by the RPC, and then dropped by consensus -- the outbox records `submitted` with
+    // zero attempts and no error, total supply never moves, and the intent sits in `submitted`
+    // forever. It looks exactly like a mint that is merely slow, which is how it went unnoticed on
+    // stage until someone asked why a swept deposit had minted nothing.
+    //
+    // Checked once, in the background: the node may not be up yet at boot, so this retries rather
+    // than crash-looping the whole service over a dependency that is still starting.
+    {
+        use clutch_chain::signer::ChainSigner;
+        let node = node.clone();
+        let pool = pool.clone();
+        let ours = signer.address();
+        tokio::spawn(async move {
+            loop {
+                match node.get_chain_info().await {
+                    Ok(info) => {
+                        if info.mint_authority.eq_ignore_ascii_case(&ours) {
+                            tracing::info!("mint authority confirmed by the chain: {ours}");
+                        } else {
+                            let msg = format!(
+                                "MINT AUTHORITY MISMATCH: this service signs as {ours} but the chain's \
+                                 authority is {}. Every mint will be accepted by the RPC and then \
+                                 silently dropped by consensus. Minting halted.",
+                                info.mint_authority
+                            );
+                            tracing::error!("{msg}");
+                            // Halt rather than let mints keep vanishing: a mint that is submitted
+                            // and dropped leaves a depositor credited in the ledger and holding
+                            // nothing on chain.
+                            let _ = treasury_service::breakers::manual_halt(&pool, &msg, "startup-check").await;
+                            treasury_service::ledger::alert(&pool, "p1", "startup", &msg).await;
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("mint authority check: node not ready yet ({e}); retrying in 10s");
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                }
+            }
+        });
+    }
     {
         let pool = pool.clone();
         let node = node.clone();
