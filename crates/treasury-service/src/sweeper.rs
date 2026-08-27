@@ -88,6 +88,17 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         }
     };
 
+    // One line per pass, always -- including when there is nothing to do.
+    //
+    // Without it this worker is completely silent while idle, which is byte-for-byte what a worker
+    // that died at startup looks like. There is no way to tell them apart from outside, and the
+    // difference is "no deposits to consolidate" versus "money is accumulating at addresses nothing
+    // will ever sweep".
+    //
+    // The interval is an hour, so this costs 24 lines a day and buys a liveness signal that does
+    // not depend on anything going wrong first.
+    tracing::info!("sweeper: pass over {} unswept address(es)", rows.len());
+
     for (id, address, index, age_hours) in rows {
         let balance = match client.get_custody_balance(&address, &config.usdt_contract).await {
             Ok(b) => b,
