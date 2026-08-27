@@ -129,16 +129,38 @@ pub fn sign_txid(key: &SigningKey, txid_hex: &str) -> Result<String, String> {
     Ok(format!("{}{:02x}", hex::encode(sig.to_bytes()), recid.to_byte()))
 }
 
-#[derive(Deserialize)]
-struct BuiltTx {
-    #[serde(rename = "txID")]
-    tx_id: String,
-    raw_data_hex: String,
+/// The body `/wallet/broadcasttransaction` expects: the transaction EXACTLY as the node built it,
+/// with a signature added.
+///
+/// Rebuilding it from `txID` and `raw_data_hex` alone does not work, and this is how that failed:
+/// the node rejected every broadcast with an empty code and an empty message, because what it
+/// received was not a transaction it could parse. `raw_data` -- the structured object -- has to
+/// survive the round trip. The first real sweep on stage died here.
+fn signed_body(mut built: serde_json::Value, signature: &str) -> Result<serde_json::Value, String> {
+    let obj = built.as_object_mut().ok_or("built transaction is not a JSON object")?;
+    obj.insert("signature".into(), serde_json::json!([signature]));
+    Ok(built)
 }
 
-#[derive(Deserialize)]
-struct BuildResponse {
-    transaction: Option<BuiltTx>,
+/// Say something useful about a rejection even when the node says nothing useful.
+///
+/// Tron reports failures as `code` plus a hex-encoded `message`, but not always -- and when both
+/// were missing this returned the bare string "broadcast rejected:  ", which names a failure and
+/// gives nothing to act on. Falling back to the raw body means the next failure is at least
+/// attributable.
+fn describe_rejection(res: &serde_json::Value) -> String {
+    let code = res["code"].as_str().unwrap_or("");
+    let decoded = res["message"]
+        .as_str()
+        .and_then(|m| hex::decode(m).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    if code.is_empty() && decoded.is_empty() {
+        let raw = res.to_string();
+        let clipped: String = raw.chars().take(400).collect();
+        return format!("node gave no code or message; raw response: {clipped}");
+    }
+    format!("{code} {decoded}").trim().to_string()
 }
 
 #[derive(Deserialize)]
@@ -203,10 +225,7 @@ impl SweepClient {
         if let Some(err) = built["Error"].as_str() {
             return Err(format!("trongrid refused to build the funding transfer: {err}"));
         }
-        let tx: BuiltTx =
-            serde_json::from_value(built).map_err(|e| format!("unexpected createtransaction response: {e}"))?;
-
-        let tx_id = self.sign_and_broadcast(&signer.fee_signing_key()?, tx).await?;
+        let tx_id = self.sign_and_broadcast(&signer.fee_signing_key()?, built).await?;
         tracing::info!("funded {deposit_address} with {MIN_TRX_SUN_FOR_TRANSFER} sun from {fee_address} in {tx_id}");
         Ok(SweepOutcome::Funded { tx_id, amount_sun: MIN_TRX_SUN_FOR_TRANSFER })
     }
@@ -214,28 +233,26 @@ impl SweepClient {
     /// Verify, sign and broadcast a transaction TronGrid built. Shared by the sweep and its funding
     /// so both get the txID recomputation — a node that returned a txID for different raw_data would
     /// otherwise walk away with a valid signature over a transaction nobody inspected.
-    async fn sign_and_broadcast(&self, key: &SigningKey, tx: BuiltTx) -> Result<String, String> {
-        let computed = hex::encode(Sha256::digest(hex::decode(&tx.raw_data_hex).map_err(|e| e.to_string())?));
-        if computed != tx.tx_id {
-            return Err(format!("txID mismatch: node said {} but raw_data hashes to {computed}", tx.tx_id));
+    async fn sign_and_broadcast(&self, key: &SigningKey, built: serde_json::Value) -> Result<String, String> {
+        let tx_id = built["txID"].as_str().ok_or("built transaction has no txID")?.to_string();
+        let raw_hex = built["raw_data_hex"].as_str().ok_or("built transaction has no raw_data_hex")?.to_string();
+
+        // Recompute the id rather than trusting the node's: it is the thing being signed, and a
+        // node that returned a txID for different raw_data would otherwise walk away with a valid
+        // signature over a transaction nobody inspected.
+        let computed = hex::encode(Sha256::digest(hex::decode(&raw_hex).map_err(|e| e.to_string())?));
+        if computed != tx_id {
+            return Err(format!("txID mismatch: node said {tx_id} but raw_data hashes to {computed}"));
         }
 
-        let signature = sign_txid(key, &tx.tx_id)?;
-        let broadcast = serde_json::json!({
-            "txID": tx.tx_id,
-            "raw_data_hex": tx.raw_data_hex,
-            "signature": [signature],
-            "visible": true,
-        });
+        let signature = sign_txid(key, &tx_id)?;
+        let body = signed_body(built, &signature)?;
 
-        let res = self.post("/wallet/broadcasttransaction", broadcast).await?;
+        let res = self.post("/wallet/broadcasttransaction", body).await?;
         if res["result"].as_bool() != Some(true) {
-            let code = res["code"].as_str().unwrap_or("");
-            let msg = res["message"].as_str().unwrap_or("");
-            let decoded = hex::decode(msg).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
-            return Err(format!("broadcast rejected: {code} {decoded}"));
+            return Err(format!("broadcast rejected: {}", describe_rejection(&res)));
         }
-        Ok(tx.tx_id)
+        Ok(tx_id)
     }
 
     /// USDT held at `address`, in base units.
@@ -296,8 +313,8 @@ impl SweepClient {
             return self.fund(signer, &from).await;
         }
 
-        let built: BuildResponse = serde_json::from_value(
-            self.post(
+        let built: serde_json::Value = self
+            .post(
                 "/wallet/triggersmartcontract",
                 serde_json::json!({
                     "owner_address": from,
@@ -309,10 +326,12 @@ impl SweepClient {
                     "visible": true,
                 }),
             )
-            .await?,
-        )
-        .map_err(|e| format!("unexpected build response: {e}"))?;
-        let tx = built.transaction.ok_or("trongrid returned no transaction to sign")?;
+            .await?;
+        // triggersmartcontract nests the transaction; createtransaction does not.
+        let tx = built
+            .get("transaction")
+            .cloned()
+            .ok_or_else(|| format!("trongrid returned no transaction to sign: {}", describe_rejection(&built)))?;
 
         let tx_id = self.sign_and_broadcast(&signer.signing_key_at(index)?, tx).await?;
         Ok(SweepOutcome::Swept { tx_id, amount_usdt: amount })
@@ -446,5 +465,55 @@ mod funding_tests {
     #[test]
     fn the_fee_account_must_hold_more_than_it_sends() {
         assert!(FEE_ACCOUNT_RESERVE_SUN > 0, "a zero reserve lets the account drain to unusable");
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    /// What the node built must survive to the broadcast INTACT.
+    ///
+    /// This is the bug that killed the first real sweep on stage: the body was rebuilt from txID and
+    /// raw_data_hex alone, `raw_data` was dropped, and the node rejected it with an empty code and
+    /// an empty message. Nothing in the unit tests noticed, because nothing checked what got sent.
+    #[test]
+    fn the_broadcast_keeps_every_field_the_node_built() {
+        let built = serde_json::json!({
+            "txID": "aa".repeat(32),
+            "raw_data": { "contract": [{"type": "TransferContract"}], "timestamp": 1 },
+            "raw_data_hex": "0a02",
+            "visible": true,
+        });
+        let body = signed_body(built.clone(), "sig").unwrap();
+
+        assert_eq!(body["raw_data"], built["raw_data"], "raw_data must survive -- dropping it is the bug");
+        assert_eq!(body["txID"], built["txID"]);
+        assert_eq!(body["raw_data_hex"], built["raw_data_hex"]);
+        assert_eq!(body["visible"], serde_json::json!(true), "visible decides how addresses are read");
+        assert_eq!(body["signature"], serde_json::json!(["sig"]));
+    }
+
+    /// A rejection with no code and no message must still say something actionable. The bare
+    /// "broadcast rejected:  " named a failure and gave nothing to act on.
+    #[test]
+    fn an_empty_rejection_still_reports_the_raw_response() {
+        let res = serde_json::json!({"result": false});
+        let d = describe_rejection(&res);
+        assert!(d.contains("raw response"), "must fall back to the body, got: {d}");
+        assert!(d.contains("result"), "the body itself must appear, got: {d}");
+    }
+
+    /// The normal case still decodes Tron's hex message.
+    #[test]
+    fn a_normal_rejection_decodes_the_hex_message() {
+        let res = serde_json::json!({
+            "result": false,
+            "code": "SIGERROR",
+            "message": hex::encode("validate signature error"),
+        });
+        let d = describe_rejection(&res);
+        assert!(d.contains("SIGERROR"), "{d}");
+        assert!(d.contains("validate signature error"), "{d}");
     }
 }
