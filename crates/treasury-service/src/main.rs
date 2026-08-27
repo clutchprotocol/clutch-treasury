@@ -42,7 +42,7 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 match treasury_service::reconciliation::run_once(
-                    &pool, &node, cfg.custody_stub_balance_usdt, cfg.genesis_allocation as u64, &cfg,
+                    &pool, &node, cfg.genesis_allocation as u64, &cfg,
                 ).await {
                     Ok(status) => {
                         tracing::info!("reconciliation run: {}", status);

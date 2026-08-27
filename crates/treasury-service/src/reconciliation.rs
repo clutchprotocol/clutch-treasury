@@ -17,12 +17,18 @@ pub struct Sources {
     pub onchain_supply: u64,
     pub genesis_allocation: u64,
     pub ledger_liability: i64,
+    /// The reserve, read from chain: the treasury address plus every address still holding an
+    /// unswept deposit, summed over the USDT contract.
+    ///
+    /// This used to be `config.custody_stub_balance_usdt`, a hand-maintained number that defaulted
+    /// to 0 — so the first credited deposit made `custody_reported < ledger_liability` true and
+    /// halted minting on a system that was over-collateralized a hundred times over. The figure
+    /// that proved it was fine was computed in the same function and deliberately excluded from
+    /// the decision. There is no stub any more; if the reserve cannot be read, no run is recorded.
+    ///
+    /// Units line up exactly: USDT has 6 decimals and 1 USD is 1,000,000 CLT, so one micro-USDT is
+    /// one CLT and this compares directly against `ledger_liability`.
     pub custody_reported: i64,
-    /// Plan C T5: a live TronGrid read of the custody address's USDT balance, independent of
-    /// `custody_reported` (which is the LEDGER's custody balance). `None` when the TronGrid
-    /// call itself failed — an early smell gets logged as `null`, not a synthetic zero that
-    /// would read as "custody drained to nothing" and could confuse a human reading the report.
-    pub trongrid_balance: Option<i64>,
 }
 
 /// Pure judgement — testable without IO. Spec §5: every confirmed intent has exactly
@@ -35,16 +41,12 @@ pub struct Sources {
 /// `submitted`-status mint intent amounts to `ledger_liability` before calling `judge`.
 pub fn judge(s: &Sources) -> (&'static str, serde_json::Value) {
     let treasury_minted = s.onchain_supply as i128 - s.genesis_allocation as i128;
-    // trongrid_balance is a cross-check column ONLY — it plays no part in any branch below.
-    // A mismatch against custody_reported is an early smell a human reads off the report,
-    // never a halt condition (brief: "not wired into the breaker").
     let detail = json!({
         "onchain_supply": s.onchain_supply,
         "genesis_allocation": s.genesis_allocation,
         "treasury_minted": treasury_minted as i64,
         "ledger_liability": s.ledger_liability,
         "custody_reported": s.custody_reported,
-        "trongrid_balance": s.trongrid_balance,
     });
     if treasury_minted > s.ledger_liability as i128 {
         ("mismatch", detail) // unbacked CLT on-chain
@@ -105,7 +107,6 @@ async fn in_flight_mint_amount(pool: &PgPool) -> Result<i64, sqlx::Error> {
 pub async fn run_once(
     pool: &PgPool,
     node: &Arc<NodeClient>,
-    custody_reported: i64,
     genesis_allocation: u64,
     config: &AppConfig,
 ) -> Result<String, String> {
@@ -113,9 +114,6 @@ pub async fn run_once(
     let balances = ledger::balances(pool).await.map_err(|e| e.to_string())?;
     let in_flight = in_flight_mint_amount(pool).await.map_err(|e| e.to_string())?;
 
-    // Cross-check only (brief: "not a halt") — a TronGrid failure here must not stop
-    // reconciliation itself from running and judging the other three sources. Logged as
-    // `None`/`null` in `detail.trongrid_balance` rather than aborting the whole run.
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
     // Every address that still holds an unswept deposit. Read from our OWN rows — the orchestrator's
     // database is not reachable from here, and mint_intents.deposit_address is the record of which
@@ -132,16 +130,19 @@ pub async fn run_once(
         Vec::new()
     });
 
-    let trongrid_balance = match client
+    // An unreadable reserve aborts the run rather than recording one.
+    //
+    // Not a synthetic zero, which would read as "custody drained to nothing" and halt minting on a
+    // TronGrid hiccup. Not a recorded `error` row either: the mint gate accepts any status that is
+    // not `mismatch`, so an error row would license minting against a reserve nobody verified.
+    //
+    // Returning Err leaves NO row, which is the honest state — the run did not happen. main.rs
+    // retries in 30 seconds, and if the outage persists the existing "no reconciliation run in 48h
+    // — refusing to mint blind" gate stops minting on its own.
+    let custody_reported = client
         .get_reserve_balance(&config.custody_tron_address, &unswept, &config.usdt_contract)
         .await
-    {
-        Ok(bal) => Some(bal),
-        Err(e) => {
-            tracing::warn!("reconciliation: trongrid reserve balance read failed: {}", e);
-            None
-        }
-    };
+        .map_err(|e| format!("reserve balance unreadable, not recording a run: {e}"))?;
 
     record(
         pool,
@@ -150,7 +151,6 @@ pub async fn run_once(
             genesis_allocation,
             ledger_liability: balances.clt_liability + in_flight,
             custody_reported,
-            trongrid_balance,
         },
     )
     .await

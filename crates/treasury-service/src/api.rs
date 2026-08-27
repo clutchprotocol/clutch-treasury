@@ -287,10 +287,10 @@ struct CustodyDepositBody {
 /// an independent on-chain observation is exactly the kind of action that must leave a trail,
 /// never a silent override.
 ///
-/// `config.custody_stub_balance_usdt` (reconciliation's separate custody input, read at
-/// startup) is NOT updated by this route — it must be kept equal to the sum of recorded
-/// deposits by the same operator action (i.e. whoever calls this route also updates that
-/// config value) until the real Tron custody watcher replaces both.
+/// Reconciliation no longer takes a custody figure from config or from this route: it reads the
+/// reserve from chain each run (treasury address plus every unswept deposit address). So this
+/// route records a ledger event and nothing else — it cannot move the number the breaker judges,
+/// which is the point.
 async fn custody_deposits_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

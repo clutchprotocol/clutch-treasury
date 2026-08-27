@@ -6,7 +6,6 @@ fn s(onchain: u64, genesis: u64, ledger: i64, custody: i64) -> Sources {
         genesis_allocation: genesis,
         ledger_liability: ledger,
         custody_reported: custody,
-        trongrid_balance: None,
     }
 }
 
@@ -63,7 +62,6 @@ async fn mismatch_halts_minting() {
             genesis_allocation: 1_000_000_000_000_000,
             ledger_liability: 0,
             custody_reported: 0,
-            trongrid_balance: None,
         },
     )
     .await
@@ -79,4 +77,44 @@ async fn mismatch_halts_minting() {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'")
         .fetch_one(&pool).await.unwrap();
     assert!(n >= 1, "P1 alert row required — a mismatch is an incident, not a metric");
+}
+
+/// The regression that halted stage.
+///
+/// The real numbers from 2026-08-27: a $10 liability against a $1,004.12 reserve — over a hundred
+/// times over-collateralized — judged a `mismatch` and tripped the breaker, because
+/// `custody_reported` was a config stub that defaulted to 0 while the figure proving the system was
+/// healthy sat in the same JSON, deliberately excluded from the decision.
+#[test]
+fn an_over_collateralized_reserve_is_not_a_mismatch() {
+    let s = treasury_service::reconciliation::Sources {
+        onchain_supply: 1_000_000_000_000_000,
+        genesis_allocation: 1_000_000_000_000_000,
+        ledger_liability: 10_000_000,      // $10
+        custody_reported: 1_004_124_930,   // $1,004.12 actually held on chain
+    };
+    let (status, _) = treasury_service::reconciliation::judge(&s);
+    assert_ne!(status, "mismatch", "a reserve 100x the liability must never halt minting");
+}
+
+/// The peg makes the two figures directly comparable, and the whole comparison is meaningless if
+/// that ever stops being true: USDT carries 6 decimals and 1 USD is 1,000,000 CLT, so one
+/// micro-USDT is exactly one CLT. A units slip here reads as a 10^6 under- or over-backing.
+#[test]
+fn one_micro_usdt_is_one_clt() {
+    let exactly_backed = treasury_service::reconciliation::Sources {
+        onchain_supply: 1_000_000_000_000_000,
+        genesis_allocation: 1_000_000_000_000_000,
+        ledger_liability: 5_000_000,     // $5 of CLT
+        custody_reported: 5_000_000,     // $5 of USDT, same integer
+    };
+    let (status, _) = treasury_service::reconciliation::judge(&exactly_backed);
+    assert_ne!(status, "mismatch", "exact 1:1 backing is the healthy case, not a halt");
+
+    let one_short = treasury_service::reconciliation::Sources {
+        ledger_liability: 5_000_001,
+        ..exactly_backed
+    };
+    let (status, _) = treasury_service::reconciliation::judge(&one_short);
+    assert_eq!(status, "mismatch", "one micro-unit of under-backing must still halt");
 }

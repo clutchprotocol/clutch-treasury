@@ -69,7 +69,6 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         per_tx_mint_cap_clt: 50_000_000,
         backing_target_bps: 10_050,
         backing_halt_bps: 10_000,
-        custody_stub_balance_usdt: 1_000_000_000,
         genesis_allocation: 1_000_000_000_000_000,
         confirmations: 2,
         outbox_poll_ms: 2000,

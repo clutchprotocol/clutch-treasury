@@ -10,7 +10,6 @@ daily_mint_cap_clt = 500000000
 per_tx_mint_cap_clt = 50000000
 backing_target_bps = 10050
 backing_halt_bps = 10000
-custody_stub_balance_usdt = 0
 confirmations = 2
 outbox_poll_ms = 2000
 reconciliation_interval_secs = 86400

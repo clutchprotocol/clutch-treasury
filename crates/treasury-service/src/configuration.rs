@@ -16,7 +16,6 @@ pub struct AppConfig {
     pub per_tx_mint_cap_clt: i64,
     pub backing_target_bps: i64,
     pub backing_halt_bps: i64,
-    pub custody_stub_balance_usdt: i64,
     pub confirmations: u64,
     pub outbox_poll_ms: u64,
     pub reconciliation_interval_secs: u64,

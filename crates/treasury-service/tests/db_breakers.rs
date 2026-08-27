@@ -36,7 +36,6 @@ fn test_config() -> AppConfig {
         per_tx_mint_cap_clt: 50_000_000,
         backing_target_bps: 10_050,
         backing_halt_bps: 10_000,
-        custody_stub_balance_usdt: 1_000_000_000,
         genesis_allocation: 1_000_000_000_000_000,
         confirmations: 2,
         outbox_poll_ms: 2000,
@@ -132,7 +131,6 @@ async fn backing_below_halt_denies_and_trips() {
     treasury_service::ledger::append_event(&pool, "mint_executed", 100, 0, None, None, "seed").await.unwrap();
     treasury_service::ledger::append_event(&pool, "custody_deposit", 0, 99, None, None, "seed").await.unwrap();
     let mut cfg = test_config();
-    cfg.custody_stub_balance_usdt = 0; // force ledger custody to be the number used
     let err = breakers::check_mint(&pool, &cfg, 1).await.unwrap_err();
     assert!(err.reason.contains("backing"));
     let (halted,): (bool,) = sqlx::query_as("SELECT minting_halted FROM breaker_state")
