@@ -187,33 +187,28 @@ pub async fn create(
             // response_body IS NULL: a previous attempt died between `create` and
             // `store_invoice`. Resume on the SAME derived address.
             //
-            // Reusing the amount is what keeps this safe, not what makes it risky. This
-            // row is the only holder of that slot under uq_active_pay_amount, and the
-            // schema's invariant is that a slot stays reserved until we ourselves can
-            // no longer match a payment to it. Moving the row to a fresh slot would
-            // release the old amount while a possibly-live orphan invoice still carries
-            // it, letting a LATER, DIFFERENT intent be allocated that amount — the
-            // cross-user misattribution on the shared static custody address that the
-            // discriminator exists to prevent.
+            // The row already holds its derivation_index and deposit_address, so a resume
+            // reuses the SAME address by construction: there is nothing to re-allocate, and
+            // no way to hand this user a second address while they are paying the first.
             //
-            // The address dimension is simpler and safer: the row already holds its
-            // derivation_index and deposit_address, so a resume reuses the SAME address by
-            // construction — there is nothing to re-allocate and no way to hand this user a
-            // second address while they are paying the first.
+            // This used to be the hardest reasoning in the file. Under the amount
+            // discriminator, resuming meant deciding whether to keep or release a slot in
+            // `uq_active_pay_amount`, and releasing one while a stranger's payment was still
+            // in flight to that amount was the misattribution hazard behind four Critical
+            // bugs. Per-address, the question does not arise — which is most of why the
+            // discriminator was retired (migration 0008).
             //
-            // Two live invoices at one amount for THIS SAME intent is not that hazard:
-            // both carry this intent's order_id, this user, this credit, and whichever
-            // one we match against, `store_invoice`'s compare-and-set plus the per-invoice
-            // webhook event key still credit exactly once. A second genuine payment at
-            // the same amount strands on the `transition` guards and lands in
-            // needs_manual — funds held and flagged, never paid to a stranger.
+            // Two live invoices for THIS SAME intent are not a hazard: both carry this
+            // intent's order_id, this user and this credit, and whichever one we match
+            // against, `store_invoice`'s compare-and-set plus the per-invoice event key
+            // still credit exactly once.
             tx.rollback().await?;
             Ok(CreateOutcome::Created(intent))
         }
     }
 }
 
-/// Brand new `(user_pk, client_key)`: allocate a discriminator and insert. `ON CONFLICT`
+/// Brand new `(user_pk, client_key)`: allocate a derivation index and insert. `ON CONFLICT`
 /// on the (user_pk, client_key) unique constraint means a concurrent request beat us to
 /// this exact key — the caller re-checks and treats it as StillProcessing/retry rather
 /// than us guessing at the winner's state here.
@@ -230,10 +225,10 @@ async fn insert_new(
     let id = Uuid::new_v4();
     let expires_at = chrono::Utc::now() + chrono::Duration::minutes(config.deposit_ttl_minutes);
 
-    // Allocate and derive BEFORE the insert, and once — not per discriminator attempt. The address
-    // is written in the same statement as the row, so a row can never exist without the address
-    // users were told to pay. A retry below re-uses this same index: the index is not what
-    // collides, and burning a fresh one per attempt would waste the sequence for no gain.
+    // Allocate and derive BEFORE the insert, and once. The address is written in the same
+    // statement as the row, so a row can never exist without the address users were told to pay.
+    // A retry below re-uses this same index: the index is not what collides, and burning a fresh
+    // one per attempt would waste the sequence for no gain.
     //
     // A subsequently-failed insert burns this index. Gaps are harmless; see migration 0007.
     let derivation_index = allocate_derivation_index(pool).await?;
@@ -336,18 +331,6 @@ pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Optio
         .bind(invoice_id)
         .fetch_optional(pool)
         .await
-}
-
-/// Sets `payment_window_closed = TRUE` — the ONLY thing that frees the discriminator slot
-/// (`uq_active_pay_amount`'s `WHERE ... AND NOT payment_window_closed` clause). Deliberately
-/// unconditional (no status guard): a closed payment window is a fact about the clock, not
-/// about our own state machine, and setting it twice is harmless.
-pub async fn mark_payment_window_closed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE deposit_intents SET payment_window_closed = TRUE, updated_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 /// Records the on-chain tx id once the custody poller matches a transfer to this intent.
@@ -527,8 +510,8 @@ async fn check_headroom(config: &OrchConfig, amount_usdt: i64) -> Result<(), Dep
 }
 
 /// The create-flow orchestration (T2b): routes `deposits::create`'s outcome (idempotency
-/// layer 1 + the discriminator, Task 2) through `adapter.create_invoice` and the
-/// compare-and-set store (idempotency layer 4) — the two mechanisms meeting the wire.
+/// layer 1) through `adapter.create_invoice` and the compare-and-set store (idempotency
+/// layer 4) — the two mechanisms meeting the wire.
 ///
 /// Ordering that keeps money safe: the intent row is created BEFORE any pay instructions are
 /// handed out, and

@@ -5,14 +5,16 @@
 //! to keep in sync.
 //!
 //! 1. `create_step`: POST `{treasury_url}/internal/mint-intents` with the **initiator** token.
-//!    THE line that matters most in this file: `expected_amount_usdt` is
-//!    `deposit_intents.pay_amount_usdt` — the DISCRIMINATED amount the user was actually told to
-//!    pay — never `amount_clt` (what they merely asked to deposit). On the shared static Tron
-//!    custody address the discriminated amount is the only thing telling one payer's transfer
-//!    from another's; the treasury's TronGrid verifier matches on-chain transfers against
-//!    exactly this value. Sending the wrong one lets a stranger's larger transfer satisfy this
-//!    deposit and get ledgered as its backing — that was Critical `cb497e3`, fixed treasury-side;
-//!    this worker is the sole producer of the value on the wire.
+//!    THE line that matters most in this file: `expected_amount_usdt` is the amount the user was
+//!    told to pay, never `amount_clt` (what they merely asked to deposit). The treasury's TronGrid
+//!    verifier matches transfers to this intent's own derived address against exactly this value,
+//!    and settles once they reach it. Sending a smaller one credits a deposit the payment does not
+//!    back. This worker is the sole producer of the value on the wire.
+//!
+//!    It used to carry a fractional discriminator, because one shared custody address left the
+//!    amount as the only way to tell one payer's transfer from another's — and getting it wrong
+//!    let a stranger's larger transfer satisfy this deposit (Critical `cb497e3`). Per-address, the
+//!    destination is the identity and the amount is only a threshold.
 //!    `client_ref` (this deposit intent's own id) is the idempotency key: the treasury replays
 //!    the existing intent (200) on a duplicate rather than creating a second one, so this file
 //!    adds no dedup layer of its own — a lost-response retry is safe by construction via that

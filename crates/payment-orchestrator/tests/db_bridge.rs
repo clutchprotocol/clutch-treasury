@@ -2,7 +2,7 @@
 //! the treasury (same convention as `bitcart_adapter.rs`'s wiremock coverage of Bitcart).
 //!
 //! The central property this file exists to prove, per the brief: the POST to
-//! `/internal/mint-intents` sends `expected_amount_usdt` = `pay_amount_usdt` (the DISCRIMINATED
+//! `/internal/mint-intents` sends `expected_amount_usdt` = the amount the user was told to pay (the
 //! amount), never `amount_clt` — proven by asserting the exact JSON body wiremock actually
 //! received, not by reading `treasury_bridge.rs` back and trusting it matches its own comments.
 //!
