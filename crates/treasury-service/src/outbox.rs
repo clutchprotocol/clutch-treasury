@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clutch_chain::node_client::NodeClient;
@@ -39,6 +40,13 @@ fn is_deposit_backed(_intent_id: Uuid) -> bool {
 
 /// Picks due `pending` outbox rows, re-checks breakers (approval alone is never
 /// authorisation to mint — spec §7.2), signs, and submits. Returns the count processed.
+/// Whether the "node is behind" alert has already fired for the current stale episode.
+///
+/// Process-local by design: this de-duplicates a live condition rather than recording anything, and
+/// a restart re-alerting is correct — whoever restarted the service should be told the node is
+/// still behind.
+static STALE_ALERTED: AtomicBool = AtomicBool::new(false);
+
 pub async fn drain_once(
     pool: &PgPool,
     node: &Arc<NodeClient>,
@@ -84,7 +92,16 @@ pub async fn drain_once(
                     "node is {lag} blocks behind its peers (primary {primary}, best peer {best_peer}) \
                      — not submitting mints into a stale chain"
                 );
-                alert(pool, "p1", "outbox", &reason).await;
+                // One alert per stale EPISODE, not per pass. The outbox runs every 2 seconds, so
+                // alerting each time buried the alerts table under hundreds of identical P1 rows
+                // within minutes of this guard first firing — which is how a useful signal becomes
+                // one people filter out. The flag resets when the node comes back in sync, so a
+                // second episode alerts again.
+                if !STALE_ALERTED.swap(true, Ordering::Relaxed) {
+                    alert(pool, "p1", "outbox", &reason).await;
+                } else {
+                    tracing::warn!("{reason}");
+                }
                 for row in &rows {
                     park_row(pool, row.outbox_id, &reason).await?;
                 }
@@ -96,7 +113,12 @@ pub async fn drain_once(
                 // every time a peer restarts -- which, on a three-node stack, is every deploy.
                 tracing::warn!("outbox: could not confirm the node is at the tip (no peer answered)");
             }
-            crate::chain_sync::SyncState::InSync { .. } => {}
+            crate::chain_sync::SyncState::InSync { .. } => {
+                // Back in sync: re-arm the alert so the next episode is reported.
+                if STALE_ALERTED.swap(false, Ordering::Relaxed) {
+                    tracing::info!("outbox: node is back in sync with its peers");
+                }
+            }
         }
     }
 
