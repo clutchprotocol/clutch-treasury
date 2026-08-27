@@ -2,11 +2,25 @@ use config::{Config, ConfigError, Environment, File};
 use dotenv::dotenv;
 use serde::Deserialize;
 
+/// 50 blocks. Comfortably above normal propagation, far below the 115,000-block lag that went
+/// unnoticed on stage for a day.
+fn default_max_node_lag_blocks() -> u64 {
+    50
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub http_addr: String,
     pub database_url: String,
     pub node_ws_url: String,
+    /// Comma-separated peer node WebSocket URLs, used ONLY to ask "is `node_ws_url` at the tip".
+    /// Empty means the check cannot run, which is reported as unknown rather than as healthy.
+    #[serde(default)]
+    pub node_peer_ws_urls: String,
+    /// How far the primary may trail the best peer before this service stops acting on what it
+    /// says. Some lag is normal — blocks propagate — so this is a tolerance, not zero.
+    #[serde(default = "default_max_node_lag_blocks")]
+    pub max_node_lag_blocks: u64,
     pub chain_id: u64,
     pub mint_authority_secret: String,
     pub initiator_token: String,

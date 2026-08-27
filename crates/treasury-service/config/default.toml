@@ -20,3 +20,7 @@ custody_tron_address = ""
 usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 deposit_confirmations = 19
 deposit_match_window_hours = 24
+
+# Peers used only to check whether node_ws_url is at the tip. Set per-environment.
+node_peer_ws_urls = ""
+max_node_lag_blocks = 50

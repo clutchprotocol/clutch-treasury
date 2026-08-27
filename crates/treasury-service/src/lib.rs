@@ -1,5 +1,6 @@
 pub mod api;
 pub mod breakers;
+pub mod chain_sync;
 pub mod configuration;
 pub mod ledger;
 pub mod intents;

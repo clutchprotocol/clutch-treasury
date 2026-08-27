@@ -27,6 +27,8 @@ fn test_config() -> AppConfig {
         http_addr: "0.0.0.0:0".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
         node_ws_url: "ws://unused".into(),
+        node_peer_ws_urls: String::new(),
+        max_node_lag_blocks: 50,
         chain_id: 2077,
         mint_authority_secret: "x".into(),
         initiator_token: "i".into(),

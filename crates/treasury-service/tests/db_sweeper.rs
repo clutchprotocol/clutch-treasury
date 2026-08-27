@@ -47,6 +47,8 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         http_addr: "0.0.0.0:0".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
         node_ws_url: "ws://unused".into(),
+        node_peer_ws_urls: String::new(),
+        max_node_lag_blocks: 50,
         chain_id: 2077,
         mint_authority_secret: "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509".into(),
         initiator_token: "i".into(),

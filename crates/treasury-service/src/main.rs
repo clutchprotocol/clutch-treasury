@@ -21,6 +21,7 @@ async fn main() {
     sqlx::migrate!("./migrations").run(&pool).await.expect("migrations");
 
     let node = clutch_chain::node_client::NodeClient::new(config.node_ws_url.clone());
+    let peers = treasury_service::chain_sync::peer_clients(&config.node_peer_ws_urls);
     {
         let pool = pool.clone();
         let node = node.clone();
@@ -146,7 +147,7 @@ async fn main() {
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
-                match treasury_service::outbox::drain_once(&pool, &node, &signer, &cfg).await {
+                match treasury_service::outbox::drain_once(&pool, &node, &peers, &signer, &cfg).await {
                     Ok(n) if n > 0 => tracing::info!("outbox: submitted {} mint(s)", n),
                     Ok(_) => {}
                     Err(e) => tracing::error!("outbox drain failed: {}", e),

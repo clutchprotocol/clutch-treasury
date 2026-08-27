@@ -42,6 +42,7 @@ fn is_deposit_backed(_intent_id: Uuid) -> bool {
 pub async fn drain_once(
     pool: &PgPool,
     node: &Arc<NodeClient>,
+    peers: &[Arc<NodeClient>],
     signer: &dyn ChainSigner,
     config: &AppConfig,
 ) -> Result<u32, String> {
@@ -68,6 +69,36 @@ pub async fn drain_once(
     })
     .collect();
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Is the node we are about to submit into actually at the tip?
+    //
+    // Checked once per pass, before any row: a node that has fallen behind accepts the mint and
+    // reports success, and the transaction lands on a chain nobody else is following. On stage the
+    // primary sat 115,000 blocks behind while the outbox recorded `submitted` with zero attempts
+    // and no error. Parking is the right response, not failing -- the intent is fine, the node is
+    // not, and attempts must not burn down toward permanent failure over someone else's sync.
+    if !peers.is_empty() {
+        match crate::chain_sync::check(node, peers, config.max_node_lag_blocks).await {
+            crate::chain_sync::SyncState::Behind { lag, primary, best_peer } => {
+                let reason = format!(
+                    "node is {lag} blocks behind its peers (primary {primary}, best peer {best_peer}) \
+                     — not submitting mints into a stale chain"
+                );
+                alert(pool, "p1", "outbox", &reason).await;
+                for row in &rows {
+                    park_row(pool, row.outbox_id, &reason).await?;
+                }
+                return Ok(0);
+            }
+            crate::chain_sync::SyncState::Unknown => {
+                // No peer answered, so there is nothing to compare against. Proceeding is no worse
+                // than the behaviour before this check existed, and blocking would stop minting
+                // every time a peer restarts -- which, on a three-node stack, is every deploy.
+                tracing::warn!("outbox: could not confirm the node is at the tip (no peer answered)");
+            }
+            crate::chain_sync::SyncState::InSync { .. } => {}
+        }
+    }
 
     let mut processed = 0u32;
     for row in rows {
