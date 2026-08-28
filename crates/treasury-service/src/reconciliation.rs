@@ -53,7 +53,14 @@ pub fn judge(s: &Sources) -> (&'static str, serde_json::Value) {
     } else if s.custody_reported < s.ledger_liability {
         ("mismatch", detail) // reserve below liability
     } else if treasury_minted < s.ledger_liability as i128 {
-        ("over_backed_drift", detail) // plain burns — benign, logged
+        // Benign ONLY while transient. A mint moves chain supply and liability together, and so
+        // does a burn, so in a settled system these two figures are equal — a gap means one side
+        // recorded something the other has not yet. That is ordinary for a few seconds.
+        //
+        // A gap that PERSISTS is CLT the ledger counts as issued which does not exist on chain:
+        // someone is owed money they do not hold. `record` escalates on persistence; this arm
+        // cannot tell the difference on its own because it sees a single run.
+        ("over_backed_drift", detail)
     } else {
         ("ok", detail)
     }
@@ -88,9 +95,49 @@ pub async fn record(pool: &PgPool, s: &Sources) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
         alert(pool, "p1", "reconciliation", &format!("MISMATCH: {}", detail)).await;
     } else if status == "over_backed_drift" {
-        alert(pool, "warn", "reconciliation", &format!("over-backed drift: {}", detail)).await;
+        // Transient drift is a timing artifact and a warn. The same gap two runs running is not:
+        // it means minted CLT the ledger recorded never reached the chain, or was destroyed after
+        // it did — which is precisely what a chain reset does. Stage lost a $10 mint that way and
+        // this arm reported it as benign, because a single run cannot tell a race from a loss.
+        let gap = s.ledger_liability as i128 - (s.onchain_supply as i128 - s.genesis_allocation as i128);
+        let persistent = previous_drift_gap(pool).await.is_some_and(|prev| prev >= gap);
+        if persistent {
+            alert(
+                pool,
+                "p1",
+                "reconciliation",
+                &format!(
+                    "PERSISTENT under-issuance of {gap} CLT: the ledger counts more as issued than \
+                     the chain holds, across consecutive runs. Not a timing race — a mint the ledger \
+                     recorded is missing on chain. Detail: {detail}"
+                ),
+            )
+            .await;
+        } else {
+            alert(pool, "warn", "reconciliation", &format!("over-backed drift: {}", detail)).await;
+        }
     }
     Ok(status.to_string())
+}
+
+/// The under-issuance gap from the PREVIOUS run, if that run also drifted.
+///
+/// `None` when there is no prior run or it was not a drift — either way this run's gap has not been
+/// seen before, so it is treated as transient. Read from `detail` rather than recomputed: those are
+/// the figures that run actually judged.
+async fn previous_drift_gap(pool: &PgPool) -> Option<i128> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT detail FROM reconciliation_runs
+         WHERE status = 'over_backed_drift' ORDER BY run_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    let d = row.0;
+    let liability = d.get("ledger_liability")?.as_i64()? as i128;
+    let minted = d.get("treasury_minted")?.as_i64()? as i128;
+    Some(liability - minted)
 }
 
 /// Sum of `submitted`-status mint intents: on-chain but not yet watcher-credited into

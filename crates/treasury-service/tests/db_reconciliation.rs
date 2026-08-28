@@ -1,4 +1,23 @@
-use treasury_service::reconciliation::{judge, Sources};
+use sqlx::PgPool;
+use treasury_service::reconciliation::{judge, record, Sources};
+
+/// Own database per test binary: --test-threads=1 only serialises tests WITHIN a binary, and cargo
+/// runs binaries in parallel while every pool() here TRUNCATEs shared tables.
+async fn pool() -> PgPool {
+    let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
+    let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
+    let url = format!("{prefix}/{dbname}_tre_recon");
+    if !<sqlx::Postgres as sqlx::migrate::MigrateDatabase>::database_exists(&url).await.unwrap_or(false) {
+        <sqlx::Postgres as sqlx::migrate::MigrateDatabase>::create_database(&url).await.unwrap();
+    }
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query("TRUNCATE treasury_events, mint_intents, reconciliation_runs, alerts RESTART IDENTITY CASCADE")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE breaker_state SET minting_halted = FALSE, halt_reason = NULL")
+        .execute(&pool).await.unwrap();
+    pool
+}
 
 fn s(onchain: u64, genesis: u64, ledger: i64, custody: i64) -> Sources {
     Sources {
@@ -117,4 +136,55 @@ fn one_micro_usdt_is_one_clt() {
     };
     let (status, _) = treasury_service::reconciliation::judge(&one_short);
     assert_eq!(status, "mismatch", "one micro-unit of under-backing must still halt");
+}
+
+/// Under-issuance is not "over-backed drift" in the benign sense once it persists.
+///
+/// A mint moves chain supply and ledger liability together, and so does a burn, so the two figures
+/// are equal in a settled system. A gap means one side recorded something the other has not — fine
+/// for a few seconds. The same gap on consecutive runs means minted CLT the ledger counted never
+/// reached the chain, or was destroyed after it did.
+///
+/// Stage lost a $10 mint to a chain reset and this reported it as benign for a day.
+#[tokio::test]
+async fn a_persistent_under_issuance_escalates_to_p1() {
+    let pool = pool().await;
+
+    // Ledger says $1,000 issued; the chain holds $990. The missing $10 is a lost mint.
+    let s = Sources {
+        onchain_supply: 1_000_000_990_000_000,
+        genesis_allocation: 1_000_000_000_000_000,
+        ledger_liability: 1_000_000_000,
+        custody_reported: 1_004_124_930,
+    };
+
+    // First run: nothing to compare against, so treated as a possible timing race.
+    let status = record(&pool, &s).await.unwrap();
+    assert_eq!(status, "over_backed_drift");
+    let p1s: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM alerts WHERE source = 'reconciliation' AND severity = 'p1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(p1s, 0, "a first-seen gap must not page anyone");
+
+    // Second run, same gap: no longer explicable as a race.
+    let status = record(&pool, &s).await.unwrap();
+    assert_eq!(status, "over_backed_drift", "still drift, but no longer benign");
+    let p1s: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM alerts WHERE source = 'reconciliation' AND severity = 'p1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(p1s, 1, "a gap that survives a run is a lost mint, not a race");
+
+    let msg: String = sqlx::query_scalar(
+        "SELECT message FROM alerts WHERE severity = 'p1' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(msg.contains("10000000"), "the alert must name the shortfall: {msg}");
 }
