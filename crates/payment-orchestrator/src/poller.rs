@@ -96,6 +96,14 @@ pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
                     tracing::error!("poller: failed to store tx id for intent {id}: {e}");
                     continue;
                 }
+                // What arrived is what gets credited, so it has to be persisted before the intent
+                // advances. Previously this figure was logged and dropped: the bridge then sent the
+                // REQUESTED amount, and an overpayment left the difference in the treasury with
+                // nothing recording that we owed it.
+                if let Err(e) = deposits::set_received_usdt(pool, id, received_usdt).await {
+                    tracing::error!("poller: failed to store received amount for intent {id}: {e}");
+                    continue;
+                }
                 match deposits::transition(pool, id, &["created", "invoiced", "paying", "expired"], "confirmed").await
                 {
                     Ok(true) => {
@@ -105,13 +113,17 @@ pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
                     Err(e) => tracing::error!("poller: failed to confirm intent {id}: {e}"),
                 }
                 if received_usdt > expected_amount_usdt {
+                    // Says "recorded", not "credited": crediting happens downstream in the bridge
+                    // and the treasury's caps can still refuse it. The old wording claimed the
+                    // excess had been credited while nothing carried the figure anywhere at all,
+                    // so the one alert that could have caught the shortfall asserted it was fine.
                     alert(
                         pool,
                         "warn",
                         "poller",
                         &format!(
                             "deposit {id} overpaid: {received_usdt} vs {expected_amount_usdt} micro-USDT \
-                             at {address} — credited what arrived"
+                             at {address} — recorded as received; the credit is for the full amount"
                         ),
                     )
                     .await;

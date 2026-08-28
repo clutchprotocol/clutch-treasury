@@ -641,3 +641,89 @@ async fn headroom_check_allows_through_when_sufficient() {
         "expected a normal 201 Respond when headroom is sufficient, got {outcome:?}"
     );
 }
+
+/// The overpayment that went wrong on stage: 1,000 USDT paid against a $10 intent.
+///
+/// The credit must be for what ARRIVED. Sending the requested amount mints less CLT than the
+/// deposit backs, and the difference sits in the treasury with nothing recording that it is owed —
+/// which is precisely what happened to the first real depositor. Pinned on the wire, because the
+/// old behaviour also ALERTED "credited what arrived" while sending the requested figure, so
+/// reading the logs would have told you it was fine.
+#[tokio::test]
+async fn an_overpaid_deposit_is_credited_at_the_amount_received() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = Uuid::new_v4();
+    let deposit_id = seed_confirmed_deposit(&pool, 10_000_000, 10_000_000, Some("tron-tx-over")).await;
+
+    // Paid $1,000 against a $10 intent, as recorded by the poller.
+    deposits::set_received_usdt(&pool, deposit_id, 1_000_000_000).await.unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/mint-intents"))
+        .and(body_json(json!({
+            "beneficiary": "TBeneficiary1111111111111111111111",
+            "amount_clt": 1_000_000_000,
+            "expected_amount_usdt": 1_000_000_000,
+            "deposit_address": address_of(&pool, deposit_id).await,
+            "derivation_index": index_of(&pool, deposit_id).await,
+            "client_ref": deposit_id.to_string(),
+            "deposit_tx_id": "tron-tx-over",
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mint_intent_response(treasury_id, "created")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    treasury_bridge::run_once(&pool, &test_config(server.uri())).await;
+
+    assert_eq!(status_of(&pool, deposit_id).await, "mint_requested");
+}
+
+/// Rows that predate `received_usdt` must keep working. NULL means "unknown", and treating it as
+/// zero would post a mint for nothing.
+#[tokio::test]
+async fn a_deposit_without_a_received_amount_falls_back_to_the_requested_one() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = Uuid::new_v4();
+    let deposit_id = seed_confirmed_deposit(&pool, 7_000_000, 7_000_000, Some("tron-tx-legacy")).await;
+
+    let row = deposits::find_by_id(&pool, deposit_id).await.unwrap().unwrap();
+    assert!(row.received_usdt.is_none(), "precondition: nothing recorded a received amount");
+
+    Mock::given(method("POST"))
+        .and(path("/internal/mint-intents"))
+        .and(body_json(json!({
+            "beneficiary": "TBeneficiary1111111111111111111111",
+            "amount_clt": 7_000_000,
+            "expected_amount_usdt": 7_000_000,
+            "deposit_address": address_of(&pool, deposit_id).await,
+            "derivation_index": index_of(&pool, deposit_id).await,
+            "client_ref": deposit_id.to_string(),
+            "deposit_tx_id": "tron-tx-legacy",
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mint_intent_response(treasury_id, "created")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    treasury_bridge::run_once(&pool, &test_config(server.uri())).await;
+
+    assert_eq!(status_of(&pool, deposit_id).await, "mint_requested");
+}
+
+/// The recorded figure is what the credit is based on, so a later pass must not rewrite it. A second
+/// transfer arriving after settlement is a matter for a human, not something that silently changes
+/// what we believe we owe.
+#[tokio::test]
+async fn the_received_amount_is_written_once() {
+    let pool = pool().await;
+    let deposit_id = seed_confirmed_deposit(&pool, 5_000_000, 5_000_000, Some("tron-tx-once")).await;
+
+    deposits::set_received_usdt(&pool, deposit_id, 5_000_000).await.unwrap();
+    deposits::set_received_usdt(&pool, deposit_id, 9_999_999).await.unwrap();
+
+    let row = deposits::find_by_id(&pool, deposit_id).await.unwrap().unwrap();
+    assert_eq!(row.received_usdt, Some(5_000_000), "the second write must not overwrite the first");
+}

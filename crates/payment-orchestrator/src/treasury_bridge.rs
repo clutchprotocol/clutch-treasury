@@ -69,10 +69,14 @@ pub async fn run_once(pool: &PgPool, config: &OrchConfig) {
 async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &DepositIntent) {
     let body = json!({
         "beneficiary": intent.clt_address,
-        "amount_clt": intent.amount_clt,
+        // What ARRIVED, not what was asked for. At par one micro-USDT is one CLT, so crediting the
+        // observed total is what keeps the reserve equal to the liability — the invariant this whole
+        // service exists to hold. Falls back to the requested amount for rows that predate
+        // `received_usdt`, which is what was always credited for them anyway.
+        "amount_clt": intent.received_usdt.unwrap_or(intent.amount_clt),
         // The amount the deposit had to reach. Now a SUFFICIENCY test rather than an identity:
         // the address identifies the payer, so this only has to be met or exceeded.
-        "expected_amount_usdt": intent.amount_usdt,
+        "expected_amount_usdt": intent.received_usdt.unwrap_or(intent.amount_usdt),
         // THE line that matters most now. The treasury's verifier is the approver, and it checks
         // evidence at THIS address rather than one from its own config — approving on an address
         // of its own choosing would defeat the four-eyes split. Sent from the row, so the address

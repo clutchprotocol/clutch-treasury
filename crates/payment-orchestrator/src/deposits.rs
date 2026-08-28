@@ -49,12 +49,18 @@ pub struct DepositIntent {
     /// Jittered-backoff gate: the bridge's scan only picks up a row once `now() >=
     /// next_attempt_at`, so a failed attempt doesn't get retried on every single poll tick.
     pub next_attempt_at: chrono::DateTime<chrono::Utc>,
+    /// What actually arrived on chain, which is what gets credited — `amount_usdt` is only what the
+    /// user asked for, and the two differ whenever someone overpays.
+    ///
+    /// `None` until settled, and on rows that predate the column. Callers must fall back to
+    /// `amount_usdt` for those rather than treating a missing figure as zero.
+    pub received_usdt: Option<i64>,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
-    treasury_intent_id, attempts, next_attempt_at";
+    treasury_intent_id, attempts, next_attempt_at, received_usdt";
 
 #[derive(Debug)]
 pub enum CreateOutcome {
@@ -336,6 +342,23 @@ pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Optio
 /// Records the on-chain tx id once the custody poller matches a transfer to this intent.
 /// `WHERE tron_tx_id IS NULL` keeps the first-seen hash rather than letting a later refetch
 /// (e.g. the poller re-confirming an already-confirmed intent) overwrite it.
+/// Record what the chain actually paid to this intent's address.
+///
+/// Guarded on IS NULL so a later pass over an already-settled intent cannot rewrite the figure the
+/// credit was based on. A second transfer arriving after settlement is a separate matter for a
+/// human, not something that silently changes what we believe we owe.
+pub async fn set_received_usdt(pool: &PgPool, id: Uuid, received: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE deposit_intents SET received_usdt = $2, updated_at = now()
+         WHERE id = $1 AND received_usdt IS NULL",
+    )
+    .bind(id)
+    .bind(received)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 pub async fn set_tron_tx_id(pool: &PgPool, id: Uuid, tron_tx_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE deposit_intents SET tron_tx_id = $1, updated_at = now() WHERE id = $2 AND tron_tx_id IS NULL")
         .bind(tron_tx_id)
