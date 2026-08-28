@@ -1,0 +1,71 @@
+# Run the test suite on every push and PR.
+#
+# There was no such job until now. The only thing executing these tests was whoever remembered to
+# run docker-compose.test.yml locally, which meant a green `main` said nothing about whether the
+# suite passed — on a service that mints money, against 24 test binaries covering the four-eyes
+# ledger, the reserve arithmetic and the signing path.
+#
+# Mirrors docker-compose.test.yml exactly. If you change the environment there, change it here:
+# a divergence means the suite passes in one place and fails in the other, and the local rig is
+# the one people run before pushing.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: treasury_test
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      # Both spellings, and they are NOT redundant: integration tests read the plain DATABASE_URL
+      # via std::env::var, while AppConfig only sees APP_-prefixed vars (the `config` crate's
+      # Environment prefix). Setting one produces a confusing failure in whichever half you forgot.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/treasury_test
+      APP_DATABASE_URL: postgres://postgres:postgres@localhost:5432/treasury_test
+      # The already-public node1 dev key — this repo's one carve-out to the env-only secret rule,
+      # scoped to the test rig. Never a real mint key.
+      APP_MINT_AUTHORITY_SECRET: "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509"
+      APP_INITIATOR_TOKEN: test-initiator
+      APP_APPROVER_TOKEN: test-approver
+      APP_READONLY_TOKEN: test-readonly
+      # wiremock stands in for TronGrid, but AppConfig::load still panics on an empty key.
+      APP_TRONGRID_API_KEY: test-trongrid-key
+      # payment-orchestrator's own secrets: OrchConfig::load panics on an empty one, so all four
+      # must be present for `cargo test --workspace` to construct a config at all.
+      APP_JWT_SECRET: test-jwt-secret
+      APP_BITCART_TOKEN: test-bitcart-token
+      APP_TREASURY_INITIATOR_TOKEN: test-initiator
+      APP_TREASURY_READONLY_TOKEN: test-readonly
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --test-threads=1: the DB tests share one Postgres and TRUNCATE each other's tables, so
+      # parallel threads inside a binary race. Serial is fine at this size, and running them
+      # in parallel produces failures that look like logic bugs but are not.
+      - name: cargo test
+        run: cargo test --workspace -- --test-threads=1
