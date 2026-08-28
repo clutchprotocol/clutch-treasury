@@ -290,6 +290,22 @@ pub struct ChainInfo {
     #[serde(deserialize_with = "de_u64_from_str")]
     pub total_supply: u64,
     pub latest_block_index: u64,
+
+    // The node's own answer to "is that index the tip, or just how far I have got".
+    //
+    // Optional because a node older than clutch-node 20b473d does not send them, and a treasury
+    // that failed to parse a response from such a node would stop working against it entirely.
+    // `None` means "this node cannot say", which is a different thing from "in sync" — the caller
+    // falls back to comparing peers rather than assuming.
+    #[serde(default)]
+    pub is_syncing: Option<bool>,
+    /// Zero here is ambiguous on its own: it means both "at the tip" and "no peer has been heard
+    /// from". `best_peer_block_index` disambiguates, which is why both are read.
+    #[serde(default)]
+    pub blocks_behind: Option<u64>,
+    /// Zero means no peer has reported a height, NOT that the tip is zero.
+    #[serde(default)]
+    pub best_peer_block_index: Option<u64>,
 }
 
 fn de_u64_from_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
