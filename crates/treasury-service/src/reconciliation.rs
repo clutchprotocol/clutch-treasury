@@ -126,7 +126,10 @@ pub async fn record(pool: &PgPool, s: &Sources) -> Result<String, String> {
 /// seen before, so it is treated as transient. Read from `detail` rather than recomputed: those are
 /// the figures that run actually judged.
 async fn previous_drift_gap(pool: &PgPool) -> Option<i128> {
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+    // Turbofish on query_as, not an annotation on the whole chain: fetch_optional already returns
+    // the Option, so annotating the result as Option<(Value,)> asks sqlx to decode a row INTO an
+    // Option and does not compile.
+    let row = sqlx::query_as::<_, (serde_json::Value,)>(
         "SELECT detail FROM reconciliation_runs
          WHERE status = 'over_backed_drift' ORDER BY run_at DESC LIMIT 1",
     )
