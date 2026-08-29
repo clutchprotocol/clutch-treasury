@@ -188,3 +188,65 @@ async fn a_persistent_under_issuance_escalates_to_p1() {
     .unwrap();
     assert!(msg.contains("10000000"), "the alert must name the shortfall: {msg}");
 }
+
+/// A reversed mint leaves liability matching what the chain actually holds.
+///
+/// treasury_events is append-only, so the original mint_executed row stays — it is a true record of
+/// something that did happen. mint_reversed records the chain losing it afterwards, which is what
+/// the ledger previously had no way to express: correcting it with burn_redeemed would assert a
+/// redemption, and a redemption owes a payout.
+#[tokio::test]
+async fn a_reversed_mint_subtracts_from_liability() {
+    let pool = pool().await;
+    let intent = uuid::Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO treasury_events (kind, amount_clt, intent_id, description)
+         VALUES ('mint_executed', 10000000, $1, 'original')",
+    )
+    .bind(intent)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before: i64 = sqlx::query_scalar("SELECT clt_liability FROM ledger_balances")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, 10_000_000);
+
+    sqlx::query(
+        "INSERT INTO treasury_events (kind, amount_clt, intent_id, description)
+         VALUES ('mint_reversed', 10000000, $1, 'chain reset destroyed it')",
+    )
+    .bind(intent)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let after: i64 = sqlx::query_scalar("SELECT clt_liability FROM ledger_balances")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, 0, "the view must subtract mint_reversed");
+
+    // The original survives: reversal records history, it does not erase it.
+    let originals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'mint_executed'",
+    )
+    .bind(intent)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(originals, 1, "append-only: the original mint must remain on record");
+
+    // uq_events_intent_kind must stop a second reversal halving liability again.
+    let twice = sqlx::query(
+        "INSERT INTO treasury_events (kind, amount_clt, intent_id, description)
+         VALUES ('mint_reversed', 10000000, $1, 'again')",
+    )
+    .bind(intent)
+    .execute(&pool)
+    .await;
+    assert!(twice.is_err(), "an intent must not be reversible twice");
+}
