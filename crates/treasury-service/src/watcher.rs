@@ -134,15 +134,35 @@ pub async fn confirm_burn(
 /// match at all — `credit_ref` is derived from the intent id and is known before submission.
 /// Pure range computation, split out so the fresh-chain underflow guard is unit-testable
 /// without a DB or node connection. Returns `None` when there is nothing new to process.
-fn process_range(cursor: u64, head: u64, confirmations: u64) -> Option<std::ops::RangeInclusive<u64>> {
+/// What the watcher should do this poll.
+///
+/// `process_range` used to return `Option`, which collapsed two unrelated situations into `None`:
+/// "nothing new yet" and "the chain is not the chain we were counting". The second is a fault, and
+/// returning None for it meant the watcher credited nothing, silently, for as long as it lasted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Scan {
+    /// Blocks to process.
+    Range(std::ops::RangeInclusive<u64>),
+    /// Caught up: nothing new past the confirmation depth. Ordinary.
+    UpToDate,
+    /// The cursor is above the head — the chain was reset or rolled back beneath us.
+    ChainShrank,
+}
+
+pub fn process_range(cursor: u64, head: u64, confirmations: u64) -> Scan {
+    // Checked BEFORE the confirmation bound: a cursor past the head is a shrunken chain whether or
+    // not confirmations would also put the bound below the cursor.
+    if cursor > head {
+        return Scan::ChainShrank;
+    }
     // saturating_sub: on a fresh chain head < confirmations, and the naive subtraction would
     // underflow (u64) into a bound near u64::MAX, sending the watcher off fetching billions
     // of nonexistent blocks.
     let bound = head.saturating_sub(confirmations);
     if bound <= cursor {
-        None
+        Scan::UpToDate
     } else {
-        Some((cursor + 1)..=bound)
+        Scan::Range((cursor + 1)..=bound)
     }
 }
 
@@ -156,8 +176,29 @@ pub async fn poll_once(pool: &PgPool, node: &Arc<NodeClient>, confirmations: u64
 
     let info = node.get_chain_info().await?;
     let head = info.latest_block_index;
-    let Some(range) = process_range(cursor, head, confirmations) else {
-        return Ok(());
+
+    let range = match process_range(cursor, head, confirmations) {
+        Scan::Range(r) => r,
+        Scan::UpToDate => return Ok(()),
+        // Rewinding to 0 rescans the new chain, which is safe: credit_mint only matches intents
+        // that are not already `credited`, and uq_events_intent_kind rejects a second event per
+        // intent. Mints made since the reset were never credited and are picked up on the rescan.
+        Scan::ChainShrank => {
+            alert(
+                pool,
+                "p1",
+                "watcher",
+                &format!(
+                    "chain cursor {cursor} is above head {head} — the chain was reset or rolled                      back. Rewinding to 0 to rescan; mints since the reset were never credited."
+                ),
+            )
+            .await;
+            sqlx::query("UPDATE chain_cursor SET last_processed_height = 0")
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
     };
 
     for height in range {
@@ -228,31 +269,50 @@ pub async fn poll_once(pool: &PgPool, node: &Arc<NodeClient>, confirmations: u64
 
 #[cfg(test)]
 mod tests {
-    use super::process_range;
+    use super::{process_range, Scan};
 
     /// The exact scenario the brief calls out: a fresh chain has fewer blocks than the
     /// confirmation depth. head=1, confirmations=2 would naively underflow to bound
-    /// ~u64::MAX; the guard must return None instead of a billion-block range.
+    /// ~u64::MAX; the guard must keep it a no-op rather than a billion-block range.
     #[test]
     fn fresh_chain_shorter_than_confirmations_does_not_underflow() {
-        assert_eq!(process_range(0, 1, 2), None);
-        assert_eq!(process_range(0, 0, 2), None);
+        assert_eq!(process_range(0, 1, 2), Scan::UpToDate);
+        assert_eq!(process_range(0, 0, 2), Scan::UpToDate);
     }
 
     #[test]
     fn bound_equal_to_cursor_is_a_noop() {
         // Nothing new past what's already processed.
-        assert_eq!(process_range(5, 7, 2), None);
+        assert_eq!(process_range(5, 7, 2), Scan::UpToDate);
     }
 
     #[test]
     fn processes_newly_confirmed_blocks_once() {
         // head=10, confirmations=2 -> confirmed up to 8; cursor at 5 -> process 6..=8.
-        assert_eq!(process_range(5, 10, 2), Some(6..=8));
+        assert_eq!(process_range(5, 10, 2), Scan::Range(6..=8));
     }
 
     #[test]
     fn zero_confirmations_processes_up_to_head() {
-        assert_eq!(process_range(0, 3, 0), Some(1..=3));
+        assert_eq!(process_range(0, 3, 0), Scan::Range(1..=3));
+    }
+
+    /// A cursor above the head is a chain that was reset beneath the watcher, NOT "caught up".
+    ///
+    /// Both used to return None, so the watcher credited nothing and said nothing for as long as it
+    /// lasted. Stage sat at cursor 117,635 against a head near 25,000 after developer_mode erased
+    /// the nodes' databases; every mint after the reset stayed `submitted`, including the one whose
+    /// investigation found this.
+    #[test]
+    fn a_cursor_above_head_is_a_shrunken_chain_not_up_to_date() {
+        assert_eq!(process_range(117_635, 25_000, 12), Scan::ChainShrank);
+        // One block past the head still counts: the chain cannot have a block we already processed.
+        assert_eq!(process_range(11, 10, 0), Scan::ChainShrank);
+    }
+
+    /// Equal is caught up, not shrunken — the boundary the check above must not swallow.
+    #[test]
+    fn a_cursor_equal_to_head_is_merely_up_to_date() {
+        assert_eq!(process_range(10, 10, 0), Scan::UpToDate);
     }
 }
