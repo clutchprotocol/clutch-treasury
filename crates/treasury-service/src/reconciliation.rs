@@ -70,6 +70,9 @@ pub fn judge(s: &Sources) -> (&'static str, serde_json::Value) {
 /// tests drive it directly.
 pub async fn record(pool: &PgPool, s: &Sources) -> Result<String, String> {
     let (status, detail) = judge(s);
+    // Read the previous drifting run BEFORE inserting this one, or the lookup finds this very run
+    // and every first sighting reports itself as persistent.
+    let prior_gap = previous_drift_gap(pool).await;
     sqlx::query(
         "INSERT INTO reconciliation_runs
          (onchain_supply, genesis_allocation, ledger_liability, custody_reported, status, detail)
@@ -100,7 +103,7 @@ pub async fn record(pool: &PgPool, s: &Sources) -> Result<String, String> {
         // it did — which is precisely what a chain reset does. Stage lost a $10 mint that way and
         // this arm reported it as benign, because a single run cannot tell a race from a loss.
         let gap = s.ledger_liability as i128 - (s.onchain_supply as i128 - s.genesis_allocation as i128);
-        let persistent = previous_drift_gap(pool).await.is_some_and(|prev| prev >= gap);
+        let persistent = prior_gap.is_some_and(|prev| prev >= gap);
         if persistent {
             alert(
                 pool,
