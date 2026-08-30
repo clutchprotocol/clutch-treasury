@@ -46,6 +46,14 @@ const CHANGE_LEVEL: u32 = 0;
 /// else's claim.
 const FEE_CHANGE_LEVEL: u32 = 1;
 const FEE_INDEX: u32 = 0;
+/// The USDT payout float, `<account>/2/0`.
+///
+/// A third change level, for the same reason the fee account got a second one: deposit addresses
+/// are `0/i` for every i, so nothing at `2/0` can ever be handed to a depositor. Separate from the
+/// fee account at `1/0` because the two hold different assets and are topped up by different
+/// people — a shared address would make "the float is dry" ambiguous between TRX and USDT.
+const PAYOUT_CHANGE_LEVEL: u32 = 2;
+const PAYOUT_INDEX: u32 = 0;
 const TRON_ADDRESS_VERSION: u8 = 0x41;
 
 pub struct Signer {
@@ -114,6 +122,30 @@ impl Signer {
 
     pub fn fee_signing_key(&self) -> Result<SigningKey, String> {
         Ok(self.fee_child()?.private_key().clone().into())
+    }
+
+    fn payout_child(&self) -> Result<XPrv, String> {
+        let change = ChildNumber::new(PAYOUT_CHANGE_LEVEL, false).map_err(|e| e.to_string())?;
+        let idx = ChildNumber::new(PAYOUT_INDEX, false).map_err(|e| e.to_string())?;
+        self.account
+            .derive_child(change)
+            .map_err(|e| format!("payout change-level derivation failed: {e}"))?
+            .derive_child(idx)
+            .map_err(|e| format!("payout index derivation failed: {e}"))
+    }
+
+    /// The USDT payout float, `<account>/2/0`.
+    ///
+    /// Redemption payouts are sent from here and nowhere else. An operator tops it up from custody;
+    /// its balance is the cap on what a compromised caller could move, which is why it is a float
+    /// and not the custody address itself.
+    pub fn payout_address(&self) -> Result<String, String> {
+        let pubkey = self.payout_child()?.public_key().public_key().to_encoded_point(false);
+        Ok(tron_address_from_uncompressed(pubkey.as_bytes()))
+    }
+
+    pub fn payout_signing_key(&self) -> Result<SigningKey, String> {
+        Ok(self.payout_child()?.private_key().clone().into())
     }
 
     /// The address for `index` — MUST equal what the orchestrator derived from the xpub.
@@ -274,6 +306,68 @@ mod fee_tests {
     fn the_fee_address_is_valid_base58check() {
         let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
         let addr = s.fee_address().unwrap();
+        let bytes = bs58::decode(&addr).with_check(Some(TRON_ADDRESS_VERSION)).into_vec().unwrap();
+        assert_eq!(bytes.len(), 21);
+        assert!(addr.starts_with('T'));
+    }
+}
+
+#[cfg(test)]
+mod payout_tests {
+    use super::*;
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn the_payout_address_is_never_a_deposit_address() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let payout = s.payout_address().unwrap();
+        for i in 0..2000u32 {
+            assert_ne!(payout, s.address_at(i).unwrap(), "payout collides with deposit index {i}");
+        }
+    }
+
+    #[test]
+    fn the_payout_address_is_not_the_fee_address() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        assert_ne!(s.payout_address().unwrap(), s.fee_address().unwrap());
+    }
+
+    #[test]
+    fn the_payout_key_controls_the_payout_address() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let pubkey = s.payout_signing_key().unwrap().verifying_key().to_encoded_point(false);
+        assert_eq!(tron_address_from_uncompressed(pubkey.as_bytes()), s.payout_address().unwrap());
+    }
+
+    #[test]
+    fn the_payout_address_is_stable_across_instances() {
+        let a = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let b = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        assert_eq!(a.payout_address().unwrap(), b.payout_address().unwrap());
+    }
+
+    #[test]
+    fn the_payout_path_is_pinned_to_2_0() {
+        assert_eq!(PAYOUT_CHANGE_LEVEL, 2, "the payout float lives on change level 2");
+        assert_eq!(PAYOUT_INDEX, 0, "the payout float is index 0 of change level 2");
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        // Ground truth from @scure/bip32, derived independently of this implementation and
+        // cross-checked against the five `EXPECTED` deposit addresses above before being trusted —
+        // the same provenance as that table.
+        //
+        // Without this, every other test in this module passes against a WRONG path: they check
+        // non-collision, non-equality, self-consistency and determinism, none of which can tell
+        // `2/0` from `3/0`. A wrong path sends every redemption payout to an address no operator
+        // ever funded.
+        assert_eq!(s.payout_address().unwrap(), "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT");
+    }
+
+    #[test]
+    fn the_payout_address_is_valid_base58check() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let addr = s.payout_address().unwrap();
         let bytes = bs58::decode(&addr).with_check(Some(TRON_ADDRESS_VERSION)).into_vec().unwrap();
         assert_eq!(bytes.len(), 21);
         assert!(addr.starts_with('T'));
