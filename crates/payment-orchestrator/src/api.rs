@@ -169,9 +169,10 @@ struct CreateRedemptionBody {
 /// `POST /api/v1/redemptions` — validates the payout address (base58check checksum + Tron
 /// version byte, `redemptions::is_valid_tron_address` — NOT a shape regex) and bounds, then
 /// forwards to the treasury with `redeemer_address` = the JWT's `pk`, never the request body.
-/// 503s while `config.redemptions_enabled` is false (default) — the treasury's payout rail is
-/// still `payout::StubRail`; see `OrchConfig::redemptions_enabled`'s doc comment for why this
-/// gate exists before anything else in this handler runs.
+/// 503s while `config.redemptions_enabled` is false (default) — the treasury's payout rail is a
+/// real TRC-20 transfer now, but the rollout that funds and verifies its float hasn't run yet;
+/// see `OrchConfig::redemptions_enabled`'s doc comment for why this gate exists before anything
+/// else in this handler runs.
 async fn create_redemption_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -203,10 +204,11 @@ async fn create_redemption_handler(
             StatusCode::CREATED,
             json!({"id": id, "redemption_ref": redemption_ref, "amount_clt": amount_clt, "status": status}),
         ),
-        // 503, not 400: this isn't a malformed request, it's a feature that isn't live yet —
-        // the treasury's payout rail is a stub (see OrchConfig::redemptions_enabled). Naming
-        // that plainly in the body keeps a caller from retrying forever thinking it's transient
-        // backpressure, or from concluding their address/amount was somehow invalid.
+        // 503, not 400: this isn't a malformed request, it's a feature not turned on yet — the
+        // treasury's payout rail itself is real, but redemptions_enabled stays false until its
+        // rollout finishes (see OrchConfig::redemptions_enabled). Naming that plainly in the body
+        // keeps a caller from retrying forever thinking it's transient backpressure, or from
+        // concluding their address/amount was somehow invalid.
         RedemptionOutcome::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"error": "redemptions are not yet available — the treasury payout rail is not live"}),

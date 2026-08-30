@@ -182,7 +182,18 @@ async fn main() {
         // a paid intent parks at `payout_submitted` with its `payout_ref` set until then.
         let pool = pool.clone();
         let payout_signer = payout::HttpPayoutSigner {
-            http: reqwest::Client::new(),
+            // 30s: tron-signer's own handler makes several sequential TronGrid round trips
+            // before it can answer at all (balance reads, building the transfer, sometimes a TRX
+            // top-up first), so this has to be generous enough that a slow-but-real chain of
+            // those doesn't masquerade as a timeout. A timeout here is indistinguishable from a
+            // broadcast that landed (see HttpPayoutSigner::pay's Ambiguous arm) and is treated
+            // exactly that conservatively, so it must also not be unbounded: confirm_payouts_once
+            // runs right after drain_once in this same loop tick, so a hung signer call would
+            // otherwise stall on-chain confirmation checks too, forever.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client builder"),
             base_url: config.signer_url.clone(),
             token: config.signer_token.clone(),
         };

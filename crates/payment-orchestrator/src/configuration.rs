@@ -41,12 +41,16 @@ pub struct OrchConfig {
     pub min_deposit_usdt: i64,
     pub max_deposit_usdt: i64,
     pub poll_interval_secs: u64,
-    /// Plan C T6 gate, default `false`: the treasury's payout rail is still `payout::StubRail`
-    /// (fabricates `payout_ref = "stub:<uuid>"`, sends nothing — spec §7.6 wants a working
-    /// off-ramp before real deposits). While this is `false` both redemption routes 503 rather
-    /// than accept a request, because a burn is irreversible: a user who is allowed to redeem
-    /// destroys their CLT claim on the reserve and gets a `redemption_ref` for a payout that
-    /// cannot happen. Flip only after a real TRC-20 payout rail replaces the stub.
+    /// Plan C T6 gate, default `false`. The treasury's payout rail is real now — a TRC-20
+    /// transfer from a derived float via `tron-signer`'s `/internal/payout` — not the old stub
+    /// that fabricated `payout_ref = "stub:<uuid>"` and sent nothing. This flag no longer waits
+    /// on the rail existing; it waits on the rollout in
+    /// `clutch-treasury/docs/superpowers/specs/2026-08-30-redemption-payout-rail-design.md` §5
+    /// (float funded, reconciliation confirmed `ok` with it counted). While this is `false` both
+    /// redemption routes 503 rather than accept a request, because a burn is irreversible: a user
+    /// who is allowed to redeem destroys their CLT claim on the reserve and gets a
+    /// `redemption_ref` for a payout that cannot happen while the float behind it is unfunded.
+    /// Flip only once that rollout checklist is done.
     pub redemptions_enabled: bool,
     pub min_redemption_clt: i64,
     pub max_redemption_clt: i64,

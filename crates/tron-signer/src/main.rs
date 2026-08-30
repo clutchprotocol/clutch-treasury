@@ -49,9 +49,9 @@ fn authed(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
     }
 }
 
-/// The account xpub, the fee address, and the payout address, so all can be read off the service that owns the private
-/// half rather than transcribed by hand. Public material — a mistyped xpub over there means every
-/// deposit address is one this service cannot sweep.
+/// The account xpub, the fee address, and the payout address, so all can be read off the
+/// service that owns the private half rather than transcribed by hand. Public material — a
+/// mistyped xpub over there means every deposit address is one this service cannot sweep.
 ///
 /// `fee_address` is where an operator sends the TRX float. It is here rather than only in the log
 /// line that fires when the account runs dry, because it is needed BEFORE the first sweep: an
@@ -144,6 +144,7 @@ async fn payout(
                 PayoutOutcome::CapExceeded { limit_usdt } => tracing::warn!(intent_id = %req.intent_id, amount_usdt = req.amount_usdt, limit_usdt, "payout over cap"),
                 PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => tracing::warn!(intent_id = %req.intent_id, %float_address, have_usdt, need_usdt, "payout float dry"),
                 PayoutOutcome::NeedsTrx { tx_id, amount_sun } => tracing::info!(intent_id = %req.intent_id, %tx_id, amount_sun, "funded the payout float with TRX"),
+                PayoutOutcome::Refused(reason) => tracing::warn!(intent_id = %req.intent_id, %reason, "payout refused pre-broadcast"),
             }
             Ok(Json(payout_response(&outcome)))
         }

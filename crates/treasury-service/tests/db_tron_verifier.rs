@@ -797,10 +797,12 @@ async fn reserve_status_reports_daily_headroom_that_shrinks_with_approved_mints(
     assert_eq!(after, 6_000_000, "headroom must shrink by exactly the approved mint's amount");
 }
 
-/// The reserve is a SUM once deposits sit on per-intent addresses.
+/// The reserve is a SUM across three buckets now: the main custody address, every unswept
+/// per-intent deposit address, and the payout float.
 ///
 /// Reading only the main treasury address reports a reserve near zero while unswept deposits sit
-/// elsewhere. That is not a halt risk — `judge` keys on the LEDGER's `custody_reported`, and
+/// elsewhere, and leaving the float out makes topping it up from custody look like the reserve
+/// shrinking. Neither is a halt risk — `judge` keys on the LEDGER's `custody_reported`, and
 /// `trongrid_balance` is a cross-check column that plays no part in any branch — but a fourth source
 /// that is permanently wrong is worse than one that is absent: people stop reading it, and then
 /// disbelieve it on the day it is right.

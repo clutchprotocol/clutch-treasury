@@ -113,6 +113,17 @@ pub enum PayoutOutcome {
     /// The float was just sent TRX so it can pay for its own transfer. Not a failure and not yet a
     /// payout — the funding has to confirm first, so the next pass does the transfer.
     NeedsTrx { tx_id: String, amount_sun: i64 },
+    /// Provably no broadcast was attempted: a key derivation failed, a TronGrid read (balance,
+    /// building the transaction) never got a usable response, or the recipient address itself was
+    /// bad — all before anything existed to sign. Safe to retry, unlike a 500: this is what a
+    /// TronGrid `balanceOf` blip or a dry fee account (spec §3) actually are.
+    ///
+    /// Never used for anything at or after `sign_and_broadcast` is called — a failure there may
+    /// have followed a real broadcast, so it stays a plain `Err` (500 on the wire, `Ambiguous` to
+    /// the treasury) even though some of ITS internal failures (a txID mismatch, a node rejecting
+    /// the broadcast) are, in principle, also provable non-broadcasts. Drawing the line at the
+    /// call rather than inside it keeps that guarantee simple enough to trust.
+    Refused(String),
 }
 
 /// The wire form of a payout outcome.
@@ -136,6 +147,7 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
         PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
         }
+        PayoutOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
     }
 }
 
@@ -450,12 +462,22 @@ impl SweepClient {
         // provably a non-broadcast. Without this, a non-positive amount still reaches the balance
         // reads and can trigger a real TRX funding broadcast before failing at transfer_parameter.
         if amount_usdt <= 0 {
-            return Err(format!("payout amount must be positive, got {amount_usdt}"));
+            return Ok(PayoutOutcome::Refused(format!("payout amount must be positive, got {amount_usdt}")));
         }
 
-        let from = signer.payout_address()?;
+        // Everything from here down to the call to `sign_and_broadcast` is provably pre-broadcast:
+        // a key derivation or a read-only TronGrid call, never a transaction. A failure in that
+        // stretch is `Refused`, not `Err` — see `PayoutOutcome::Refused`'s doc comment for why the
+        // line is drawn at the call to `sign_and_broadcast` and not inside it.
+        let from = match signer.payout_address() {
+            Ok(a) => a,
+            Err(e) => return Ok(PayoutOutcome::Refused(format!("could not derive the payout float address: {e}"))),
+        };
 
-        let have = self.usdt_balance(&from).await?;
+        let have = match self.usdt_balance(&from).await {
+            Ok(v) => v,
+            Err(e) => return Ok(PayoutOutcome::Refused(format!("could not read the payout float's USDT balance: {e}"))),
+        };
         if have < amount_usdt {
             return Ok(PayoutOutcome::FloatDry {
                 float_address: from,
@@ -466,34 +488,55 @@ impl SweepClient {
 
         // Same ordering as sweep: balance first, TRX second. An underfunded float reports FloatDry
         // without dispersing TRX to an address that was never going to send anything.
-        let trx = self.trx_balance_sun(&from).await?;
+        let trx = match self.trx_balance_sun(&from).await {
+            Ok(v) => v,
+            Err(e) => return Ok(PayoutOutcome::Refused(format!("could not read the payout float's TRX balance: {e}"))),
+        };
         if trx < MIN_TRX_SUN_FOR_TRANSFER {
-            return match self.fund(signer, &from).await? {
-                SweepOutcome::Funded { tx_id, amount_sun } => {
-                    Ok(PayoutOutcome::NeedsTrx { tx_id, amount_sun })
-                }
-                SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => {
-                    Err(format!(
+            return match self.fund(signer, &from).await {
+                Ok(SweepOutcome::Funded { tx_id, amount_sun }) => Ok(PayoutOutcome::NeedsTrx { tx_id, amount_sun }),
+                // Only a balance check ran before this outcome — no sign_and_broadcast call was
+                // made for any transaction, so this is provably a non-broadcast (spec §3).
+                Ok(SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun }) => {
+                    Ok(PayoutOutcome::Refused(format!(
                         "payout float {from} has no TRX and the fee account {fee_address} is dry \
                          ({have_sun} sun, needs {need_sun}) — an operator must top it up"
-                    ))
+                    )))
                 }
-                other => Err(format!("funding the payout float returned {other:?}")),
+                Ok(other) => Err(format!("funding the payout float returned {other:?}")),
+                // fund() may already have reached its OWN sign_and_broadcast call for the TRX
+                // top-up transfer before failing — conservatively ambiguous, same rule as below.
+                Err(e) => Err(e),
             };
         }
 
-        let built: serde_json::Value = self
-            .post(
-                "/wallet/triggersmartcontract",
-                payout_body(&from, &self.cfg.usdt_contract, to, amount_usdt, self.cfg.fee_limit)?,
-            )
-            .await?;
-        let tx = built
-            .get("transaction")
-            .cloned()
-            .ok_or_else(|| format!("trongrid returned no transaction to sign: {}", describe_rejection(&built)))?;
+        let body = match payout_body(&from, &self.cfg.usdt_contract, to, amount_usdt, self.cfg.fee_limit) {
+            Ok(b) => b,
+            Err(e) => return Ok(PayoutOutcome::Refused(format!("could not build the payout transfer: {e}"))),
+        };
+        let built: serde_json::Value = match self.post("/wallet/triggersmartcontract", body).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(PayoutOutcome::Refused(format!("could not build the payout transfer via TronGrid: {e}")))
+            }
+        };
+        let tx = match built.get("transaction").cloned() {
+            Some(t) => t,
+            None => {
+                return Ok(PayoutOutcome::Refused(format!(
+                    "trongrid returned no transaction to sign: {}",
+                    describe_rejection(&built)
+                )))
+            }
+        };
+        let payout_key = match signer.payout_signing_key() {
+            Ok(k) => k,
+            Err(e) => return Ok(PayoutOutcome::Refused(format!("could not derive the payout signing key: {e}"))),
+        };
 
-        let tx_id = self.sign_and_broadcast(&signer.payout_signing_key()?, tx).await?;
+        // Past this point a failure may follow a real broadcast attempt — genuinely ambiguous,
+        // never Refused. This is the only `?` left in the function.
+        let tx_id = self.sign_and_broadcast(&payout_key, tx).await?;
         Ok(PayoutOutcome::Paid { tx_id })
     }
 }
@@ -635,6 +678,18 @@ mod tests {
         assert_eq!(outcome, PayoutOutcome::CapExceeded { limit_usdt: 1_000_000 });
     }
 
+    /// A TronGrid failure while reading the float's OWN balance happens before anything exists to
+    /// sign — provably no broadcast was attempted. Before this fix `payout()` propagated this as a
+    /// plain `Err`, which the treasury client maps to `Ambiguous` and never retries: a dead
+    /// TronGrid endpoint would permanently wedge every redemption instead of leaving it retryable.
+    #[tokio::test]
+    async fn a_dead_trongrid_before_any_broadcast_is_refused_not_ambiguous() {
+        let client = SweepClient::new(payout_test_config(1_000_000)); // trongrid_url: dead port
+        let signer = fixture_signer();
+        let outcome = client.payout(&signer, RECIPIENT, 5).await.unwrap();
+        assert!(matches!(outcome, PayoutOutcome::Refused(_)), "got {outcome:?}");
+    }
+
     #[test]
     fn a_payout_always_spends_from_the_float_and_never_a_deposit() {
         // The security property of the whole endpoint, tested the way funding_body's argument order
@@ -664,7 +719,7 @@ mod tests {
 
     #[test]
     fn every_payout_status_string_is_pinned() {
-        // These four literals are the contract with treasury-service's HttpPayoutSigner. A typo
+        // These five literals are the contract with treasury-service's HttpPayoutSigner. A typo
         // does not fail loudly on either side: the treasury treats an unrecognised status as
         // "may have broadcast" and parks the redemption for a human, forever.
         assert_eq!(payout_response(&PayoutOutcome::Paid { tx_id: "t".into() })["status"], "paid");
@@ -677,6 +732,7 @@ mod tests {
             payout_response(&PayoutOutcome::NeedsTrx { tx_id: "t".into(), amount_sun: 1 })["status"],
             "needs_trx"
         );
+        assert_eq!(payout_response(&PayoutOutcome::Refused("x".into()))["status"], "refused");
     }
 
     #[test]

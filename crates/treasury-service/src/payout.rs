@@ -89,6 +89,12 @@ impl PayoutSigner for HttpPayoutSigner {
                 PayoutReply::CapExceeded { limit_usdt: body["limit_usdt"].as_i64().unwrap_or(0) }
             }
             Some("needs_trx") => PayoutReply::NeedsTrx,
+            // The signer proved this happened before it ever attempted a broadcast (a bad
+            // recipient, a key derivation failure, a TronGrid read that never got a response) —
+            // see sweep.rs's `PayoutOutcome::Refused` doc comment for exactly which class this is.
+            Some("refused") => PayoutReply::Refused(
+                body["reason"].as_str().unwrap_or("signer reported refused with no reason").to_string(),
+            ),
             // An unknown status from a newer signer might describe a broadcast this version does
             // not understand. Ambiguous, never Refused.
             other => PayoutReply::Ambiguous(format!("unrecognised signer status {other:?}")),
@@ -110,6 +116,28 @@ impl PayoutSigner for HttpPayoutSigner {
 /// the way `AtomicBool::new(false)` can — `OnceLock` is this codebase's existing answer to that
 /// (see `test_deriver` in payment-orchestrator's db_bridge.rs).
 fn over_cap_alerted() -> &'static Mutex<HashSet<Uuid>> {
+    static ALERTED: std::sync::OnceLock<Mutex<HashSet<Uuid>>> = std::sync::OnceLock::new();
+    ALERTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Same shape and reasoning as `over_cap_alerted` — de-dupes a live condition, not a record, so
+/// re-alerting after a restart is correct — but for `drain_once`'s proven-non-broadcast arm
+/// (`FloatDry` / `CapExceeded` / `NeedsTrx` / `Refused`) instead of the over-cap one.
+///
+/// `outbox_poll_ms` is 2 seconds, so a dry float — the NORMAL state until the rollout funds it —
+/// re-claims and re-refuses the same intent every single pass. Without this, that inserts a fresh
+/// P1 row and burns two TronGrid calls every 2 seconds, which buries the ambiguous-payout P1s the
+/// whole design depends on someone actually reading.
+fn payout_refused_alerted() -> &'static Mutex<HashSet<Uuid>> {
+    static ALERTED: std::sync::OnceLock<Mutex<HashSet<Uuid>>> = std::sync::OnceLock::new();
+    ALERTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Same shape again, for `confirm_payouts_once`'s confirmed-but-failed arm. A `REVERT` /
+/// `OUT_OF_ENERGY` transfer never leaves `payout_submitted` on its own — nothing here retries it —
+/// so without this dedupe it would re-alert on every confirmation pass forever, exactly the noise
+/// `payout_refused_alerted` exists to avoid on the submission side.
+fn failed_transfer_alerted() -> &'static Mutex<HashSet<Uuid>> {
     static ALERTED: std::sync::OnceLock<Mutex<HashSet<Uuid>>> = std::sync::OnceLock::new();
     ALERTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -269,8 +297,12 @@ pub async fn drain_once(
                     )).await;
                     continue;
                 }
-                alert(pool, "p1", "payout",
-                    &format!("redemption {intent_id}: payout refused ({reply:?}), returned to payout_pending")).await;
+                // Deduped: a dry float re-claims and re-refuses this same intent every pass, and
+                // an alert per pass buries the ambiguous-payout P1s a human actually needs to see.
+                if payout_refused_alerted().lock().unwrap().insert(intent_id) {
+                    alert(pool, "p1", "payout",
+                        &format!("redemption {intent_id}: payout refused ({reply:?}), returned to payout_pending")).await;
+                }
             }
             // May or may not have broadcast. Stays claimed, forever, until a human resolves it.
             PayoutReply::Ambiguous(msg) => {
@@ -302,6 +334,16 @@ pub async fn drain_once(
 ///
 /// An intent with no `payout_ref` is skipped, never confirmed and never failed — that is the
 /// ambiguous state, and only a human puts a tx id on it or sends it back.
+///
+/// Confirmation is two questions, not one: `transaction_confirmed` (is it in an irreversible
+/// block) gates `transfer_succeeded` (did it actually move value). A TRC-20 transfer that ran out
+/// of energy or reverted answers the first `true` and the second `false` — it is in the block and
+/// paid nothing. Only both `true` writes `paid` and the ledger event; the first true and second
+/// false is a dead end that alerts a human and is never retried automatically.
+///
+/// Each intent's own failure is logged (or alerted, for the one case where money already moved)
+/// and the loop continues rather than using `?` — one intent's DB error must not head-of-line
+/// block confirmation for every intent after it in this pass.
 pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<u32, String> {
     let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(
         "SELECT id, amount_clt, payout_ref FROM redemption_intents
@@ -314,10 +356,48 @@ pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<
     let mut confirmed = 0u32;
     for (intent_id, amount_clt, payout_ref) in rows {
         match client.transaction_confirmed(&payout_ref).await {
-            Ok(true) => {
-                pay_intent(pool, intent_id, amount_clt, &payout_ref).await?;
-                confirmed += 1;
-            }
+            Ok(true) => match client.transfer_succeeded(&payout_ref).await {
+                Ok(true) => {
+                    if let Err(e) = pay_intent(pool, intent_id, amount_clt, &payout_ref).await {
+                        // The transfer is proven successful on chain; only our own bookkeeping
+                        // failed. Safe to retry — pay_intent's UPDATE and its ON CONFLICT DO
+                        // NOTHING insert are both idempotent, and this row still matches the
+                        // SELECT above, so the next pass picks it up on its own.
+                        alert(pool, "p1", "payout", &format!(
+                            "redemption {intent_id}: tx {payout_ref} confirmed successful on \
+                             chain but recording it as paid failed ({e}). Safe to retry — the \
+                             next confirmation pass will pick it up automatically."
+                        )).await;
+                        continue;
+                    }
+                    confirmed += 1;
+                }
+                // In an irreversible block, but the transfer itself moved nothing —
+                // OUT_OF_ENERGY, REVERT, etc. The float never paid out: this must never become
+                // `paid` and must never be retried automatically (drain_once already spent this
+                // intent's one signer call; the chain's answer is already terminal). Only a human
+                // resolves it from here.
+                Ok(false) => {
+                    if failed_transfer_alerted().lock().unwrap().insert(intent_id) {
+                        let reason = client
+                            .payout_contract_ret(&payout_ref)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        alert(pool, "p1", "payout", &format!(
+                            "redemption {intent_id}: payout tx {payout_ref} is confirmed on chain \
+                             but did NOT succeed (contractRet={reason}). No USDT left the float. \
+                             Left payout_submitted and NOT retried automatically — check the tx on \
+                             chain, then either move this intent back to payout_pending by hand to \
+                             retry, or resolve it another way."
+                        )).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%intent_id, %payout_ref, "could not check payout success: {e}");
+                }
+            },
             // Not yet mined. Nothing to do; the next pass looks again.
             Ok(false) => {}
             Err(e) => {

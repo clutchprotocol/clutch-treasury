@@ -90,6 +90,8 @@ pub async fn create_redemption(
     payout_tron_address: &str,
     amount_clt: i64,
 ) -> RedemptionOutcome {
+    // The payout rail behind this is real now (see OrchConfig::redemptions_enabled); the flag
+    // stays false only until its rollout — float funded, reconciliation verified — finishes.
     if !config.redemptions_enabled {
         return RedemptionOutcome::Disabled;
     }

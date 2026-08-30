@@ -108,6 +108,18 @@ async fn a_400_is_refused_because_the_signer_rejected_the_shape() {
 }
 
 #[tokio::test]
+async fn a_refused_status_is_refused_and_carries_its_reason() {
+    // The signer's structured answer for a provable pre-broadcast failure (IMPORTANT 2): a
+    // TronGrid balanceOf blip, a dry fee account, a bad recipient — all proven to have happened
+    // before anything existed to sign, so retrying is free.
+    let (_s, signer) = signer_replying(200, serde_json::json!({
+        "status": "refused", "reason": "could not read the payout float's USDT balance: boom",
+    })).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert_eq!(reply, PayoutReply::Refused("could not read the payout float's USDT balance: boom".into()));
+}
+
+#[tokio::test]
 async fn a_500_is_ambiguous_not_refused() {
     // A 500 can follow a broadcast that then failed to report. Classifying it Refused would make
     // it retryable, and the retry would pay the same burn again.
@@ -125,7 +137,7 @@ async fn an_unrecognised_status_is_ambiguous() {
 }
 
 #[tokio::test]
-async fn a_float_dry_reply_is_refused_and_carries_its_numbers() {
+async fn a_float_dry_reply_carries_its_numbers() {
     let (_s, signer) = signer_replying(200, serde_json::json!({
         "status": "float_dry", "float_address": "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT",
         "have_usdt": 0, "need_usdt": 5,
@@ -452,10 +464,30 @@ async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_goi
 
 // --- confirm_payouts_once: on-chain confirmation before ledgering ---
 
+/// A confirmed transaction that actually SUCCEEDED — the realistic shape, `ret[0].contractRet`
+/// included. The original version of this helper returned `{"txID": ...}` alone: it modeled
+/// presence but never execution result, so it passed against the exact bug `transfer_succeeded`
+/// exists to catch (a `REVERT`/`OUT_OF_ENERGY` transaction is ALSO present with just a `txID`).
 async fn mount_confirmed_tx(server: &MockServer, tx_id: &str) {
     Mock::given(method("POST"))
         .and(path("/walletsolidity/gettransactionbyid"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "txID": tx_id })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "txID": tx_id,
+            "ret": [{ "contractRet": "SUCCESS" }],
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Confirmed — present in an irreversible block — but NOT successful: `contractRet` is whatever
+/// TronGrid reported for a transfer that ran out of energy or reverted.
+async fn mount_confirmed_but_failed_tx(server: &MockServer, tx_id: &str, contract_ret: &str) {
+    Mock::given(method("POST"))
+        .and(path("/walletsolidity/gettransactionbyid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "txID": tx_id,
+            "ret": [{ "contractRet": contract_ret }],
+        })))
         .mount(server)
         .await;
 }
@@ -494,4 +526,66 @@ async fn confirmation_writes_paid_and_the_ledger_event_once() {
         "SELECT count(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'")
         .bind(id).fetch_one(&pool).await.unwrap();
     assert_eq!(events, 1, "liability must drop exactly once");
+}
+
+/// THE regression for the critical bug this rail shipped with: `transaction_confirmed` alone only
+/// proves the tx is in a block, not that it moved anything. A TRC-20 transfer that ran out of
+/// energy or reverted is in the block just the same — before this fix, `confirm_payouts_once`
+/// would write `paid` and a `custody_withdrawal` event for USDT that never left the float.
+#[tokio::test]
+async fn a_reverted_payout_tx_is_never_paid_and_alerts_a_human_instead() {
+    let pool = pool().await;
+    let id = pending_redemption(&pool, 10_000_000).await;
+    sqlx::query("UPDATE redemption_intents SET status = 'payout_submitted', payout_ref = 'abc123' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+
+    let server = MockServer::start().await;
+    mount_confirmed_but_failed_tx(&server, "abc123", "REVERT").await;
+    let client = TronClient::new(server.uri(), String::new());
+
+    payout::confirm_payouts_once(&pool, &client).await.unwrap();
+
+    let (status, payout_ref): (String, Option<String>) =
+        sqlx::query_as("SELECT status, payout_ref FROM redemption_intents WHERE id = $1")
+            .bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "payout_submitted", "a reverted transfer must never become paid");
+    assert_eq!(payout_ref.as_deref(), Some("abc123"), "left for a human, not cleared");
+
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(events, 0, "no USDT left the float, so no custody_withdrawal event");
+
+    let (alerted,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM alerts WHERE severity = 'p1' AND source = 'payout' \
+         AND message LIKE '%abc123%' AND message LIKE '%REVERT%')")
+        .fetch_one(&pool).await.unwrap();
+    assert!(alerted, "a confirmed-but-failed transfer must alert a human, naming the tx id and contractRet");
+}
+
+/// `outbox_poll_ms` is 2 seconds, so a dry float — the NORMAL state until the rollout funds it —
+/// re-claims and re-refuses the same intent on every pass. Without dedup this inserts a fresh P1
+/// row (and burns two TronGrid calls) every 2 seconds, burying the ambiguous-payout P1s the whole
+/// design depends on someone actually reading.
+#[tokio::test]
+async fn a_repeatedly_refused_payout_alerts_once_not_every_pass() {
+    let pool = pool().await;
+    pending_redemption(&pool, 10_000_000).await;
+    let signer = CountingSigner {
+        reply: PayoutReply::FloatDry {
+            float_address: "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY".into(),
+            have_usdt: 0,
+            need_usdt: 10_000_000,
+        },
+        calls: AtomicUsize::new(0),
+    };
+    let cfg = config();
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    let (alerts,): (i64,) = sqlx::query_as("SELECT count(*) FROM alerts WHERE severity = 'p1' AND source = 'payout'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(alerts, 1, "a dry float must alert once, not once per pass");
 }
