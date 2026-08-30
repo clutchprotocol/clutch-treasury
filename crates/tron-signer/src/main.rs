@@ -18,7 +18,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
-use tron_signer::sweep::{SweepClient, SweepConfig, SweepOutcome};
+use tron_signer::sweep::{validate_payout_cap, SweepClient, SweepConfig, SweepOutcome};
 
 #[derive(Clone)]
 struct AppState {
@@ -132,9 +132,7 @@ async fn main() {
         treasury_address: env("APP_TREASURY_ADDRESS"),
         usdt_contract: env("APP_USDT_CONTRACT"),
         fee_limit: std::env::var("APP_FEE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(150_000_000),
-        per_tx_payout_cap_usdt: env("APP_PER_TX_PAYOUT_CAP_USDT")
-            .parse()
-            .expect("APP_PER_TX_PAYOUT_CAP_USDT must be an integer number of micro-USDT"),
+        per_tx_payout_cap_usdt: validate_payout_cap(&env("APP_PER_TX_PAYOUT_CAP_USDT")).unwrap_or_else(|e| panic!("{e}")),
     }));
 
     let state = AppState { signer, sweeper, token: env("APP_SIGNER_TOKEN") };

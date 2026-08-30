@@ -65,6 +65,21 @@ pub struct SweepConfig {
     pub per_tx_payout_cap_usdt: i64,
 }
 
+/// A payout cap of zero or less is a misconfiguration, not a limit: it refuses every payout while
+/// looking like a working service, which presents as "redemptions all mysteriously fail" and costs
+/// an investigation to trace back to one env var. Rejected at boot so the signer dies loudly with
+/// the reason instead of stalling redemptions quietly.
+pub fn validate_payout_cap(raw: &str) -> Result<i64, String> {
+    let parsed: i64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("APP_PER_TX_PAYOUT_CAP_USDT must be an integer number of micro-USDT, got {raw:?}"))?;
+    if parsed <= 0 {
+        return Err(format!("APP_PER_TX_PAYOUT_CAP_USDT must be positive, got {parsed} — a non-positive cap refuses every payout"));
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, PartialEq)]
 pub enum SweepOutcome {
     /// Broadcast accepted; `tx_id` is the on-chain transfer.
@@ -127,16 +142,19 @@ fn payout_body(
     to: &str,
     amount_usdt: i64,
     fee_limit: i64,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
         "owner_address": from,
         "contract_address": usdt_contract,
         "function_selector": "transfer(address,uint256)",
-        "parameter": transfer_parameter(to, amount_usdt).unwrap_or_default(),
+        // Propagated, not defaulted: an empty parameter is a transfer TronGrid will build and sign
+        // against zero recipient bytes and a zero amount — a transaction that does nothing while
+        // looking exactly like one that does. sweep() treats the same failure the same way.
+        "parameter": transfer_parameter(to, amount_usdt)?,
         "fee_limit": fee_limit,
         "call_value": 0,
         "visible": true,
-    })
+    }))
 }
 
 /// ABI-encode a Tron address into the 32-byte word `transfer(address,uint256)` expects.
@@ -436,7 +454,7 @@ impl SweepClient {
         let built: serde_json::Value = self
             .post(
                 "/wallet/triggersmartcontract",
-                payout_body(&from, &self.cfg.usdt_contract, to, amount_usdt, self.cfg.fee_limit),
+                payout_body(&from, &self.cfg.usdt_contract, to, amount_usdt, self.cfg.fee_limit)?,
             )
             .await?;
         let tx = built
@@ -565,15 +583,14 @@ mod tests {
     }
 
     #[test]
-    fn a_payout_cap_of_zero_would_block_every_payout() {
-        // Guards against defaulting the cap to 0 and silently disabling redemptions, which would
-        // present as every payout refusing with CapExceeded and no obvious cause.
-        let cfg = payout_test_config(0);
-        assert_eq!(cfg.per_tx_payout_cap_usdt, 0, "test intends a zero cap");
-        assert!(
-            cfg.per_tx_payout_cap_usdt <= 0,
-            "a zero or negative cap must be rejected at boot, not treated as a limit"
-        );
+    fn a_payout_cap_of_zero_or_less_is_rejected_at_boot() {
+        // A cap that resolves to 0 or negative would refuse every payout while the service looks up
+        // and healthy. validate_payout_cap is what turns that into a boot-time panic instead of a
+        // silent, hard-to-trace outage.
+        assert!(validate_payout_cap("0").is_err(), "zero must be rejected");
+        assert!(validate_payout_cap("-5").is_err(), "negative must be rejected");
+        assert!(validate_payout_cap("not a number").is_err(), "non-numeric must be rejected");
+        assert_eq!(validate_payout_cap("25000000").unwrap(), 25_000_000, "a valid cap must parse through");
     }
 
     #[tokio::test]
@@ -594,7 +611,7 @@ mod tests {
         // from anything the caller supplied, this fails.
         let s = fixture_signer();
         let float = s.payout_address().unwrap();
-        let body = payout_body(&float, USDT_FIXTURE, RECIPIENT, 5, 150_000_000);
+        let body = payout_body(&float, USDT_FIXTURE, RECIPIENT, 5, 150_000_000).unwrap();
 
         assert_eq!(body["owner_address"], float, "the float must be the payer");
         assert_ne!(body["owner_address"], RECIPIENT, "the recipient must never be the payer");
