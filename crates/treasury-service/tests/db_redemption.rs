@@ -22,6 +22,13 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    // Belt-and-braces alongside the in-test DROP in
+    // a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_going: a SIGKILL
+    // mid-test (not just a failed assertion) can leave `tmp` behind on this shared, persistent
+    // database, and every later test that writes payout_ref would then fail in a way that looks
+    // nothing like the real cause. Cleared here so a previous run's hard death cannot leak in.
+    sqlx::query("ALTER TABLE redemption_intents DROP CONSTRAINT IF EXISTS tmp")
+        .execute(&pool).await.unwrap();
     sqlx::query("TRUNCATE treasury_events, redemption_intents, alerts RESTART IDENTITY CASCADE")
         .execute(&pool).await.unwrap();
     pool
@@ -385,23 +392,35 @@ async fn the_daily_cap_window_ignores_a_stale_claim_even_after_it_is_touched_aga
 /// the tx_id verbatim, and the pass must keep going rather than abort on the first failure — the
 /// "claim committed but the ack was lost" variant needs no separate test, since it is the same
 /// straight-line alert-and-continue handler on the claim UPDATE just above this one.
+///
+/// The tight 2M cap and the third 1M intent are load-bearing, not incidental — they are what
+/// pins N1 (the day_total charge sits ABOVE the fallible write, so a paid-but-unrecorded intent
+/// still spends budget). `a` and `b` both always fail their write here, so if the charge ever
+/// slipped back below it, day_total would stay 0 regardless of how many intents got "paid", the
+/// cap would never bind, and `c` would ALSO be attempted (calls == 3 instead of 2). Do not
+/// "simplify" this back down to two intents under a loose cap — that shape passes whether N1
+/// holds or not, which is the exact gap that let N1 ship untested the first time.
 #[tokio::test]
 async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_going() {
     let pool = pool().await;
+    let mut cfg = config();
+    cfg.daily_payout_cap_clt = 2_000_000;
     let a = pending_redemption(&pool, 1_000_000).await;
     let b = pending_redemption(&pool, 1_000_000).await;
+    let c = pending_redemption(&pool, 1_000_000).await;
     let signer = CountingSigner {
         reply: PayoutReply::Paid { tx_id: "constrained-tx".into() },
         calls: AtomicUsize::new(0),
     };
 
-    // Self-healing in case a previous run of this test panicked before reaching its own DROP.
+    // Self-healing in case a previous run of this test panicked before reaching its own DROP
+    // (pool() now also clears a leak from a harder kill — see its comment).
     sqlx::query("ALTER TABLE redemption_intents DROP CONSTRAINT IF EXISTS tmp")
         .execute(&pool).await.unwrap();
     sqlx::query("ALTER TABLE redemption_intents ADD CONSTRAINT tmp CHECK (payout_ref IS NULL)")
         .execute(&pool).await.unwrap();
 
-    let result = payout::drain_once(&pool, &config(), &signer).await;
+    let result = payout::drain_once(&pool, &cfg, &signer).await;
 
     // Drop the constraint BEFORE asserting anything: a failed assertion below must not leave a
     // table-wide constraint behind for every later test in this binary to trip over.
@@ -409,7 +428,8 @@ async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_goi
 
     result.unwrap();
     assert_eq!(signer.calls.load(Ordering::SeqCst), 2,
-        "the second intent must still be attempted — one bad write must not abort the pass");
+        "a and b must charge 2M between them even though both writes fail, so c is never \
+         attempted once the cap reads spent — 3 here would mean the failed writes charged nothing");
 
     for id in [a, b] {
         let (status, payout_ref): (String, Option<String>) =
@@ -418,6 +438,10 @@ async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_goi
         assert_eq!(status, "payout_submitted", "claimed, then stuck there when the write that would advance it further failed");
         assert_eq!(payout_ref, None, "the CHECK-violating write must not have applied");
     }
+
+    let (c_status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(c).fetch_one(&pool).await.unwrap();
+    assert_eq!(c_status, "payout_pending", "never reached — the cap must already read as spent by a and b alone");
 
     let (alerted,): (bool,) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM alerts WHERE severity = 'p1' AND source = 'payout' \
