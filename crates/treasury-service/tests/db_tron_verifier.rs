@@ -228,6 +228,32 @@ async fn mount_transaction_confirmed(server: &MockServer, tx_id: &str, confirmed
         .await;
 }
 
+/// A `"ret": null` response must read as "no execution result yet", NOT as a transport failure.
+///
+/// `#[serde(default)]` only covers the field being ABSENT. An explicit null fails to deserialize
+/// into a bare `Vec`, and `SolidityTransaction` is shared with the DEPOSIT path — where every
+/// `Err` becomes `Evidence::Transient` and the deposit retries until the 24h stuck-sweep hands it
+/// to a human. So a null must be `Ok(false)`, never `Err`.
+///
+/// This fails against a bare `Vec<ContractResult>`: serde rejects null for a sequence, `.json()`
+/// returns an error, and `transfer_succeeded` yields `Err` instead of `Ok(false)`.
+#[tokio::test]
+async fn a_null_ret_is_not_yet_successful_rather_than_a_read_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/walletsolidity/gettransactionbyid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"txID": "tx-null-ret", "ret": null})))
+        .mount(&server)
+        .await;
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+
+    let succeeded = client
+        .transfer_succeeded("tx-null-ret")
+        .await
+        .expect("a null ret must not surface as a transport error");
+    assert!(!succeeded, "no execution result yet means not-successful, not paid");
+}
+
 /// Happy path, deposit_tx_id already known (Bitcart returned a hash): all four evidence
 /// conditions hold, so the intent is approved and the custody event lands. Rerunning
 /// `verify_once` (simulating a crash-then-restart of the poll loop) must NOT append a second

@@ -94,8 +94,14 @@ struct SolidityTransaction {
     /// Empty when not yet final, same as `tx_id` — present transactions carry exactly one entry.
     /// Only `transfer_succeeded` (and `payout_contract_ret`) read this; `transaction_confirmed`
     /// still answers presence alone, unchanged.
+    ///
+    /// `Option`, not a bare `Vec`, because `#[serde(default)]` only covers the field being
+    /// ABSENT. An explicit `"ret": null` fails to deserialize into a `Vec` and would turn a
+    /// routine read into an `Err` — and this struct is shared with the DEPOSIT path, where every
+    /// `Err` maps to `Evidence::Transient` and the deposit retries until a human is handed it 24h
+    /// later. A null here must read as "no execution result yet", exactly like an absent field.
     #[serde(default)]
-    ret: Vec<ContractResult>,
+    ret: Option<Vec<ContractResult>>,
 }
 
 /// One `ret` entry from `gettransactionbyid`. `contractRet` is the EXECUTION result — `"SUCCESS"`
@@ -216,7 +222,7 @@ impl TronClient {
         if !parsed.tx_id.as_deref().is_some_and(|got| got.eq_ignore_ascii_case(tx_id)) {
             return Ok(false);
         }
-        Ok(parsed.ret.first().is_some_and(|r| r.contract_ret == "SUCCESS"))
+        Ok(parsed.ret.as_ref().and_then(|r| r.first()).is_some_and(|r| r.contract_ret == "SUCCESS"))
     }
 
     /// The raw `contractRet` behind a `transfer_succeeded` of `false`, so a P1 alert can name the
@@ -228,7 +234,7 @@ impl TronClient {
         if !parsed.tx_id.as_deref().is_some_and(|got| got.eq_ignore_ascii_case(tx_id)) {
             return Ok(None);
         }
-        Ok(parsed.ret.first().map(|r| r.contract_ret.clone()))
+        Ok(parsed.ret.as_ref().and_then(|r| r.first()).map(|r| r.contract_ret.clone()))
     }
 
     /// Reconciliation's cross-check read (spec's fourth-source stand-in until a PSP exists):
