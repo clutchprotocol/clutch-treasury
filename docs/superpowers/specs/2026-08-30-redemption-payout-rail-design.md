@@ -190,7 +190,14 @@ already covered by `db_redemption.rs`.
 
 The flag flip is last:
 
-1. Ship the rail with `APP_REDEMPTIONS_ENABLED` still `false` — dead code in production.
+1. Ship the rail with `APP_REDEMPTIONS_ENABLED` still `false`. **Not dead code**:
+   `treasury-service` panics at boot without `payout_float_address` and `daily_payout_cap_clt` set
+   (no serde default, absent from `config/default.toml`), so both must be configured for the
+   service to start at all — and its payout workers (`drain_once` / `confirm_payouts_once`) then
+   run on their normal poll cadence unconditionally, whether or not anyone can create a
+   redemption. `redemptions_enabled` lives only in `payment-orchestrator`, gating just the two
+   HTTP routes that create/read one; it never reaches `treasury-service`. Verify `payout_pending`
+   has zero rows before deploying — nothing else stops these workers from acting on one.
 2. Surface the float in `/internal/xpub`; add it to the `treasury` probe in `inspect-stage.yml`,
    beside the existing TRX float line.
 3. Fund it — USDT from custody, TRX from the fee account.

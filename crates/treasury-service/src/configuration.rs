@@ -27,6 +27,12 @@ pub struct AppConfig {
     pub approver_token: String,
     pub readonly_token: String,
     pub daily_mint_cap_clt: i64,
+    /// Rolling 24h payout ceiling in CLT base units.
+    ///
+    /// Separate from the signer's `per_tx_payout_cap_usdt`, which is micro-USDT and per-transaction.
+    /// The two are equal at 1:1 par and must still be configured independently — collapsing them
+    /// would silently couple a unit change on one side to the other.
+    pub daily_payout_cap_clt: i64,
     pub per_tx_mint_cap_clt: i64,
     pub backing_target_bps: i64,
     pub backing_halt_bps: i64,
@@ -37,6 +43,11 @@ pub struct AppConfig {
     pub trongrid_url: String,
     pub trongrid_api_key: String,
     pub custody_tron_address: String,
+    /// The payout float address, read off tron-signer's /internal/xpub.
+    ///
+    /// Configured rather than derived: this service holds no key material and must not be able to
+    /// derive spending addresses. It only needs to know where to LOOK, so it is given the address.
+    pub payout_float_address: String,
     pub usdt_contract: String,
     pub deposit_confirmations: u32,
     /// How far back the verifier's fallback (no-tx-hash) match may reach for a transfer, relative

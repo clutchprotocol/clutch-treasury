@@ -91,6 +91,21 @@ struct SolidityTransaction {
     /// Absent when the transaction is not yet in an irreversible block.
     #[serde(default, rename = "txID")]
     tx_id: Option<String>,
+    /// Empty when not yet final, same as `tx_id` — present transactions carry exactly one entry.
+    /// Only `transfer_succeeded` (and `payout_contract_ret`) read this; `transaction_confirmed`
+    /// still answers presence alone, unchanged.
+    #[serde(default)]
+    ret: Vec<ContractResult>,
+}
+
+/// One `ret` entry from `gettransactionbyid`. `contractRet` is the EXECUTION result — `"SUCCESS"`
+/// for a transfer that actually moved value; `"REVERT"`, `"OUT_OF_ENERGY"` and others for a
+/// transaction that made it into a block but did nothing. This is the distinction
+/// `transaction_confirmed` cannot make: it only proves presence, not outcome.
+#[derive(Debug, Deserialize)]
+struct ContractResult {
+    #[serde(default, rename = "contractRet")]
+    contract_ret: String,
 }
 
 pub struct TronClient {
@@ -141,17 +156,9 @@ impl TronClient {
         Ok(parsed.data)
     }
 
-    /// Is `tx_id` in an irreversible block?
-    ///
-    /// Asks the SOLIDITY node, which by definition only serves finalised blocks — presence is the
-    /// proof. Deliberately a different endpoint from `trc20_transfers`' `only_confirmed=true`, so
-    /// this stays a genuinely independent second observation rather than the same read twice.
-    ///
-    /// Returns `Ok(false)` (not `Err`) when the node answers `{}`: not-yet-final is a normal
-    /// waiting state that should surface as "not yet confirmed", while `Err` is reserved for our
-    /// infrastructure failing. The caller maps both to `Transient`, but only one of them is worth
-    /// alerting about.
-    async fn transaction_confirmed(&self, tx_id: &str) -> Result<bool, String> {
+    /// Shared by `transaction_confirmed`, `transfer_succeeded` and `payout_contract_ret` — one
+    /// fetch, three questions asked of the same response.
+    async fn fetch_solidity_transaction(&self, tx_id: &str) -> Result<SolidityTransaction, String> {
         let url = format!("{}/walletsolidity/gettransactionbyid", self.base_url);
         let resp = self
             .http
@@ -167,10 +174,61 @@ impl TronClient {
             return Err(format!("trongrid gettransactionbyid failed: {status} {text}"));
         }
         let parsed: SolidityTransaction = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(parsed)
+    }
+
+    /// Is `tx_id` in an irreversible block?
+    ///
+    /// Asks the SOLIDITY node, which by definition only serves finalised blocks — presence is the
+    /// proof. Deliberately a different endpoint from `trc20_transfers`' `only_confirmed=true`, so
+    /// this stays a genuinely independent second observation rather than the same read twice.
+    ///
+    /// Returns `Ok(false)` (not `Err`) when the node answers `{}`: not-yet-final is a normal
+    /// waiting state that should surface as "not yet confirmed", while `Err` is reserved for our
+    /// infrastructure failing. The caller maps both to `Transient`, but only one of them is worth
+    /// alerting about.
+    ///
+    /// Presence only — NOT success. A TRC-20 transfer that ran out of energy or reverted is still
+    /// in the block, so this returns `true` for it. That is correct for the deposit path (paired
+    /// with a `Trc20Transfer` event, which Tron only emits on success) but wrong on its own for a
+    /// payout — see `transfer_succeeded`.
+    pub async fn transaction_confirmed(&self, tx_id: &str) -> Result<bool, String> {
+        let parsed = self.fetch_solidity_transaction(tx_id).await?;
         // Compare the echoed id rather than merely checking presence: a response for some other
         // transaction must not be read as confirmation of this one. Tron hex ids are
         // case-insensitive, hence the eq_ignore_ascii_case.
         Ok(parsed.tx_id.is_some_and(|got| got.eq_ignore_ascii_case(tx_id)))
+    }
+
+    /// Confirmed AND successful. `transaction_confirmed` answers only "is it in an irreversible
+    /// block" — a TRC-20 transfer that ran out of energy or reverted is in the block and moved
+    /// nothing. Recording that as `paid` would credit a redemption whose USDT never left the float
+    /// and put a custody_withdrawal in the ledger for money still sitting there.
+    ///
+    /// The deposit path can use the weaker check because it pairs it with a Trc20Transfer event,
+    /// which is only emitted on success. The payout path has no such pairing.
+    ///
+    /// Absent/not-yet-final stays `Ok(false)`, same as `transaction_confirmed`; a transport
+    /// failure stays `Err`. Use alongside `transaction_confirmed` (call that first) to tell "not
+    /// yet mined" apart from "mined but failed" — this alone collapses both to `false`.
+    pub async fn transfer_succeeded(&self, tx_id: &str) -> Result<bool, String> {
+        let parsed = self.fetch_solidity_transaction(tx_id).await?;
+        if !parsed.tx_id.as_deref().is_some_and(|got| got.eq_ignore_ascii_case(tx_id)) {
+            return Ok(false);
+        }
+        Ok(parsed.ret.first().is_some_and(|r| r.contract_ret == "SUCCESS"))
+    }
+
+    /// The raw `contractRet` behind a `transfer_succeeded` of `false`, so a P1 alert can name the
+    /// actual reason (`"REVERT"`, `"OUT_OF_ENERGY"`, ...) instead of a bare no. `None` when the
+    /// transaction isn't final yet or the id doesn't match — the same cases `transfer_succeeded`
+    /// reports as `Ok(false)` without a reason, because there isn't one yet.
+    pub(crate) async fn payout_contract_ret(&self, tx_id: &str) -> Result<Option<String>, String> {
+        let parsed = self.fetch_solidity_transaction(tx_id).await?;
+        if !parsed.tx_id.as_deref().is_some_and(|got| got.eq_ignore_ascii_case(tx_id)) {
+            return Ok(None);
+        }
+        Ok(parsed.ret.first().map(|r| r.contract_ret.clone()))
     }
 
     /// Reconciliation's cross-check read (spec's fourth-source stand-in until a PSP exists):
@@ -192,14 +250,21 @@ impl TronClient {
     /// cross-check would have reported as zero reserve.
     ///
     /// `balanceOf` asks the token's own ledger, so account activation is irrelevant.
-    /// The whole reserve: the main treasury address plus every address still holding an unswept
-    /// deposit.
+    ///
+    /// Custody + every unswept deposit address + the payout float.
     ///
     /// Reading only the main address would report a reserve near zero while deposits sit on derived
     /// addresses awaiting a sweep. That is not a halt risk — `judge` keys on the LEDGER's
     /// `custody_reported`, and `trongrid_balance` is a cross-check column that plays no part in any
     /// branch — but a fourth source that is permanently wrong is worse than one that is absent:
     /// people stop reading it, and then disbelieve it on the day it is right.
+    ///
+    /// The float is counted for the same reason, with a sharper failure mode: it is funded FROM
+    /// custody, so leaving it out means the first top-up reads as the reserve shrinking, and
+    /// reconciliation halts minting over money that never left.
+    ///
+    /// `float_address` is a separate parameter rather than another entry in `unswept_addresses` so a
+    /// failure reading it is attributed to the float, not misreported as a deposit problem.
     ///
     /// A failure on ANY address fails the whole sum. A partial total would understate the reserve
     /// and look exactly like a shortfall, which is the one direction a reserve figure must never
@@ -208,6 +273,7 @@ impl TronClient {
         &self,
         main_address: &str,
         unswept_addresses: &[String],
+        float_address: &str,
         usdt_contract: &str,
     ) -> Result<i64, String> {
         let mut total = self.get_custody_balance(main_address, usdt_contract).await?;
@@ -219,7 +285,11 @@ impl TronClient {
             // Saturating: a corrupt balance must not wrap the reserve into something small.
             total = total.saturating_add(bal);
         }
-        Ok(total)
+        let float = self
+            .get_custody_balance(float_address, usdt_contract)
+            .await
+            .map_err(|e| format!("payout float {float_address}: {e}"))?;
+        Ok(total.saturating_add(float))
     }
 
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {

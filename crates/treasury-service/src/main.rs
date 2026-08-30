@@ -1,5 +1,7 @@
 use treasury_service::api;
 use treasury_service::configuration::AppConfig;
+use treasury_service::payout;
+use treasury_service::tron_verifier::TronClient;
 
 /// How long to wait before retrying a FAILED reconciliation run. Deliberately far shorter than
 /// `reconciliation_interval_secs`: minting is blocked until a run succeeds, so a transient failure
@@ -170,18 +172,42 @@ async fn main() {
         });
     }
     {
-        // StubRail only — the real Tron rail is Plan C follow-on (docs/keys.md: the payout
-        // key doesn't exist yet). Same poll cadence as the mint outbox/watcher; no dedicated
-        // interval justified for a stub.
+        // Real TRC-20 payouts via tron-signer's /internal/payout, then an on-chain confirmation
+        // pass right after. Same poll cadence as the mint outbox/watcher; no dedicated interval
+        // justified here either.
+        //
+        // Confirmation runs immediately after drain, in the same tick, rather than waiting for the
+        // next interval: a payout submitted this pass gets its first confirmation check now instead
+        // of a full interval later. Nothing claims money moved until that leg confirms it on chain —
+        // a paid intent parks at `payout_submitted` with its `payout_ref` set until then.
         let pool = pool.clone();
-        let rail = treasury_service::payout::StubRail;
+        let payout_signer = payout::HttpPayoutSigner {
+            // 30s: tron-signer's own handler makes several sequential TronGrid round trips
+            // before it can answer at all (balance reads, building the transfer, sometimes a TRX
+            // top-up first), so this has to be generous enough that a slow-but-real chain of
+            // those doesn't masquerade as a timeout. A timeout here is indistinguishable from a
+            // broadcast that landed (see HttpPayoutSigner::pay's Ambiguous arm) and is treated
+            // exactly that conservatively, so it must also not be unbounded: confirm_payouts_once
+            // runs right after drain_once in this same loop tick, so a hung signer call would
+            // otherwise stall on-chain confirmation checks too, forever.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client builder"),
+            base_url: config.signer_url.clone(),
+            token: config.signer_token.clone(),
+        };
+        let tron_client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
-                match treasury_service::payout::drain_once(&pool, &rail).await {
+                match payout::drain_once(&pool, &cfg, &payout_signer).await {
                     Ok(n) if n > 0 => tracing::info!("payout: paid {} redemption(s)", n),
                     Ok(_) => {}
                     Err(e) => tracing::error!("payout drain failed: {}", e),
+                }
+                if let Err(e) = payout::confirm_payouts_once(&pool, &tron_client).await {
+                    tracing::error!("payout confirmation failed: {e}");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
             }

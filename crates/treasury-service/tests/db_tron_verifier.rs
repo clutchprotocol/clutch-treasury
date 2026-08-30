@@ -11,7 +11,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// THIS intent's own derived deposit address. Deposits no longer share one custody address, so the
@@ -28,6 +28,9 @@ const USDT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const REAL_MAIN: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
 const REAL_UNSWEPT_A: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
 const REAL_UNSWEPT_B: &str = "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx";
+/// The payout float's address — also genuinely valid base58check, since it goes through the same
+/// balanceOf/abi_encode_address path as the addresses above.
+const FLOAT: &str = "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY";
 
 async fn pool() -> PgPool {
     // Each test BINARY gets its own database. --test-threads=1 only serialises tests WITHIN a
@@ -68,6 +71,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         approver_token: "a".into(),
         readonly_token: "r".into(),
         daily_mint_cap_clt: 500_000_000,
+        daily_payout_cap_clt: 500_000_000,
         per_tx_mint_cap_clt: 50_000_000,
         backing_target_bps: 10_050,
         backing_halt_bps: 10_000,
@@ -78,6 +82,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         trongrid_url,
         trongrid_api_key: "test-trongrid-key".into(),
         custody_tron_address: DEPOSIT_ADDR.into(),
+        payout_float_address: "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY".into(),
         usdt_contract: USDT.into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,
@@ -176,6 +181,18 @@ async fn mount_balance_of(server: &MockServer, hex_word: &str) {
     Mock::given(method("POST"))
         .and(path("/wallet/triggerconstantcontract"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [hex_word]})))
+        .mount(server)
+        .await;
+}
+
+/// Mocks `POST /wallet/triggerconstantcontract` (balanceOf) so that only a request naming THIS
+/// `address` sees `amount` (micro-USDT) — unlike `mount_balance_of`'s blanket any-address stub,
+/// needed wherever two addresses must report two different balances within the same test.
+async fn mount_balance(server: &MockServer, address: &str, amount: i64) {
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains(address))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [format!("{amount:064x}")]})))
         .mount(server)
         .await;
 }
@@ -780,10 +797,12 @@ async fn reserve_status_reports_daily_headroom_that_shrinks_with_approved_mints(
     assert_eq!(after, 6_000_000, "headroom must shrink by exactly the approved mint's amount");
 }
 
-/// The reserve is a SUM once deposits sit on per-intent addresses.
+/// The reserve is a SUM across three buckets now: the main custody address, every unswept
+/// per-intent deposit address, and the payout float.
 ///
 /// Reading only the main treasury address reports a reserve near zero while unswept deposits sit
-/// elsewhere. That is not a halt risk — `judge` keys on the LEDGER's `custody_reported`, and
+/// elsewhere, and leaving the float out makes topping it up from custody look like the reserve
+/// shrinking. Neither is a halt risk — `judge` keys on the LEDGER's `custody_reported`, and
 /// `trongrid_balance` is a cross-check column that plays no part in any branch — but a fourth source
 /// that is permanently wrong is worse than one that is absent: people stop reading it, and then
 /// disbelieve it on the day it is right.
@@ -794,15 +813,15 @@ async fn reserve_balance_sums_the_main_address_and_every_unswept_deposit_address
     mount_balance_of(&server, "00000000000000000000000000000000000000000000000000000000000f4240").await;
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
 
-    let only_main = client.get_reserve_balance(REAL_MAIN, &[], USDT).await.unwrap();
-    assert_eq!(only_main, 1_000_000, "with nothing unswept the reserve is just the main address");
+    let only_main = client.get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT).await.unwrap();
+    assert_eq!(only_main, 2_000_000, "with nothing unswept the reserve is main + float");
 
-    // Three addresses now, each answering the same mocked balance.
+    // Four addresses now, each answering the same mocked balance.
     let with_unswept = client
-        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string(), REAL_UNSWEPT_B.to_string()], USDT)
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string(), REAL_UNSWEPT_B.to_string()], FLOAT, USDT)
         .await
         .unwrap();
-    assert_eq!(with_unswept, 3_000_000, "main + two unswept addresses must all be counted");
+    assert_eq!(with_unswept, 4_000_000, "main + two unswept addresses + float must all be counted");
 }
 
 /// A failure on ANY address must fail the whole sum. A partial total understates the reserve, which
@@ -813,8 +832,23 @@ async fn a_single_unreadable_address_fails_the_whole_reserve_sum() {
     // No balanceOf mock mounted at all, so the very first read fails.
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
     let err = client
-        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string()], USDT)
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string()], FLOAT, USDT)
         .await
         .expect_err("an unreadable address must not yield a partial total");
     assert!(!err.is_empty(), "the failure must be reported, not swallowed into a smaller number");
+}
+
+/// The trap this test guards: the float is funded FROM custody, so if it is not counted, the first
+/// top-up looks like custody shrinking and reconciliation reports a shortfall that halts minting.
+/// That is exactly the failure this task exists to prevent.
+#[tokio::test]
+async fn the_reserve_includes_the_payout_float() {
+    let server = MockServer::start().await;
+    mount_balance(&server, REAL_MAIN, 700).await;
+    mount_balance(&server, FLOAT, 300).await;
+
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+    let total = client.get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT).await.unwrap();
+
+    assert_eq!(total, 1000, "float USDT is reserve backing CLT, not spare money");
 }
