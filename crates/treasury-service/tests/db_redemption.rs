@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use sqlx::PgPool;
 use treasury_service::intents::create_redemption_intent;
 use treasury_service::payout::{self, HttpPayoutSigner, PayoutReply, PayoutSigner};
+use treasury_service::tron_verifier::TronClient;
 use treasury_service::watcher::confirm_burn;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -303,4 +304,39 @@ async fn payouts_stop_at_the_daily_cap() {
     payout::drain_once(&pool, &cfg, &signer).await.unwrap();
 
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1, "the second payout crosses the cap");
+}
+
+// --- confirm_payouts_once: on-chain confirmation before ledgering ---
+
+async fn mount_confirmed_tx(server: &MockServer, tx_id: &str) {
+    Mock::given(method("POST"))
+        .and(path("/walletsolidity/gettransactionbyid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "txID": tx_id })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn confirmation_writes_paid_and_the_ledger_event_once() {
+    let pool = pool().await;
+    let id = pending_redemption(&pool, 10_000_000).await;
+    sqlx::query("UPDATE redemption_intents SET status = 'payout_submitted', payout_ref = 'abc123' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+
+    let server = MockServer::start().await;
+    mount_confirmed_tx(&server, "abc123").await;
+    let client = TronClient::new(server.uri(), String::new());
+
+    payout::confirm_payouts_once(&pool, &client).await.unwrap();
+    // Twice: the ON CONFLICT must make a second pass a no-op, not a double ledger entry.
+    payout::confirm_payouts_once(&pool, &client).await.unwrap();
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "paid");
+
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(events, 1, "liability must drop exactly once");
 }

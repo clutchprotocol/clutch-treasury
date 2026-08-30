@@ -151,7 +151,7 @@ impl TronClient {
     /// waiting state that should surface as "not yet confirmed", while `Err` is reserved for our
     /// infrastructure failing. The caller maps both to `Transient`, but only one of them is worth
     /// alerting about.
-    async fn transaction_confirmed(&self, tx_id: &str) -> Result<bool, String> {
+    pub async fn transaction_confirmed(&self, tx_id: &str) -> Result<bool, String> {
         let url = format!("{}/walletsolidity/gettransactionbyid", self.base_url);
         let resp = self
             .http

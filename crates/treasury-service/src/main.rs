@@ -1,6 +1,7 @@
 use treasury_service::api;
 use treasury_service::configuration::AppConfig;
 use treasury_service::payout;
+use treasury_service::tron_verifier::TronClient;
 
 /// How long to wait before retrying a FAILED reconciliation run. Deliberately far shorter than
 /// `reconciliation_interval_secs`: minting is blocked until a run succeeds, so a transient failure
@@ -171,24 +172,29 @@ async fn main() {
         });
     }
     {
-        // Real TRC-20 payouts via tron-signer's /internal/payout. Same poll cadence as the mint
-        // outbox/watcher; no dedicated interval justified here either.
+        // Real TRC-20 payouts via tron-signer's /internal/payout, then an on-chain confirmation
+        // pass right after. Same poll cadence as the mint outbox/watcher; no dedicated interval
+        // justified here either.
         //
-        // Confirmation (chain-verifying a `Paid` reply and flipping the intent to `paid`) is not
-        // wired in yet — that pass does not exist in this codebase yet. Until it lands, a paid
-        // intent parks at `payout_submitted` with its `payout_ref` set, which is correct: nothing
-        // here claims money moved until that leg confirms it on chain.
+        // Confirmation runs immediately after drain, in the same tick, rather than waiting for the
+        // next interval: a payout submitted this pass gets its first confirmation check now instead
+        // of a full interval later. Nothing claims money moved until that leg confirms it on chain —
+        // a paid intent parks at `payout_submitted` with its `payout_ref` set until then.
         let pool = pool.clone();
         let payout_signer = payout::HttpPayoutSigner {
             http: reqwest::Client::new(),
             base_url: config.signer_url.clone(),
             token: config.signer_token.clone(),
         };
+        let tron_client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
                 if let Err(e) = payout::drain_once(&pool, &cfg, &payout_signer).await {
                     tracing::error!("payout drain failed: {e}");
+                }
+                if let Err(e) = payout::confirm_payouts_once(&pool, &tron_client).await {
+                    tracing::error!("payout confirmation failed: {e}");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
             }

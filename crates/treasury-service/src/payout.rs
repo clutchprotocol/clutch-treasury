@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::configuration::AppConfig;
 use crate::ledger::alert;
+use crate::tron_verifier::TronClient;
 
 /// What the signer reported for one payout.
 ///
@@ -193,6 +194,41 @@ pub async fn drain_once(
         }
     }
     Ok(processed)
+}
+
+/// Moves `payout_submitted` intents whose transfer is confirmed on chain to `paid`, writing the
+/// ledger event in the same transaction.
+///
+/// Separate from `drain_once` because submission and confirmation happen at different times: the
+/// transfer needs Tron confirmations, and holding a request open across them would stall the whole
+/// drain for one intent.
+///
+/// An intent with no `payout_ref` is skipped, never confirmed and never failed — that is the
+/// ambiguous state, and only a human puts a tx id on it or sends it back.
+pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<u32, String> {
+    let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(
+        "SELECT id, amount_clt, payout_ref FROM redemption_intents
+         WHERE status = 'payout_submitted' AND payout_ref IS NOT NULL ORDER BY updated_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut confirmed = 0u32;
+    for (intent_id, amount_clt, payout_ref) in rows {
+        match client.transaction_confirmed(&payout_ref).await {
+            Ok(true) => {
+                pay_intent(pool, intent_id, amount_clt, &payout_ref).await?;
+                confirmed += 1;
+            }
+            // Not yet mined. Nothing to do; the next pass looks again.
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(%intent_id, %payout_ref, "could not check payout confirmation: {e}");
+            }
+        }
+    }
+    Ok(confirmed)
 }
 
 /// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past
