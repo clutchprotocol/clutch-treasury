@@ -422,6 +422,13 @@ impl SweepClient {
             return Ok(PayoutOutcome::CapExceeded { limit_usdt: self.cfg.per_tx_payout_cap_usdt });
         }
 
+        // Beside the cap check and before ANY network call, for the same reason: a refusal must be
+        // provably a non-broadcast. Without this, a non-positive amount still reaches the balance
+        // reads and can trigger a real TRX funding broadcast before failing at transfer_parameter.
+        if amount_usdt <= 0 {
+            return Err(format!("payout amount must be positive, got {amount_usdt}"));
+        }
+
         let from = signer.payout_address()?;
 
         let have = self.usdt_balance(&from).await?;
@@ -563,6 +570,7 @@ mod tests {
 
     const RECIPIENT: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
     const USDT_FIXTURE: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+    const FLOAT_ADDR: &str = "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT";
 
     fn payout_test_config(cap: i64) -> SweepConfig {
         SweepConfig {
@@ -620,6 +628,14 @@ mod tests {
                 "a payout must never spend from deposit index {i}");
         }
         assert_eq!(body["contract_address"], USDT_FIXTURE, "the token comes from config, not the caller");
+    }
+
+    #[test]
+    fn payout_body_propagates_a_bad_parameter_instead_of_defaulting() {
+        // Guards the fix, not the helper: an empty transfer parameter is a transaction that looks
+        // built and moves nothing. sweep() propagates here; so must this.
+        let err = payout_body(FLOAT_ADDR, USDT_FIXTURE, "not-a-tron-address", 5, 150_000_000);
+        assert!(err.is_err(), "an undecodable recipient must propagate, not default to empty");
     }
 }
 
