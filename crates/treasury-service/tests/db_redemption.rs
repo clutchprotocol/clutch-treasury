@@ -448,7 +448,18 @@ async fn confirmation_writes_paid_and_the_ledger_event_once() {
     let client = TronClient::new(server.uri(), String::new());
 
     payout::confirm_payouts_once(&pool, &client).await.unwrap();
-    // Twice: the ON CONFLICT must make a second pass a no-op, not a double ledger entry.
+
+    // Force the one state where ON CONFLICT is load-bearing: put the intent back at
+    // payout_submitted (payout_ref and the ledger row already written stay untouched) so the
+    // second confirm_payouts_once pass re-selects it and calls pay_intent again for real. Without
+    // this reset the second pass's SELECT (`WHERE status = 'payout_submitted'`) would just return
+    // zero rows — proving the state filter works, not that a repeat pay_intent call is safe.
+    sqlx::query("UPDATE redemption_intents SET status = 'payout_submitted' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+
+    // This second call really does re-run pay_intent's INSERT for the same (intent_id, kind).
+    // uq_events_intent_kind (0001_init.sql) is the unique index the ON CONFLICT clause targets;
+    // delete that clause and this INSERT hits the index and errors instead of no-op'ing.
     payout::confirm_payouts_once(&pool, &client).await.unwrap();
 
     let (status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
