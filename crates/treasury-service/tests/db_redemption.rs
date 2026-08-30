@@ -306,6 +306,79 @@ async fn payouts_stop_at_the_daily_cap() {
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1, "the second payout crosses the cap");
 }
 
+/// Nothing caps a redemption's size at creation, so an intent larger than the cap is reachable.
+/// `ORDER BY created_at` means a naive "stop the pass once the cumulative total would cross the
+/// cap" check would `break` on this one forever and wedge every intent behind it in line.
+#[tokio::test]
+async fn an_over_cap_intent_is_skipped_and_does_not_block_smaller_ones() {
+    let pool = pool().await;
+    let mut cfg = config();
+    cfg.daily_payout_cap_clt = 5_000_000;
+    let stuck = pending_redemption(&pool, 10_000_000).await; // first in line, unpayable alone
+    let payable = pending_redemption(&pool, 1_000_000).await;
+    let signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "t".into() }, calls: AtomicUsize::new(0) };
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap(); // second pass: must not re-alert
+
+    let (stuck_status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(stuck).fetch_one(&pool).await.unwrap();
+    assert_eq!(stuck_status, "payout_pending", "unpayable under the current cap; left alone, not claimed");
+
+    let (payable_status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(payable).fetch_one(&pool).await.unwrap();
+    assert_eq!(payable_status, "payout_submitted", "must not be wedged behind the over-cap intent");
+
+    let (alerts,): (i64,) = sqlx::query_as("SELECT count(*) FROM alerts WHERE severity = 'p1' AND source = 'payout'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(alerts, 1, "one alert for the stuck intent, not one per pass");
+}
+
+#[tokio::test]
+async fn an_ambiguous_payout_counts_against_the_daily_cap() {
+    // Without this, an unknown-outcome payout would consume no budget and a single pass could
+    // send out more than the cap allows.
+    let pool = pool().await;
+    let mut cfg = config();
+    cfg.daily_payout_cap_clt = 15_000_000;
+    pending_redemption(&pool, 10_000_000).await;
+    pending_redemption(&pool, 10_000_000).await;
+    let signer = CountingSigner { reply: PayoutReply::Ambiguous("timeout".into()), calls: AtomicUsize::new(0) };
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1, "the ambiguous payout must spend budget too");
+}
+
+#[tokio::test]
+async fn the_daily_cap_window_ignores_a_stale_claim_even_after_it_is_touched_again() {
+    // Regression for keying the window on `updated_at`: a later write (exactly what
+    // confirm_payouts_once's `paid` flip does) must not re-enter an old claim into today's budget.
+    let pool = pool().await;
+    let mut cfg = config();
+    cfg.daily_payout_cap_clt = 10_000_000;
+
+    let old = pending_redemption(&pool, 10_000_000).await;
+    let old_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "old-tx".into() }, calls: AtomicUsize::new(0) };
+    payout::drain_once(&pool, &cfg, &old_signer).await.unwrap();
+
+    sqlx::query(
+        "UPDATE redemption_intents SET payout_submitted_at = now() - interval '30 hours', updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(old)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pending_redemption(&pool, 10_000_000).await;
+    let new_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "new-tx".into() }, calls: AtomicUsize::new(0) };
+    payout::drain_once(&pool, &cfg, &new_signer).await.unwrap();
+
+    assert_eq!(new_signer.calls.load(Ordering::SeqCst), 1,
+        "a 30h-old claim must not count against today's budget just because something touched updated_at");
+}
+
 // --- confirm_payouts_once: on-chain confirmation before ledgering ---
 
 async fn mount_confirmed_tx(server: &MockServer, tx_id: &str) {

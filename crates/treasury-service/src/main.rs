@@ -190,8 +190,10 @@ async fn main() {
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = payout::drain_once(&pool, &cfg, &payout_signer).await {
-                    tracing::error!("payout drain failed: {e}");
+                match payout::drain_once(&pool, &cfg, &payout_signer).await {
+                    Ok(n) if n > 0 => tracing::info!("payout: paid {} redemption(s)", n),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("payout drain failed: {}", e),
                 }
                 if let Err(e) = payout::confirm_payouts_once(&pool, &tron_client).await {
                     tracing::error!("payout confirmation failed: {e}");

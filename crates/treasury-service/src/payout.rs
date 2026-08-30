@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -93,6 +96,24 @@ impl PayoutSigner for HttpPayoutSigner {
     }
 }
 
+/// IDs already P1-alerted for exceeding the daily cap on their own. Same shape as outbox.rs's
+/// `STALE_ALERTED`: de-duplicates a live condition rather than recording anything, so a restart
+/// re-alerting is correct and expected, not a bug to fix.
+///
+/// Unlike `STALE_ALERTED` this never needs to clear mid-process: `daily_payout_cap_clt` is loaded
+/// once at startup and never changes while this process runs, so an intent that exceeds it keeps
+/// exceeding it for the rest of this process's life. The only way an id stops mattering is leaving
+/// `payout_pending` entirely, and a handful of stale UUIDs sitting unused in this set forever costs
+/// nothing worth guarding against.
+///
+/// `HashSet::new()` needs `RandomState`'s runtime entropy, so it cannot seed a `static` directly
+/// the way `AtomicBool::new(false)` can — `OnceLock` is this codebase's existing answer to that
+/// (see `test_deriver` in payment-orchestrator's db_bridge.rs).
+fn over_cap_alerted() -> &'static Mutex<HashSet<Uuid>> {
+    static ALERTED: std::sync::OnceLock<Mutex<HashSet<Uuid>>> = std::sync::OnceLock::new();
+    ALERTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 /// Pays each due `payout_pending` intent against its ALREADY-CONFIRMED burn.
 ///
 /// Burn first, payout second, always — `watcher::confirm_burn` is the sole path into
@@ -106,6 +127,11 @@ impl PayoutSigner for HttpPayoutSigner {
 /// reply that PROVES no broadcast returns it to `payout_pending`. Everything else stays claimed and
 /// alerts: orphaning a burn is the one outcome this function must never produce, and paying one
 /// burn twice is the mirror-image sin.
+///
+/// Every write between "claimed" and "outcome recorded" alerts on failure instead of propagating
+/// `?`. A `?` there would abort the whole pass and leave THIS intent claimed with nobody told —
+/// an orphan by omission, exactly as bad as one by crash. Only the breaker read and the initial
+/// SELECT still propagate: nothing is claimed yet at that point, so there is nothing to lose.
 pub async fn drain_once(
     pool: &PgPool,
     config: &AppConfig,
@@ -133,6 +159,21 @@ pub async fn drain_once(
     let mut processed = 0u32;
 
     for (intent_id, payout_address, amount_clt) in rows {
+        // Unpayable under the current cap, permanently — nothing in this codebase caps a
+        // redemption's size at creation. Checked BEFORE the cumulative test below: without this,
+        // `ORDER BY created_at` would let one such intent `break` the pass forever and wedge every
+        // intent behind it in line. Skip it instead; it consumes no budget and blocks nobody.
+        if amount_clt > config.daily_payout_cap_clt {
+            if over_cap_alerted().lock().unwrap().insert(intent_id) {
+                alert(pool, "p1", "payout", &format!(
+                    "redemption {intent_id}: amount {amount_clt} (CLT base units) alone exceeds \
+                     daily_payout_cap_clt ({cap}); it can never be paid under the current cap and \
+                     will not block any other intent. Raise the cap or resolve this intent by hand.",
+                    cap = config.daily_payout_cap_clt
+                )).await;
+            }
+            continue;
+        }
         if day_total + amount_clt > config.daily_payout_cap_clt {
             tracing::warn!(%intent_id, day_total, cap = config.daily_payout_cap_clt,
                 "daily payout cap reached; remaining intents wait for the window to roll");
@@ -141,28 +182,61 @@ pub async fn drain_once(
 
         // CLAIM FIRST. Committed before the call, so a crash between here and the reply is
         // indistinguishable from a lost response — which is correct, because it is one.
-        let claimed = sqlx::query(
-            "UPDATE redemption_intents SET status = 'payout_submitted', updated_at = now()
-             WHERE id = $1 AND status = 'payout_pending'",
+        let claimed: Option<(chrono::DateTime<chrono::Utc>,)> = match sqlx::query_as(
+            "UPDATE redemption_intents SET status = 'payout_submitted', payout_submitted_at = now(),
+                 updated_at = now()
+             WHERE id = $1 AND status = 'payout_pending'
+             RETURNING payout_submitted_at",
         )
         .bind(intent_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
-        .map_err(|e| e.to_string())?;
-        if claimed.rows_affected() == 0 {
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // The UPDATE can commit server-side with only the acknowledgement lost
+                // (connection reset, failover) — indistinguishable here from a clean failure.
+                // Bailing the whole pass via `?` would silently orphan this intent if it did
+                // commit: claimed, signer never called, nobody told. Alert and move on instead —
+                // the rest of the pass is unaffected.
+                alert(pool, "p1", "payout", &format!(
+                    "redemption {intent_id}: claim UPDATE errored ({e}). If it committed anyway \
+                     this intent is now payout_submitted with no signer call made — check its \
+                     status and payout_ref before assuming it is untouched."
+                )).await;
+                continue;
+            }
+        };
+        let claimed_at = match claimed {
+            Some((t,)) => t,
             // Another worker took it between the SELECT and here.
-            continue;
-        }
+            None => continue,
+        };
 
         // 1:1 CLT<->USDT base units at par — spread/fee modelling is an orchestrator concern.
         match signer.pay(intent_id, &payout_address, amount_clt).await {
             PayoutReply::Paid { tx_id } => {
-                sqlx::query("UPDATE redemption_intents SET payout_ref = $2, updated_at = now() WHERE id = $1")
-                    .bind(intent_id)
-                    .bind(&tx_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if let Err(e) = sqlx::query(
+                    "UPDATE redemption_intents SET payout_ref = $2, updated_at = now() WHERE id = $1",
+                )
+                .bind(intent_id)
+                .bind(&tx_id)
+                .execute(pool)
+                .await
+                {
+                    // Money already left the float. tx_id is the ONLY record of which transfer
+                    // paid this burn — confirm_payouts_once finds it solely by payout_ref — so
+                    // losing this write loses that link entirely. It goes into the alert
+                    // (`alert` does a tracing::error! before its own insert, so the tx id
+                    // survives even if the alerts-table write also fails) rather than through
+                    // `?`, which would discard tx_id outright.
+                    alert(pool, "p1", "payout", &format!(
+                        "redemption {intent_id}: signer paid tx {tx_id} but recording payout_ref \
+                         failed ({e}). The transfer already happened — find {tx_id} on chain and \
+                         set payout_ref by hand, or confirm_payouts_once can never find it."
+                    )).await;
+                    continue;
+                }
                 day_total += amount_clt;
                 processed += 1;
             }
@@ -171,24 +245,42 @@ pub async fn drain_once(
             | PayoutReply::CapExceeded { .. }
             | PayoutReply::NeedsTrx
             | PayoutReply::Refused(_)) => {
-                sqlx::query(
-                    "UPDATE redemption_intents SET status = 'payout_pending', updated_at = now() WHERE id = $1",
+                if let Err(e) = sqlx::query(
+                    "UPDATE redemption_intents SET status = 'payout_pending', updated_at = now()
+                     WHERE id = $1 AND status = 'payout_submitted'",
                 )
                 .bind(intent_id)
                 .execute(pool)
                 .await
-                .map_err(|e| e.to_string())?;
+                {
+                    // Same reasoning as the claim-write failure above: `?` here would abandon a
+                    // proven-safe-to-retry intent claimed with nobody told, which is strictly
+                    // worse than the state it already looks like (indistinguishable from
+                    // Ambiguous to anyone who does not read this log).
+                    alert(pool, "p1", "payout", &format!(
+                        "redemption {intent_id}: signer proved no broadcast ({reply:?}) but \
+                         returning it to payout_pending failed ({e}). It carries no payout_ref, \
+                         so it is safe to move back to payout_pending by hand."
+                    )).await;
+                    continue;
+                }
                 alert(pool, "p1", "payout",
                     &format!("redemption {intent_id}: payout refused ({reply:?}), returned to payout_pending")).await;
             }
             // May or may not have broadcast. Stays claimed, forever, until a human resolves it.
             PayoutReply::Ambiguous(msg) => {
+                // Counts against today's budget: it might have spent real float capacity, and
+                // daily_payout_total counts every payout_submitted row as spent from the next
+                // pass onward regardless — this just makes the CURRENT pass agree with that.
+                day_total += amount_clt;
                 alert(pool, "p1", "payout", &format!(
-                    "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted and \
-                     NOT retried — retrying could pay this burn twice. Check the payout float's \
-                     outbound transfers for a transfer of {amount_clt} to {payout_address}, then \
-                     either set payout_ref to that tx and let confirmation finish it, or return the \
-                     intent to payout_pending."
+                    "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted \
+                     and NOT retried — retrying could pay this burn twice. Claimed at {claimed_at}: \
+                     check the payout float ({float}) for an outbound USDT transfer of {amount_clt} \
+                     (CLT base units, 1:1 par) to {payout_address} around that time. Found it? Set \
+                     payout_ref to that tx hash — confirm_payouts_once will pick it up from there. \
+                     Found nothing? Return the intent to payout_pending by hand.",
+                    float = config.payout_float_address
                 )).await;
             }
         }
@@ -232,13 +324,21 @@ pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<
 }
 
 /// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past
-/// submission, mirroring `breakers::daily_mint_total` — an in-flight payout is spent budget.
+/// submission — an in-flight payout is spent budget — keyed on `payout_submitted_at`, the moment
+/// each claim happened.
+///
+/// NOT `updated_at`, which is wrong in both directions: `pay_intent`'s later confirmation write
+/// touches it too, so a day-old payout re-enters TODAY's budget the instant it confirms; an
+/// `Ambiguous` row that nothing ever touches again just sits at its claim time and ages out of the
+/// window despite possibly having spent real float capacity. `payout_submitted_at` is set once, by
+/// the claim UPDATE below, and never again — genuinely immutable, which is what actually mirrors
+/// how `breakers::daily_mint_total` keys its window on `mint_intents.created_at`.
 async fn daily_payout_total(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let (total,): (i64,) = sqlx::query_as(
         // ::BIGINT — SUM(BIGINT) is NUMERIC, sqlx can't decode that into i64.
         "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM redemption_intents
          WHERE status IN ('payout_submitted','paid')
-           AND updated_at > now() - interval '24 hours'",
+           AND payout_submitted_at > now() - interval '24 hours'",
     )
     .fetch_one(pool)
     .await?;
