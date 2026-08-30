@@ -115,6 +115,30 @@ pub enum PayoutOutcome {
     NeedsTrx { tx_id: String, amount_sun: i64 },
 }
 
+/// The wire form of a payout outcome.
+///
+/// Separate from the handler so the status strings are testable without an HTTP rig. These
+/// literals are a contract with treasury-service's `HttpPayoutSigner`: it matches on them exactly,
+/// and anything it does not recognise it must treat as "may have broadcast" — so a typo here does
+/// not fail loudly, it parks every redemption as ambiguous and waits for a human.
+pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
+    match outcome {
+        PayoutOutcome::Paid { tx_id } => serde_json::json!({"status": "paid", "tx_id": tx_id}),
+        PayoutOutcome::CapExceeded { limit_usdt } => {
+            serde_json::json!({"status": "cap_exceeded", "limit_usdt": limit_usdt})
+        }
+        PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => serde_json::json!({
+            "status": "float_dry",
+            "float_address": float_address,
+            "have_usdt": have_usdt,
+            "need_usdt": need_usdt,
+        }),
+        PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
+            serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
+        }
+    }
+}
+
 /// The body for a native TRX transfer from the fee account to a deposit address.
 ///
 /// Separate from the call so the argument order is testable. `owner_address` pays and `to_address`
@@ -636,6 +660,31 @@ mod tests {
         // built and moves nothing. sweep() propagates here; so must this.
         let err = payout_body(FLOAT_ADDR, USDT_FIXTURE, "not-a-tron-address", 5, 150_000_000);
         assert!(err.is_err(), "an undecodable recipient must propagate, not default to empty");
+    }
+
+    #[test]
+    fn every_payout_status_string_is_pinned() {
+        // These four literals are the contract with treasury-service's HttpPayoutSigner. A typo
+        // does not fail loudly on either side: the treasury treats an unrecognised status as
+        // "may have broadcast" and parks the redemption for a human, forever.
+        assert_eq!(payout_response(&PayoutOutcome::Paid { tx_id: "t".into() })["status"], "paid");
+        assert_eq!(payout_response(&PayoutOutcome::CapExceeded { limit_usdt: 1 })["status"], "cap_exceeded");
+        assert_eq!(
+            payout_response(&PayoutOutcome::FloatDry { float_address: "a".into(), have_usdt: 0, need_usdt: 1 })["status"],
+            "float_dry"
+        );
+        assert_eq!(
+            payout_response(&PayoutOutcome::NeedsTrx { tx_id: "t".into(), amount_sun: 1 })["status"],
+            "needs_trx"
+        );
+    }
+
+    #[test]
+    fn a_paid_response_always_carries_its_tx_id() {
+        // The treasury refuses to record a payout it cannot point at on chain, so a `paid` reply
+        // without a tx_id becomes Ambiguous and parks the intent. Cheap to guarantee here.
+        let v = payout_response(&PayoutOutcome::Paid { tx_id: "abc123".into() });
+        assert_eq!(v["tx_id"], "abc123");
     }
 }
 

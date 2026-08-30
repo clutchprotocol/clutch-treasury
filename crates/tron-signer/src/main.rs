@@ -1,11 +1,12 @@
 //! The signer's HTTP surface.
 //!
-//! Two routes, and the shape of the sweep route IS the security argument: it accepts an INDEX and
-//! nothing else. Destination, token and amount all come from this service's own config and on-chain
-//! state, so there is no field a caller can set to redirect funds. See `sweep.rs`.
+//! Three routes. The sweep route's shape IS its security argument: it accepts an INDEX and nothing
+//! else, so no field a caller sets can redirect funds.
 //!
-//! Runs on an `internal: true` network with no published ports, same posture as treasury-service.
-//! The bearer token is defence in depth, not the thing the design rests on.
+//! The payout route cannot make that claim and does not pretend to — it takes a destination and an
+//! amount because a redemption has no other way to express them. Its bound is different: the source
+//! is always the payout float, so the most a hostile caller moves is the float balance, and the
+//! per-tx cap bounds a single request. Here the bearer token is load-bearing, not defence in depth.
 
 use std::sync::Arc;
 
@@ -18,7 +19,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
-use tron_signer::sweep::{validate_payout_cap, SweepClient, SweepConfig, SweepOutcome};
+use tron_signer::sweep::{
+    payout_response, validate_payout_cap, PayoutOutcome, SweepClient, SweepConfig, SweepOutcome,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -80,6 +83,19 @@ struct SweepRequest {
     index: u32,
 }
 
+/// Unlike `SweepRequest` this DOES carry a destination and an amount, because a payout has no other
+/// way to know them. What it does NOT carry is a contract or a source: the token is config and the
+/// source is always the float. See the spec before widening this.
+///
+/// `intent_id` is not used for signing. It is logged so a broadcast can be tied back to the
+/// redemption that caused it — which is the only way to resolve an ambiguous payout later.
+#[derive(Deserialize)]
+struct PayoutRequest {
+    intent_id: String,
+    to: String,
+    amount_usdt: i64,
+}
+
 async fn sweep(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -106,6 +122,33 @@ async fn sweep(
         }))),
         Err(e) => {
             tracing::error!("sweep of index {} failed: {e}", req.index);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn payout(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PayoutRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    if req.amount_usdt <= 0 {
+        tracing::warn!(intent_id = %req.intent_id, "payout refused: non-positive amount");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match s.sweeper.payout(&s.signer, &req.to, req.amount_usdt).await {
+        Ok(outcome) => {
+            match &outcome {
+                PayoutOutcome::Paid { tx_id } => tracing::info!(intent_id = %req.intent_id, to = %req.to, amount_usdt = req.amount_usdt, %tx_id, "paid"),
+                PayoutOutcome::CapExceeded { limit_usdt } => tracing::warn!(intent_id = %req.intent_id, amount_usdt = req.amount_usdt, limit_usdt, "payout over cap"),
+                PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => tracing::warn!(intent_id = %req.intent_id, %float_address, have_usdt, need_usdt, "payout float dry"),
+                PayoutOutcome::NeedsTrx { tx_id, amount_sun } => tracing::info!(intent_id = %req.intent_id, %tx_id, amount_sun, "funded the payout float with TRX"),
+            }
+            Ok(Json(payout_response(&outcome)))
+        }
+        Err(e) => {
+            tracing::error!(intent_id = %req.intent_id, "payout failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -140,6 +183,7 @@ async fn main() {
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/internal/xpub", get(xpub))
         .route("/internal/sweep", post(sweep))
+        .route("/internal/payout", post(payout))
         .with_state(state);
 
     let addr = std::env::var("APP_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8093".into());
