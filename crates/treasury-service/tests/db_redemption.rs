@@ -379,6 +379,53 @@ async fn the_daily_cap_window_ignores_a_stale_claim_even_after_it_is_touched_aga
         "a 30h-old claim must not count against today's budget just because something touched updated_at");
 }
 
+/// Forces a REAL sqlx error on the Paid arm's payout_ref write (a temporary CHECK constraint
+/// forbidding any non-null payout_ref), rather than reasoning about the failure path by
+/// inspection only. Covers the one branch where money has already moved: the alert must carry
+/// the tx_id verbatim, and the pass must keep going rather than abort on the first failure — the
+/// "claim committed but the ack was lost" variant needs no separate test, since it is the same
+/// straight-line alert-and-continue handler on the claim UPDATE just above this one.
+#[tokio::test]
+async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_going() {
+    let pool = pool().await;
+    let a = pending_redemption(&pool, 1_000_000).await;
+    let b = pending_redemption(&pool, 1_000_000).await;
+    let signer = CountingSigner {
+        reply: PayoutReply::Paid { tx_id: "constrained-tx".into() },
+        calls: AtomicUsize::new(0),
+    };
+
+    // Self-healing in case a previous run of this test panicked before reaching its own DROP.
+    sqlx::query("ALTER TABLE redemption_intents DROP CONSTRAINT IF EXISTS tmp")
+        .execute(&pool).await.unwrap();
+    sqlx::query("ALTER TABLE redemption_intents ADD CONSTRAINT tmp CHECK (payout_ref IS NULL)")
+        .execute(&pool).await.unwrap();
+
+    let result = payout::drain_once(&pool, &config(), &signer).await;
+
+    // Drop the constraint BEFORE asserting anything: a failed assertion below must not leave a
+    // table-wide constraint behind for every later test in this binary to trip over.
+    sqlx::query("ALTER TABLE redemption_intents DROP CONSTRAINT tmp").execute(&pool).await.unwrap();
+
+    result.unwrap();
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 2,
+        "the second intent must still be attempted — one bad write must not abort the pass");
+
+    for id in [a, b] {
+        let (status, payout_ref): (String, Option<String>) =
+            sqlx::query_as("SELECT status, payout_ref FROM redemption_intents WHERE id = $1")
+                .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "payout_submitted", "claimed, then stuck there when the write that would advance it further failed");
+        assert_eq!(payout_ref, None, "the CHECK-violating write must not have applied");
+    }
+
+    let (alerted,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM alerts WHERE severity = 'p1' AND source = 'payout' \
+         AND message LIKE '%constrained-tx%')")
+        .fetch_one(&pool).await.unwrap();
+    assert!(alerted, "the alert must carry the tx_id verbatim — it is the only link to money that already moved");
+}
+
 // --- confirm_payouts_once: on-chain confirmation before ledgering ---
 
 async fn mount_confirmed_tx(server: &MockServer, tx_id: &str) {

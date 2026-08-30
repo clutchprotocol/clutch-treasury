@@ -130,8 +130,9 @@ fn over_cap_alerted() -> &'static Mutex<HashSet<Uuid>> {
 ///
 /// Every write between "claimed" and "outcome recorded" alerts on failure instead of propagating
 /// `?`. A `?` there would abort the whole pass and leave THIS intent claimed with nobody told —
-/// an orphan by omission, exactly as bad as one by crash. Only the breaker read and the initial
-/// SELECT still propagate: nothing is claimed yet at that point, so there is nothing to lose.
+/// an orphan by omission, exactly as bad as one by crash. Only the breaker read, the initial
+/// SELECT, and the `daily_payout_total` read still propagate via `?`: nothing is claimed yet at
+/// that point, so there is nothing to lose.
 pub async fn drain_once(
     pool: &PgPool,
     config: &AppConfig,
@@ -216,6 +217,11 @@ pub async fn drain_once(
         // 1:1 CLT<->USDT base units at par — spread/fee modelling is an orchestrator concern.
         match signer.pay(intent_id, &payout_address, amount_clt).await {
             PayoutReply::Paid { tx_id } => {
+                // Charge the budget now, before the write below can fail: the float has already
+                // paid out either way, same as the Ambiguous arm's identical reasoning. Charging
+                // it only after a successful write undercounts today's spend by exactly the
+                // amount that just left through a bookkeeping failure.
+                day_total += amount_clt;
                 if let Err(e) = sqlx::query(
                     "UPDATE redemption_intents SET payout_ref = $2, updated_at = now() WHERE id = $1",
                 )
@@ -237,7 +243,6 @@ pub async fn drain_once(
                     )).await;
                     continue;
                 }
-                day_total += amount_clt;
                 processed += 1;
             }
             // Proven non-broadcast: hand it back for a later pass.
@@ -330,9 +335,12 @@ pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<
 /// NOT `updated_at`, which is wrong in both directions: `pay_intent`'s later confirmation write
 /// touches it too, so a day-old payout re-enters TODAY's budget the instant it confirms; an
 /// `Ambiguous` row that nothing ever touches again just sits at its claim time and ages out of the
-/// window despite possibly having spent real float capacity. `payout_submitted_at` is set once, by
-/// the claim UPDATE below, and never again — genuinely immutable, which is what actually mirrors
-/// how `breakers::daily_mint_total` keys its window on `mint_intents.created_at`.
+/// window despite possibly having spent real float capacity. `payout_submitted_at` is set by the
+/// claim UPDATE below and touched by nothing else — confirmation and an Ambiguous outcome both
+/// leave it alone. (A refused intent later RE-claimed on a subsequent pass DOES get re-stamped —
+/// correctly: a new claim spends new budget, not the same claim again.) What actually mirrors how
+/// `breakers::daily_mint_total` keys its window on `mint_intents.created_at` is that no write
+/// other than the claim itself ever moves it.
 async fn daily_payout_total(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let (total,): (i64,) = sqlx::query_as(
         // ::BIGINT — SUM(BIGINT) is NUMERIC, sqlx can't decode that into i64.
