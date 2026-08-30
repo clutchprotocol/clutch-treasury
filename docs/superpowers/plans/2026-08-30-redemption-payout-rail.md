@@ -19,7 +19,7 @@
 - Per-tx cap lives in `tron-signer`, denominated in **micro-USDT**. Rolling 24h cap lives in `treasury-service`, denominated in **CLT base units**. They are numerically equal at 1:1 par but are different units and **must not be configured from a shared value**.
 - An **ambiguous** signer result (timeout, transport failure, unclassifiable 5xx) leaves the intent `payout_submitted` and raises P1. **Never auto-retry it.**
 - The float **must** be counted in `get_reserve_balance`, or the first top-up from custody reads as a shortfall and trips the breaker.
-- Test command for anything touching Postgres: `docker compose -f docker-compose.test.yml run --rm test cargo test --workspace -- --test-threads=1`
+- **Verification runs in CI, never on this machine.** This machine has no working linker and no Docker daemon. Implementers must NOT run `cargo`. The controller pushes the branch and dispatches `gh workflow run test.yml --ref feat/redemption-payout-rail` on clutchprotocol/clutch-treasury, which runs `cargo test --workspace -- --test-threads=1` with a Postgres service. A branch push builds no image and triggers no stage deploy (`docker-build-push.yml` is main/tags only).
 
 ---
 
@@ -537,12 +537,96 @@ Add `PayoutOutcome` to the `tron_signer::sweep::{..}` import list, and add the r
 //! per-tx cap bounds a single request. Here the bearer token is load-bearing, not defence in depth.
 ```
 
-- [ ] **Step 5: Verify it builds**
+- [ ] **Step 5: Extract the response mapping and test it**
 
-Run: `cargo test -p tron-signer`
-Expected: PASS, compiles clean
+The handler's status strings are a contract: Task 6's `HttpPayoutSigner` parses these exact
+literals, and a mismatch between the two sides breaks payouts silently — the treasury would read
+every reply as an unrecognised status and park intents as `Ambiguous` forever. Nothing in an HTTP
+handler is unit-testable here (this crate has no dev-dependencies and no HTTP test rig), so extract
+the mapping the same way `payout_body` and `funding_body` were extracted, and pin it.
 
-- [ ] **Step 6: Commit**
+In `crates/tron-signer/src/sweep.rs`:
+
+```rust
+/// The wire form of a payout outcome.
+///
+/// Separate from the handler so the status strings are testable without an HTTP rig. These
+/// literals are a contract with treasury-service's `HttpPayoutSigner`: it matches on them exactly,
+/// and anything it does not recognise it must treat as "may have broadcast" — so a typo here does
+/// not fail loudly, it parks every redemption as ambiguous and waits for a human.
+pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
+    match outcome {
+        PayoutOutcome::Paid { tx_id } => serde_json::json!({"status": "paid", "tx_id": tx_id}),
+        PayoutOutcome::CapExceeded { limit_usdt } => {
+            serde_json::json!({"status": "cap_exceeded", "limit_usdt": limit_usdt})
+        }
+        PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => serde_json::json!({
+            "status": "float_dry",
+            "float_address": float_address,
+            "have_usdt": have_usdt,
+            "need_usdt": need_usdt,
+        }),
+        PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
+            serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
+        }
+    }
+}
+```
+
+Rewrite the handler's `Ok(..)` arms to call it, keeping the `tracing` lines:
+
+```rust
+    match s.sweeper.payout(&s.signer, &req.to, req.amount_usdt).await {
+        Ok(outcome) => {
+            match &outcome {
+                PayoutOutcome::Paid { tx_id } => tracing::info!(intent_id = %req.intent_id, to = %req.to, amount_usdt = req.amount_usdt, %tx_id, "paid"),
+                PayoutOutcome::CapExceeded { limit_usdt } => tracing::warn!(intent_id = %req.intent_id, amount_usdt = req.amount_usdt, limit_usdt, "payout over cap"),
+                PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => tracing::warn!(intent_id = %req.intent_id, %float_address, have_usdt, need_usdt, "payout float dry"),
+                PayoutOutcome::NeedsTrx { tx_id, amount_sun } => tracing::info!(intent_id = %req.intent_id, %tx_id, amount_sun, "funded the payout float with TRX"),
+            }
+            Ok(Json(payout_response(&outcome)))
+        }
+        Err(e) => {
+            tracing::error!(intent_id = %req.intent_id, "payout failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+```
+
+Then pin every literal, in `sweep.rs`'s test module:
+
+```rust
+    #[test]
+    fn every_payout_status_string_is_pinned() {
+        // These four literals are the contract with treasury-service's HttpPayoutSigner. A typo
+        // does not fail loudly on either side: the treasury treats an unrecognised status as
+        // "may have broadcast" and parks the redemption for a human, forever.
+        assert_eq!(payout_response(&PayoutOutcome::Paid { tx_id: "t".into() })["status"], "paid");
+        assert_eq!(payout_response(&PayoutOutcome::CapExceeded { limit_usdt: 1 })["status"], "cap_exceeded");
+        assert_eq!(
+            payout_response(&PayoutOutcome::FloatDry { float_address: "a".into(), have_usdt: 0, need_usdt: 1 })["status"],
+            "float_dry"
+        );
+        assert_eq!(
+            payout_response(&PayoutOutcome::NeedsTrx { tx_id: "t".into(), amount_sun: 1 })["status"],
+            "needs_trx"
+        );
+    }
+
+    #[test]
+    fn a_paid_response_always_carries_its_tx_id() {
+        // The treasury refuses to record a payout it cannot point at on chain, so a `paid` reply
+        // without a tx_id becomes Ambiguous and parks the intent. Cheap to guarantee here.
+        let v = payout_response(&PayoutOutcome::Paid { tx_id: "abc123".into() });
+        assert_eq!(v["tx_id"], "abc123");
+    }
+```
+
+- [ ] **Step 6: Verify it builds**
+
+Verification runs in CI, not on this machine — see the note in Global Constraints.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/tron-signer/src/main.rs
@@ -726,19 +810,95 @@ git commit -m "fix(treasury): count the payout float as reserve"
 
 In `crates/treasury-service/tests/db_redemption.rs`:
 
+Test the CLASSIFICATION, not the enum. Two different variants being unequal is a property of the
+derived `PartialEq`, not of this design — a test asserting it would pass against an
+`HttpPayoutSigner` that classified every single reply as `Refused`, which is precisely the bug that
+double-pays a burn. What must be pinned is which HTTP outcome maps to which variant.
+
 ```rust
-#[test]
-fn refused_and_ambiguous_are_distinct_variants() {
-    // The whole safety property of this rail rests on these two never collapsing into one type.
-    // Refused means provably no broadcast and is retryable; Ambiguous means unknown and must never
-    // be retried automatically.
-    let refused = PayoutReply::Refused("cap_exceeded".into());
-    let ambiguous = PayoutReply::Ambiguous("timeout".into());
-    assert_ne!(refused, ambiguous);
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn signer_replying(status: u16, body: serde_json::Value) -> (MockServer, HttpPayoutSigner) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/payout"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    let signer = HttpPayoutSigner {
+        http: reqwest::Client::new(),
+        base_url: server.uri(),
+        token: "t".into(),
+    };
+    (server, signer)
+}
+
+#[tokio::test]
+async fn a_paid_reply_with_a_tx_id_is_paid() {
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "paid", "tx_id": "abc"})).await;
+    assert_eq!(
+        signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await,
+        PayoutReply::Paid { tx_id: "abc".into() }
+    );
+}
+
+#[tokio::test]
+async fn a_paid_reply_without_a_tx_id_is_ambiguous_not_paid() {
+    // It claimed success but cannot name the transaction. It may well have broadcast, so this must
+    // NOT be retried — treating it as a plain failure is how a burn gets paid twice.
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "paid"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_400_is_refused_because_the_signer_rejected_the_shape() {
+    // The one status that proves nothing was broadcast: the signer refused the request itself.
+    let (_s, signer) = signer_replying(400, serde_json::json!({"error": "bad"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Refused(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_500_is_ambiguous_not_refused() {
+    // A 500 can follow a broadcast that then failed to report. Classifying it Refused would make
+    // it retryable, and the retry would pay the same burn again.
+    let (_s, signer) = signer_replying(500, serde_json::json!({"error": "boom"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn an_unrecognised_status_is_ambiguous() {
+    // A newer signer may describe a broadcast this version does not understand. Never Refused.
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "teleported"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_float_dry_reply_is_refused_and_carries_its_numbers() {
+    let (_s, signer) = signer_replying(200, serde_json::json!({
+        "status": "float_dry", "float_address": "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT",
+        "have_usdt": 0, "need_usdt": 5,
+    })).await;
+    assert_eq!(
+        signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await,
+        PayoutReply::FloatDry {
+            float_address: "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT".into(),
+            have_usdt: 0,
+            need_usdt: 5,
+        }
+    );
 }
 ```
 
-Add `use treasury_service::payout::PayoutReply;` to the file's imports.
+The status literals above must match `payout_response` in `crates/tron-signer/src/sweep.rs`
+exactly — Task 3 pins them on the producing side, and these pin the consuming side.
+
+Add `use treasury_service::payout::{HttpPayoutSigner, PayoutReply, PayoutSigner};` and
+`use uuid::Uuid;` to the file's imports.
 
 - [ ] **Step 2: Run test to verify it fails**
 
