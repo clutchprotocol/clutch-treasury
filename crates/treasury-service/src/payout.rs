@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::configuration::AppConfig;
 use crate::ledger::alert;
 
 /// What the signer reported for one payout.
@@ -91,40 +92,24 @@ impl PayoutSigner for HttpPayoutSigner {
     }
 }
 
-/// Boundary for the outbound USDT leg. `StubRail` is the only implementor today; the real
-/// Tron TRC-20 rail (transaction construction, a hot payout key in KMS, TRX energy costs)
-/// is Plan C follow-on research, not this task. Kept as a trait anyway — same migration-path
-/// reasoning as `ChainSigner` in clutch-chain: one implementor now, a swappable seam later.
-/// See docs/keys.md — the payout key is a THIRD key, distinct from mint and from custody,
-/// and does not exist yet.
-#[async_trait::async_trait]
-pub trait PayoutRail: Send + Sync {
-    async fn send_usdt(&self, to_address: &str, amount_usdt: i64) -> Result<String, String>;
-}
-
-pub struct StubRail;
-
-#[async_trait::async_trait]
-impl PayoutRail for StubRail {
-    async fn send_usdt(&self, to_address: &str, amount_usdt: i64) -> Result<String, String> {
-        let payout_ref = format!("stub:{}", Uuid::new_v4());
-        tracing::info!(to_address, amount_usdt, payout_ref, "StubRail: fake USDT payout recorded");
-        Ok(payout_ref)
-    }
-}
-
-/// Picks due `payout_pending` intents and pays each against its ALREADY-CONFIRMED burn.
-/// Burn first, payout second, always — this worker only ever sees intents whose burn is
-/// already ledgered (`watcher::confirm_burn` is the sole path into `payout_pending`), so
-/// there is no code path here that pays before the chain leg is final.
+/// Pays each due `payout_pending` intent against its ALREADY-CONFIRMED burn.
 ///
-/// The halted breaker state gates this too, not just minting: a treasury that stopped
-/// minting because its books disagree must not ship money out the other door either.
+/// Burn first, payout second, always — `watcher::confirm_burn` is the sole path into
+/// `payout_pending`, so nothing here can pay before the chain leg is final.
 ///
-/// A failed `send_usdt` NEVER un-burns (there is no such operation) — it alerts P1 and
-/// leaves the intent `payout_pending` for retry or manual multisig intervention. Orphaning
-/// a burn (no payout, no alert) is the one outcome this function must never produce.
-pub async fn drain_once(pool: &PgPool, rail: &dyn PayoutRail) -> Result<u32, String> {
+/// The halted breaker gates this too, not just minting: a treasury that stopped minting because its
+/// books disagree must not ship money out the other door either.
+///
+/// Each intent is CLAIMED (`payout_submitted`, committed) before the signer is called, so a crash
+/// mid-call leaves a state that is visibly in-flight rather than one that looks retryable. Only a
+/// reply that PROVES no broadcast returns it to `payout_pending`. Everything else stays claimed and
+/// alerts: orphaning a burn is the one outcome this function must never produce, and paying one
+/// burn twice is the mirror-image sin.
+pub async fn drain_once(
+    pool: &PgPool,
+    config: &AppConfig,
+    signer: &dyn PayoutSigner,
+) -> Result<u32, String> {
     let (halted, halt_reason): (bool, Option<String>) =
         sqlx::query_as("SELECT minting_halted, halt_reason FROM breaker_state")
             .fetch_one(pool)
@@ -143,30 +128,85 @@ pub async fn drain_once(pool: &PgPool, rail: &dyn PayoutRail) -> Result<u32, Str
     .await
     .map_err(|e| e.to_string())?;
 
+    let mut day_total = daily_payout_total(pool).await.map_err(|e| e.to_string())?;
     let mut processed = 0u32;
+
     for (intent_id, payout_address, amount_clt) in rows {
-        // 1:1 CLT<->USDT base units at par — spread/fee modelling is an orchestrator
-        // concern (Plan C), not this stub.
-        match rail.send_usdt(&payout_address, amount_clt).await {
-            Ok(payout_ref) => {
-                pay_intent(pool, intent_id, amount_clt, &payout_ref).await?;
+        if day_total + amount_clt > config.daily_payout_cap_clt {
+            tracing::warn!(%intent_id, day_total, cap = config.daily_payout_cap_clt,
+                "daily payout cap reached; remaining intents wait for the window to roll");
+            break;
+        }
+
+        // CLAIM FIRST. Committed before the call, so a crash between here and the reply is
+        // indistinguishable from a lost response — which is correct, because it is one.
+        let claimed = sqlx::query(
+            "UPDATE redemption_intents SET status = 'payout_submitted', updated_at = now()
+             WHERE id = $1 AND status = 'payout_pending'",
+        )
+        .bind(intent_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if claimed.rows_affected() == 0 {
+            // Another worker took it between the SELECT and here.
+            continue;
+        }
+
+        // 1:1 CLT<->USDT base units at par — spread/fee modelling is an orchestrator concern.
+        match signer.pay(intent_id, &payout_address, amount_clt).await {
+            PayoutReply::Paid { tx_id } => {
+                sqlx::query("UPDATE redemption_intents SET payout_ref = $2, updated_at = now() WHERE id = $1")
+                    .bind(intent_id)
+                    .bind(&tx_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                day_total += amount_clt;
                 processed += 1;
             }
-            Err(e) => {
-                // Retryable: leave `payout_pending` exactly as-is. The burn already
-                // happened and is final; this failure can only cost us a retry, never
-                // orphan the user's money.
-                alert(
-                    pool,
-                    "p1",
-                    "payout",
-                    &format!("redemption {intent_id}: payout failed, staying payout_pending for retry: {e}"),
+            // Proven non-broadcast: hand it back for a later pass.
+            reply @ (PayoutReply::FloatDry { .. }
+            | PayoutReply::CapExceeded { .. }
+            | PayoutReply::NeedsTrx
+            | PayoutReply::Refused(_)) => {
+                sqlx::query(
+                    "UPDATE redemption_intents SET status = 'payout_pending', updated_at = now() WHERE id = $1",
                 )
-                .await;
+                .bind(intent_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                alert(pool, "p1", "payout",
+                    &format!("redemption {intent_id}: payout refused ({reply:?}), returned to payout_pending")).await;
+            }
+            // May or may not have broadcast. Stays claimed, forever, until a human resolves it.
+            PayoutReply::Ambiguous(msg) => {
+                alert(pool, "p1", "payout", &format!(
+                    "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted and \
+                     NOT retried — retrying could pay this burn twice. Check the payout float's \
+                     outbound transfers for a transfer of {amount_clt} to {payout_address}, then \
+                     either set payout_ref to that tx and let confirmation finish it, or return the \
+                     intent to payout_pending."
+                )).await;
             }
         }
     }
     Ok(processed)
+}
+
+/// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past
+/// submission, mirroring `breakers::daily_mint_total` — an in-flight payout is spent budget.
+async fn daily_payout_total(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (total,): (i64,) = sqlx::query_as(
+        // ::BIGINT — SUM(BIGINT) is NUMERIC, sqlx can't decode that into i64.
+        "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM redemption_intents
+         WHERE status IN ('payout_submitted','paid')
+           AND updated_at > now() - interval '24 hours'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
 }
 
 /// Same shape as `watcher::confirm_burn`'s ledger write: one atomic transaction inserting

@@ -1,5 +1,6 @@
 use treasury_service::api;
 use treasury_service::configuration::AppConfig;
+use treasury_service::payout;
 
 /// How long to wait before retrying a FAILED reconciliation run. Deliberately far shorter than
 /// `reconciliation_interval_secs`: minting is blocked until a run succeeds, so a transient failure
@@ -170,18 +171,24 @@ async fn main() {
         });
     }
     {
-        // StubRail only — the real Tron rail is Plan C follow-on (docs/keys.md: the payout
-        // key doesn't exist yet). Same poll cadence as the mint outbox/watcher; no dedicated
-        // interval justified for a stub.
+        // Real TRC-20 payouts via tron-signer's /internal/payout. Same poll cadence as the mint
+        // outbox/watcher; no dedicated interval justified here either.
+        //
+        // Confirmation (chain-verifying a `Paid` reply and flipping the intent to `paid`) is not
+        // wired in yet — that pass does not exist in this codebase yet. Until it lands, a paid
+        // intent parks at `payout_submitted` with its `payout_ref` set, which is correct: nothing
+        // here claims money moved until that leg confirms it on chain.
         let pool = pool.clone();
-        let rail = treasury_service::payout::StubRail;
+        let payout_signer = payout::HttpPayoutSigner {
+            http: reqwest::Client::new(),
+            base_url: config.signer_url.clone(),
+            token: config.signer_token.clone(),
+        };
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
-                match treasury_service::payout::drain_once(&pool, &rail).await {
-                    Ok(n) if n > 0 => tracing::info!("payout: paid {} redemption(s)", n),
-                    Ok(_) => {}
-                    Err(e) => tracing::error!("payout drain failed: {}", e),
+                if let Err(e) = payout::drain_once(&pool, &cfg, &payout_signer).await {
+                    tracing::error!("payout drain failed: {e}");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
             }
