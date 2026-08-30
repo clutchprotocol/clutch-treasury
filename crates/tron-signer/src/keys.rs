@@ -350,13 +350,18 @@ mod payout_tests {
 
     #[test]
     fn the_payout_path_is_pinned_to_2_0() {
-        // Without this, any wrong-but-non-colliding path passes every other test in this module.
-        // Guards a later accidental change to PAYOUT_CHANGE_LEVEL/PAYOUT_INDEX, which would send
-        // every redemption payout to an address no operator ever funded.
         assert_eq!(PAYOUT_CHANGE_LEVEL, 2, "the payout float lives on change level 2");
         assert_eq!(PAYOUT_INDEX, 0, "the payout float is index 0 of change level 2");
         let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
-        assert_eq!(s.payout_address().unwrap(), "PLACEHOLDER_FILL_FROM_CI");
+        // Ground truth from @scure/bip32, derived independently of this implementation and
+        // cross-checked against the five `EXPECTED` deposit addresses above before being trusted —
+        // the same provenance as that table.
+        //
+        // Without this, every other test in this module passes against a WRONG path: they check
+        // non-collision, non-equality, self-consistency and determinism, none of which can tell
+        // `2/0` from `3/0`. A wrong path sends every redemption payout to an address no operator
+        // ever funded.
+        assert_eq!(s.payout_address().unwrap(), "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT");
     }
 
     #[test]
