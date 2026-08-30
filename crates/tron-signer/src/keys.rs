@@ -323,7 +323,7 @@ mod payout_tests {
     fn the_payout_address_is_never_a_deposit_address() {
         let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
         let payout = s.payout_address().unwrap();
-        for i in 0..200u32 {
+        for i in 0..2000u32 {
             assert_ne!(payout, s.address_at(i).unwrap(), "payout collides with deposit index {i}");
         }
     }
@@ -346,5 +346,25 @@ mod payout_tests {
         let a = Signer::from_mnemonic(MNEMONIC, "").unwrap();
         let b = Signer::from_mnemonic(MNEMONIC, "").unwrap();
         assert_eq!(a.payout_address().unwrap(), b.payout_address().unwrap());
+    }
+
+    #[test]
+    fn the_payout_path_is_pinned_to_2_0() {
+        // Without this, any wrong-but-non-colliding path passes every other test in this module.
+        // Guards a later accidental change to PAYOUT_CHANGE_LEVEL/PAYOUT_INDEX, which would send
+        // every redemption payout to an address no operator ever funded.
+        assert_eq!(PAYOUT_CHANGE_LEVEL, 2, "the payout float lives on change level 2");
+        assert_eq!(PAYOUT_INDEX, 0, "the payout float is index 0 of change level 2");
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        assert_eq!(s.payout_address().unwrap(), "PLACEHOLDER_FILL_FROM_CI");
+    }
+
+    #[test]
+    fn the_payout_address_is_valid_base58check() {
+        let s = Signer::from_mnemonic(MNEMONIC, "").unwrap();
+        let addr = s.payout_address().unwrap();
+        let bytes = bs58::decode(&addr).with_check(Some(TRON_ADDRESS_VERSION)).into_vec().unwrap();
+        assert_eq!(bytes.len(), 21);
+        assert!(addr.starts_with('T'));
     }
 }
