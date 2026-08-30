@@ -56,6 +56,13 @@ pub struct SweepConfig {
     pub treasury_address: String,
     pub usdt_contract: String,
     pub fee_limit: i64,
+    /// The most one payout may move, in micro-USDT.
+    ///
+    /// Stateless and checked before anything else. NOT the same number as the treasury's
+    /// `daily_payout_cap_clt`: that one is a rolling 24h total in CLT base units and lives where
+    /// the database is. Configuring both from one value conflates two units that only happen to be
+    /// equal at 1:1 par.
+    pub per_tx_payout_cap_usdt: i64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +83,23 @@ pub enum SweepOutcome {
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
 }
 
+/// What one payout attempt did. Mirrors `SweepOutcome`: the caller must be able to tell "refused,
+/// nothing broadcast" apart from "broadcast", because the treasury retries the first and never
+/// retries the second.
+#[derive(Debug, PartialEq)]
+pub enum PayoutOutcome {
+    /// Broadcast accepted; `tx_id` is the on-chain transfer.
+    Paid { tx_id: String },
+    /// The float does not hold enough USDT. Proof that nothing was broadcast. Only an operator
+    /// topping the float up resolves it.
+    FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
+    /// Above `per_tx_payout_cap_usdt`. Proof that nothing was broadcast.
+    CapExceeded { limit_usdt: i64 },
+    /// The float was just sent TRX so it can pay for its own transfer. Not a failure and not yet a
+    /// payout — the funding has to confirm first, so the next pass does the transfer.
+    NeedsTrx { tx_id: String, amount_sun: i64 },
+}
+
 /// The body for a native TRX transfer from the fee account to a deposit address.
 ///
 /// Separate from the call so the argument order is testable. `owner_address` pays and `to_address`
@@ -87,6 +111,30 @@ fn funding_body(fee_address: &str, deposit_address: &str, amount_sun: i64) -> se
         "owner_address": fee_address,
         "to_address": deposit_address,
         "amount": amount_sun,
+        "visible": true,
+    })
+}
+
+/// The body for a TRC-20 transfer out of the payout float.
+///
+/// Separate from the call so the argument order is testable. `owner_address` PAYS and is always the
+/// float; `to` receives and is the only address the caller chose. Swapped, this would ask the
+/// redeemer to pay us — which fails at broadcast for lack of a signature we do not hold, but only
+/// after the transaction has been built and signed against the wrong account.
+fn payout_body(
+    from: &str,
+    usdt_contract: &str,
+    to: &str,
+    amount_usdt: i64,
+    fee_limit: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "owner_address": from,
+        "contract_address": usdt_contract,
+        "function_selector": "transfer(address,uint256)",
+        "parameter": transfer_parameter(to, amount_usdt).unwrap_or_default(),
+        "fee_limit": fee_limit,
+        "call_value": 0,
         "visible": true,
     })
 }
@@ -198,15 +246,16 @@ impl SweepClient {
             .map_err(|e| e.to_string())
     }
 
-    /// Send `from` enough TRX to pay for its own sweep, out of the wallet's fee account.
+    /// Send `MIN_TRX_SUN_FOR_TRANSFER` to `target_address` from the fee account so it can pay for
+    /// its own TRC-20 transfer.
     ///
-    /// A fresh deposit address holds no TRX — receiving tokens does not create a balance — so it
-    /// cannot move the USDT sitting on it. The fee account (`<account>/1/0`) is the wallet's TRX
-    /// float, topped up by an operator, and this is the only thing that spends from it.
+    /// Two callers now: a deposit address about to be swept, and the payout float about to send a
+    /// redemption. Both are addresses of ours that hold tokens but no TRX, and the fee account is
+    /// the single TRX float behind both.
     ///
     /// Sends the full minimum rather than the shortfall. Topping up the difference would, for an
     /// address already near the floor, broadcast a transaction worth less than its own bandwidth.
-    async fn fund(&self, signer: &Signer, deposit_address: &str) -> Result<SweepOutcome, String> {
+    async fn fund(&self, signer: &Signer, target_address: &str) -> Result<SweepOutcome, String> {
         let fee_address = signer.fee_address()?;
         let have = self.trx_balance_sun(&fee_address).await?;
         let need = MIN_TRX_SUN_FOR_TRANSFER + FEE_ACCOUNT_RESERVE_SUN;
@@ -217,7 +266,7 @@ impl SweepClient {
         let built = self
             .post(
                 "/wallet/createtransaction",
-                funding_body(&fee_address, deposit_address, MIN_TRX_SUN_FOR_TRANSFER),
+                funding_body(&fee_address, target_address, MIN_TRX_SUN_FOR_TRANSFER),
             )
             .await?;
         // createtransaction returns the transaction at the top level and reports refusals as
@@ -226,7 +275,7 @@ impl SweepClient {
             return Err(format!("trongrid refused to build the funding transfer: {err}"));
         }
         let tx_id = self.sign_and_broadcast(&signer.fee_signing_key()?, built).await?;
-        tracing::info!("funded {deposit_address} with {MIN_TRX_SUN_FOR_TRANSFER} sun from {fee_address} in {tx_id}");
+        tracing::info!("funded {target_address} with {MIN_TRX_SUN_FOR_TRANSFER} sun from {fee_address} in {tx_id}");
         Ok(SweepOutcome::Funded { tx_id, amount_sun: MIN_TRX_SUN_FOR_TRANSFER })
     }
 
@@ -336,6 +385,68 @@ impl SweepClient {
         let tx_id = self.sign_and_broadcast(&signer.signing_key_at(index)?, tx).await?;
         Ok(SweepOutcome::Swept { tx_id, amount_usdt: amount })
     }
+
+    /// Send `amount_usdt` from the payout float to `to`.
+    ///
+    /// Unlike `sweep`, this DOES take a destination and an amount — see the spec at
+    /// docs/superpowers/specs/2026-08-30-redemption-payout-rail-design.md. The property that
+    /// survives is narrower but still real: the source is always the float and the token is always
+    /// config, so the most a compromised caller moves is the float balance.
+    pub async fn payout(
+        &self,
+        signer: &Signer,
+        to: &str,
+        amount_usdt: i64,
+    ) -> Result<PayoutOutcome, String> {
+        // FIRST, before any network call: a refusal must be provable as "nothing was broadcast",
+        // and the cheapest proof is not having talked to anything yet.
+        if amount_usdt > self.cfg.per_tx_payout_cap_usdt {
+            return Ok(PayoutOutcome::CapExceeded { limit_usdt: self.cfg.per_tx_payout_cap_usdt });
+        }
+
+        let from = signer.payout_address()?;
+
+        let have = self.usdt_balance(&from).await?;
+        if have < amount_usdt {
+            return Ok(PayoutOutcome::FloatDry {
+                float_address: from,
+                have_usdt: have,
+                need_usdt: amount_usdt,
+            });
+        }
+
+        // Same ordering as sweep: balance first, TRX second. An underfunded float reports FloatDry
+        // without dispersing TRX to an address that was never going to send anything.
+        let trx = self.trx_balance_sun(&from).await?;
+        if trx < MIN_TRX_SUN_FOR_TRANSFER {
+            return match self.fund(signer, &from).await? {
+                SweepOutcome::Funded { tx_id, amount_sun } => {
+                    Ok(PayoutOutcome::NeedsTrx { tx_id, amount_sun })
+                }
+                SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => {
+                    Err(format!(
+                        "payout float {from} has no TRX and the fee account {fee_address} is dry \
+                         ({have_sun} sun, needs {need_sun}) — an operator must top it up"
+                    ))
+                }
+                other => Err(format!("funding the payout float returned {other:?}")),
+            };
+        }
+
+        let built: serde_json::Value = self
+            .post(
+                "/wallet/triggersmartcontract",
+                payout_body(&from, &self.cfg.usdt_contract, to, amount_usdt, self.cfg.fee_limit),
+            )
+            .await?;
+        let tx = built
+            .get("transaction")
+            .cloned()
+            .ok_or_else(|| format!("trongrid returned no transaction to sign: {}", describe_rejection(&built)))?;
+
+        let tx_id = self.sign_and_broadcast(&signer.payout_signing_key()?, tx).await?;
+        Ok(PayoutOutcome::Paid { tx_id })
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +541,68 @@ mod tests {
         let a = sign_txid(&s.signing_key_at(0).unwrap(), &digest).unwrap();
         let b = sign_txid(&s.signing_key_at(1).unwrap(), &digest).unwrap();
         assert_ne!(a, b);
+    }
+
+    const RECIPIENT: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+    const USDT_FIXTURE: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+
+    fn payout_test_config(cap: i64) -> SweepConfig {
+        SweepConfig {
+            trongrid_url: "http://127.0.0.1:1".into(),
+            trongrid_api_key: String::new(),
+            treasury_address: "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX".into(),
+            usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".into(),
+            fee_limit: 150_000_000,
+            per_tx_payout_cap_usdt: cap,
+        }
+    }
+
+    // keys.rs's own test modules each construct Signer::from_mnemonic(MNEMONIC, "") locally rather
+    // than sharing a fixture helper; this crate has no such public helper, so this is the same
+    // pattern, just factored out because payout tests need it twice.
+    fn fixture_signer() -> Signer {
+        Signer::from_mnemonic(MNEMONIC, "").unwrap()
+    }
+
+    #[test]
+    fn a_payout_cap_of_zero_would_block_every_payout() {
+        // Guards against defaulting the cap to 0 and silently disabling redemptions, which would
+        // present as every payout refusing with CapExceeded and no obvious cause.
+        let cfg = payout_test_config(0);
+        assert_eq!(cfg.per_tx_payout_cap_usdt, 0, "test intends a zero cap");
+        assert!(
+            cfg.per_tx_payout_cap_usdt <= 0,
+            "a zero or negative cap must be rejected at boot, not treated as a limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_above_the_cap_refuses_without_touching_the_network() {
+        // trongrid_url points at a dead port: if the implementation reaches TronGrid before
+        // checking the cap, this fails with a connection error instead of CapExceeded.
+        let client = SweepClient::new(payout_test_config(1_000_000));
+        let signer = fixture_signer();
+        let outcome = client.payout(&signer, RECIPIENT, 1_000_001).await.unwrap();
+        assert_eq!(outcome, PayoutOutcome::CapExceeded { limit_usdt: 1_000_000 });
+    }
+
+    #[test]
+    fn a_payout_always_spends_from_the_float_and_never_a_deposit() {
+        // The security property of the whole endpoint, tested the way funding_body's argument order
+        // is: as a pure body builder, because tron-signer has no dev-dependencies and no HTTP mock.
+        // owner_address is the payer. If owner and recipient are ever swapped, or if owner is taken
+        // from anything the caller supplied, this fails.
+        let s = fixture_signer();
+        let float = s.payout_address().unwrap();
+        let body = payout_body(&float, USDT_FIXTURE, RECIPIENT, 5, 150_000_000);
+
+        assert_eq!(body["owner_address"], float, "the float must be the payer");
+        assert_ne!(body["owner_address"], RECIPIENT, "the recipient must never be the payer");
+        for i in 0..50u32 {
+            assert_ne!(body["owner_address"], s.address_at(i).unwrap(),
+                "a payout must never spend from deposit index {i}");
+        }
+        assert_eq!(body["contract_address"], USDT_FIXTURE, "the token comes from config, not the caller");
     }
 }
 
