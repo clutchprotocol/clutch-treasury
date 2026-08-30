@@ -46,20 +46,31 @@ fn authed(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
     }
 }
 
-/// The account xpub and the fee address, so both can be read off the service that owns the private
+/// The account xpub, the fee address, and the payout address, so all can be read off the service that owns the private
 /// half rather than transcribed by hand. Public material — a mistyped xpub over there means every
 /// deposit address is one this service cannot sweep.
 ///
 /// `fee_address` is where an operator sends the TRX float. It is here rather than only in the log
 /// line that fires when the account runs dry, because it is needed BEFORE the first sweep: an
 /// unfunded fee account means no deposit can ever be moved.
+///
+/// `payout_address` is where an operator sends the USDT float. Like `fee_address`, it is needed
+/// before the first payout.
 async fn xpub(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
     authed(&headers, &s.token)?;
     let fee_address = s.signer.fee_address().map_err(|e| {
         tracing::error!("fee address derivation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(json!({ "account_xpub": s.signer.account_xpub(), "fee_address": fee_address })))
+    let payout_address = s.signer.payout_address().map_err(|e| {
+        tracing::error!("payout address derivation failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({
+        "account_xpub": s.signer.account_xpub(),
+        "fee_address": fee_address,
+        "payout_address": payout_address,
+    })))
 }
 
 /// ONLY an index. Adding `to`, `contract` or `amount` here would delete the reason this service
