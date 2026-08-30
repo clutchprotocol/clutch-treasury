@@ -193,7 +193,12 @@ pub async fn run_once(
     // retries in 30 seconds, and if the outage persists the existing "no reconciliation run in 48h
     // — refusing to mint blind" gate stops minting on its own.
     let custody_reported = client
-        .get_reserve_balance(&config.custody_tron_address, &unswept, &config.usdt_contract)
+        .get_reserve_balance(
+            &config.custody_tron_address,
+            &unswept,
+            &config.payout_float_address,
+            &config.usdt_contract,
+        )
         .await
         .map_err(|e| format!("reserve balance unreadable, not recording a run: {e}"))?;
 

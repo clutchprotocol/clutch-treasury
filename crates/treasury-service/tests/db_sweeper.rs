@@ -65,6 +65,7 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         trongrid_url,
         trongrid_api_key: "k".into(),
         custody_tron_address: ADDR.into(),
+        payout_float_address: "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY".into(),
         usdt_contract: USDT.into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,

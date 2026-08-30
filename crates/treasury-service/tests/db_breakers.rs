@@ -45,6 +45,7 @@ fn test_config() -> AppConfig {
         trongrid_url: "http://unused".into(),
         trongrid_api_key: "test-trongrid-key".into(),
         custody_tron_address: "TCustodyAddressXXXXXXXXXXXXXXXXXXX".into(),
+        payout_float_address: "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY".into(),
         usdt_contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".into(),
         deposit_confirmations: 19,
         deposit_match_window_hours: 24,

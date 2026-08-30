@@ -37,6 +37,11 @@ pub struct AppConfig {
     pub trongrid_url: String,
     pub trongrid_api_key: String,
     pub custody_tron_address: String,
+    /// The payout float address, read off tron-signer's /internal/xpub.
+    ///
+    /// Configured rather than derived: this service holds no key material and must not be able to
+    /// derive spending addresses. It only needs to know where to LOOK, so it is given the address.
+    pub payout_float_address: String,
     pub usdt_contract: String,
     pub deposit_confirmations: u32,
     /// How far back the verifier's fallback (no-tx-hash) match may reach for a transfer, relative
