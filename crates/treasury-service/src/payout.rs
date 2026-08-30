@@ -3,6 +3,94 @@ use uuid::Uuid;
 
 use crate::ledger::alert;
 
+/// What the signer reported for one payout.
+///
+/// The division that matters is `Refused` vs `Ambiguous`, and it is not a stylistic one: `Refused`
+/// means the signer told us it did not broadcast, so retrying is free. `Ambiguous` means we do not
+/// know, and a TRC-20 transfer has no memo to dedupe against, so retrying risks paying twice for a
+/// burn that only happened once. Never widen `Refused` to cover a case you are not certain about.
+#[derive(Debug, PartialEq)]
+pub enum PayoutReply {
+    Paid { tx_id: String },
+    FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
+    CapExceeded { limit_usdt: i64 },
+    /// The float was topped up with TRX and the transfer has not happened yet. Retryable.
+    NeedsTrx,
+    /// The signer answered, and its answer proves nothing was broadcast. Retryable.
+    Refused(String),
+    /// No usable answer. MAY have broadcast. Not retryable by any automation.
+    Ambiguous(String),
+}
+
+/// The signer boundary, as a trait so the worker is testable without a live service or real keys —
+/// same reasoning as `SweepSigner` in sweeper.rs.
+#[async_trait::async_trait]
+pub trait PayoutSigner: Send + Sync {
+    async fn pay(&self, intent_id: Uuid, to: &str, amount_usdt: i64) -> PayoutReply;
+}
+
+/// The real signer, over HTTP. Modelled on `sweeper::HttpSigner` — same shape, same reasoning.
+pub struct HttpPayoutSigner {
+    pub http: reqwest::Client,
+    pub base_url: String,
+    pub token: String,
+}
+
+#[async_trait::async_trait]
+impl PayoutSigner for HttpPayoutSigner {
+    async fn pay(&self, intent_id: Uuid, to: &str, amount_usdt: i64) -> PayoutReply {
+        let resp = self
+            .http
+            .post(format!("{}/internal/payout", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "intent_id": intent_id.to_string(),
+                "to": to,
+                "amount_usdt": amount_usdt,
+            }))
+            .send()
+            .await;
+
+        let body: serde_json::Value = match resp {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                // Success status, unreadable body: the signer may well have broadcast.
+                Err(e) => return PayoutReply::Ambiguous(format!("unreadable signer response: {e}")),
+            },
+            // 400 is the signer rejecting the request shape before doing anything. Every other
+            // status could have followed a broadcast, so it is ambiguous, not refused.
+            Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
+                return PayoutReply::Refused("signer rejected the request as malformed".into())
+            }
+            Ok(r) => return PayoutReply::Ambiguous(format!("signer returned {}", r.status())),
+            // Connection refused and DNS failures are safe, but a timeout is not distinguishable
+            // here from a request that landed. Treat the whole class as ambiguous.
+            Err(e) => return PayoutReply::Ambiguous(format!("signer unreachable or timed out: {e}")),
+        };
+
+        match body["status"].as_str() {
+            Some("paid") => match body["tx_id"].as_str() {
+                Some(tx) => PayoutReply::Paid { tx_id: tx.to_string() },
+                // Claimed success without naming the transaction. It may have broadcast and we
+                // cannot point at it, which is the definition of ambiguous.
+                None => PayoutReply::Ambiguous("signer reported paid with no tx_id".into()),
+            },
+            Some("float_dry") => PayoutReply::FloatDry {
+                float_address: body["float_address"].as_str().unwrap_or("unknown").to_string(),
+                have_usdt: body["have_usdt"].as_i64().unwrap_or(0),
+                need_usdt: body["need_usdt"].as_i64().unwrap_or(0),
+            },
+            Some("cap_exceeded") => {
+                PayoutReply::CapExceeded { limit_usdt: body["limit_usdt"].as_i64().unwrap_or(0) }
+            }
+            Some("needs_trx") => PayoutReply::NeedsTrx,
+            // An unknown status from a newer signer might describe a broadcast this version does
+            // not understand. Ambiguous, never Refused.
+            other => PayoutReply::Ambiguous(format!("unrecognised signer status {other:?}")),
+        }
+    }
+}
+
 /// Boundary for the outbound USDT leg. `StubRail` is the only implementor today; the real
 /// Tron TRC-20 rail (transaction construction, a hot payout key in KMS, TRX energy costs)
 /// is Plan C follow-on research, not this task. Kept as a trait anyway — same migration-path

@@ -55,6 +55,7 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         approver_token: "a".into(),
         readonly_token: "r".into(),
         daily_mint_cap_clt: 500_000_000,
+        daily_payout_cap_clt: 500_000_000,
         per_tx_mint_cap_clt: 50_000_000,
         backing_target_bps: 10_050,
         backing_halt_bps: 10_000,

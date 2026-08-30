@@ -27,6 +27,12 @@ pub struct AppConfig {
     pub approver_token: String,
     pub readonly_token: String,
     pub daily_mint_cap_clt: i64,
+    /// Rolling 24h payout ceiling in CLT base units.
+    ///
+    /// Separate from the signer's `per_tx_payout_cap_usdt`, which is micro-USDT and per-transaction.
+    /// The two are equal at 1:1 par and must still be configured independently — collapsing them
+    /// would silently couple a unit change on one side to the other.
+    pub daily_payout_cap_clt: i64,
     pub per_tx_mint_cap_clt: i64,
     pub backing_target_bps: i64,
     pub backing_halt_bps: i64,

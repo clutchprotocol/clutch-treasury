@@ -1,6 +1,10 @@
 use sqlx::PgPool;
 use treasury_service::intents::create_redemption_intent;
+use treasury_service::payout::{HttpPayoutSigner, PayoutReply, PayoutSigner};
 use treasury_service::watcher::confirm_burn;
+use uuid::Uuid;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn pool() -> PgPool {
     // Each test BINARY gets its own database. --test-threads=1 only serialises tests WITHIN a
@@ -50,4 +54,78 @@ async fn mismatched_burn_fails_intent_never_pays() {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1'")
         .fetch_one(&pool).await.unwrap();
     assert!(n >= 1);
+}
+
+async fn signer_replying(status: u16, body: serde_json::Value) -> (MockServer, HttpPayoutSigner) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/payout"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    let signer = HttpPayoutSigner {
+        http: reqwest::Client::new(),
+        base_url: server.uri(),
+        token: "t".into(),
+    };
+    (server, signer)
+}
+
+#[tokio::test]
+async fn a_paid_reply_with_a_tx_id_is_paid() {
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "paid", "tx_id": "abc"})).await;
+    assert_eq!(
+        signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await,
+        PayoutReply::Paid { tx_id: "abc".into() }
+    );
+}
+
+#[tokio::test]
+async fn a_paid_reply_without_a_tx_id_is_ambiguous_not_paid() {
+    // It claimed success but cannot name the transaction. It may well have broadcast, so this must
+    // NOT be retried — treating it as a plain failure is how a burn gets paid twice.
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "paid"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_400_is_refused_because_the_signer_rejected_the_shape() {
+    // The one status that proves nothing was broadcast: the signer refused the request itself.
+    let (_s, signer) = signer_replying(400, serde_json::json!({"error": "bad"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Refused(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_500_is_ambiguous_not_refused() {
+    // A 500 can follow a broadcast that then failed to report. Classifying it Refused would make
+    // it retryable, and the retry would pay the same burn again.
+    let (_s, signer) = signer_replying(500, serde_json::json!({"error": "boom"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn an_unrecognised_status_is_ambiguous() {
+    // A newer signer may describe a broadcast this version does not understand. Never Refused.
+    let (_s, signer) = signer_replying(200, serde_json::json!({"status": "teleported"})).await;
+    let reply = signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await;
+    assert!(matches!(reply, PayoutReply::Ambiguous(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn a_float_dry_reply_is_refused_and_carries_its_numbers() {
+    let (_s, signer) = signer_replying(200, serde_json::json!({
+        "status": "float_dry", "float_address": "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT",
+        "have_usdt": 0, "need_usdt": 5,
+    })).await;
+    assert_eq!(
+        signer.pay(Uuid::new_v4(), "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", 5).await,
+        PayoutReply::FloatDry {
+            float_address: "TKTuTvBn4qZpeYFuXz1SuL1B94NgtK5EnT".into(),
+            have_usdt: 0,
+            need_usdt: 5,
+        }
+    );
 }
