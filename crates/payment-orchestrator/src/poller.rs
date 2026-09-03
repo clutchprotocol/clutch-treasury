@@ -118,8 +118,9 @@ async fn user_for_address(pool: &PgPool, to: &str) -> Result<Option<(String, Str
 }
 
 /// Loop (a): one pass over the permanent per-user addresses. `watcher.poll()` already selected which
-/// addresses were due and stamped `last_polled_at` for all of them (`TieredPoller`) — this function
-/// never learns how the transfers it is handed were found, which is the point of the seam.
+/// addresses were due and stamped `last_attempt_at` for all of them, `last_polled_at` for whichever
+/// succeeded (`TieredPoller`) — this function never learns how the transfers it is handed were found,
+/// which is the point of the seam.
 ///
 /// A transfer to an address with no `deposit_addresses` row is not an error — it is a legacy
 /// per-intent address, left to loop (b). A failure crediting one transfer must not stop the rest.
@@ -318,12 +319,18 @@ pub struct DueAddress {
     pub last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Hot addresses first, then ONE cold tier — everyone else, oldest-polled (and never-polled) first.
-/// `COALESCE(hot_until > now(), false)` is load-bearing: a bare `(hot_until > now()) DESC` sorts
-/// TRUE / FALSE / NULL as three tiers, so an address that was hot once and has since expired would
-/// permanently outrank one that was never hot, regardless of `last_polled_at`. The COALESCE folds
-/// "expired hot" and "never hot" into the same false/cold bucket, which is why `NULLS LAST` on that
-/// column is no longer needed.
+/// Hot addresses first, then ONE cold tier — everyone else, oldest-attempted (and never-attempted)
+/// first. `COALESCE(hot_until > now(), false)` is load-bearing: a bare `(hot_until > now()) DESC`
+/// sorts TRUE / FALSE / NULL as three tiers, so an address that was hot once and has since expired
+/// would permanently outrank one that was never hot, regardless of `last_attempt_at`. The COALESCE
+/// folds "expired hot" and "never hot" into the same false/cold bucket, which is why `NULLS LAST` on
+/// that column is no longer needed.
+///
+/// Ordered by `last_attempt_at`, not `last_polled_at` (R23): rotation fairness and the read
+/// watermark are two different questions now — an address whose last fetch FAILED must still move to
+/// the back of the queue (attempted), even though its watermark did not advance (never successfully
+/// read). `last_polled_at` is still the column returned on `DueAddress`, because `TieredPoller` needs
+/// the watermark to bound its query, not the attempt time.
 ///
 /// The LIMIT is the whole cost control: permanent addresses never stop being watched, so without a
 /// per-pass budget the request count grows with every user who has ever existed. With it, cost per
@@ -332,7 +339,7 @@ pub struct DueAddress {
 pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>, String> {
     sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT user_pk, address, last_polled_at FROM deposit_addresses
-         ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
+         ORDER BY COALESCE(hot_until > now(), false) DESC, last_attempt_at ASC NULLS FIRST
          LIMIT $1",
     )
     .bind(budget)
@@ -348,9 +355,11 @@ pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>
 
 /// The `DepositWatcher` this deployment runs: poll a bounded slice of addresses per pass, hot first.
 ///
-/// Owns the tier state — it stamps `last_polled_at` for every address it polled, whether or not
-/// anything arrived, because an address that is never stamped is re-polled every pass forever and
-/// the cold rotation never advances.
+/// Owns the tier state — it stamps `last_attempt_at` for every address it polled, success or
+/// failure, because an address that is never stamped is re-picked every pass forever and the cold
+/// rotation never advances. `last_polled_at`, the read watermark, is a separate column and only
+/// advances on a SUCCESSFUL fetch (R23): stamping it unconditionally let a TronGrid outage longer
+/// than the one-hour overlap silently and permanently skip whatever arrived during it.
 pub struct TieredPoller {
     pub pool: PgPool,
     pub inner: Arc<dyn CustodyWatcher>,
@@ -362,27 +371,68 @@ impl DepositWatcher for TieredPoller {
     async fn poll(&self) -> Result<Vec<ObservedTransfer>, String> {
         let due = due_addresses(&self.pool, self.budget).await?;
         let mut found = Vec::new();
+        let mut succeeded: Vec<String> = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
 
         for a in &due {
-            // Only transfers since we last looked, minus an hour of overlap. Permanent addresses
-            // otherwise re-fetch their entire history every rotation. The overlap is free: a
+            // Only transfers since we last SUCCESSFULLY looked, minus an hour of overlap. Permanent
+            // addresses otherwise re-fetch their entire history every rotation. The overlap is free: a
             // transfer landing between the query and the stamp is re-observed next pass, and
             // credit_transfer is idempotent on tron_tx_id. Epoch MILLISECONDS, per ObservedTransfer.
             let since = a.last_polled_at.map(|t| (t - chrono::Duration::hours(1)).timestamp_millis());
             match self.inner.transfers_to(&a.address, since).await {
-                Ok(mut ts) => found.append(&mut ts),
+                Ok(mut ts) => {
+                    found.append(&mut ts);
+                    succeeded.push(a.address.clone());
+                }
                 // One unreadable address must not abort the pass: the others are still due, and a
-                // TronGrid blip on one address would otherwise stall every deposit behind it.
-                Err(e) => tracing::warn!("polling {}: {e}", a.address),
+                // TronGrid blip on one address would otherwise stall every deposit behind it. Its
+                // watermark must NOT advance on this branch (R23) — see the two UPDATEs below.
+                Err(e) => {
+                    tracing::warn!("polling {}: {e}", a.address);
+                    failed.push((a.address.clone(), e));
+                }
             }
         }
 
-        let polled: Vec<String> = due.iter().map(|a| a.address.clone()).collect();
+        // Rotation fairness: EVERY due address is stamped here, success or failure, so a failing
+        // address still moves to the back of the queue instead of being re-picked — and re-failing —
+        // every single pass, which would starve every address behind it.
+        let attempted: Vec<String> = due.iter().map(|a| a.address.clone()).collect();
+        sqlx::query("UPDATE deposit_addresses SET last_attempt_at = now() WHERE address = ANY($1)")
+            .bind(&attempted)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("stamping last_attempt_at: {e}"))?;
+
+        // The read watermark: ONLY addresses whose fetch actually returned Ok. A failed fetch means
+        // we do not know what arrived since the last successful read, so the next pass must re-read
+        // from the SAME point (last_polled_at left unmoved) rather than silently skipping an outage's
+        // worth of deposits.
         sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE address = ANY($1)")
-            .bind(&polled)
+            .bind(&succeeded)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("stamping last_polled_at: {e}"))?;
+
+        // One aggregated alert per pass, never one per address — an hour-long outage can hit every
+        // address in the budget, and a row each would be thousands of alerts saying the same thing.
+        if !failed.is_empty() {
+            let sample: Vec<&str> = failed.iter().take(3).map(|(addr, _)| addr.as_str()).collect();
+            alert(
+                &self.pool,
+                "warn",
+                "poller",
+                &format!(
+                    "{} address(es) failed to poll this pass and did not advance their read watermark; \
+                     first {}: {}",
+                    failed.len(),
+                    sample.len(),
+                    sample.join(", ")
+                ),
+            )
+            .await;
+        }
 
         Ok(found)
     }

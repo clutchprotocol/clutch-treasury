@@ -342,40 +342,41 @@ async fn hot_addresses_are_polled_before_cold_ones_and_the_budget_is_respected()
 }
 
 #[tokio::test]
-async fn cold_addresses_rotate_oldest_polled_first() {
+async fn cold_addresses_rotate_oldest_attempted_first() {
     let pool = pool().await;
     seed_address(&pool, "0xa", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", None).await;
     seed_address(&pool, "0xb", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
-    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE user_pk = '0xa'")
+    sqlx::query("UPDATE deposit_addresses SET last_attempt_at = now() WHERE user_pk = '0xa'")
         .execute(&pool).await.unwrap();
 
     let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
 
-    assert_eq!(due[0].user_pk, "0xb", "never-polled sorts ahead of just-polled");
+    assert_eq!(due[0].user_pk, "0xb", "never-attempted sorts ahead of just-attempted");
 }
 
 /// Regression test for the three-tier bug in `due_addresses`'s ORDER BY. Under the OLD query
-/// (`(hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST`): A's `hot_until` is an
+/// (`(hot_until > now()) DESC NULLS LAST, last_attempt_at ASC NULLS FIRST`): A's `hot_until` is an
 /// hour in the past, so `hot_until > now()` evaluates to FALSE; B's `hot_until` is NULL (never hot),
 /// so the same expression evaluates to NULL. Boolean `DESC` ranks TRUE, then FALSE, then NULL —
 /// `NULLS LAST` only guarantees NULL does not beat TRUE, it does NOT merge FALSE and NULL into one
-/// tier — so A's FALSE outranks B's NULL regardless of `last_polled_at`, and A (polled a minute ago)
-/// would be selected over B (never polled). Under the FIX, `COALESCE(hot_until > now(), false)` maps
-/// both A and B to `false` on that first key, so they land in the same cold tier ordered by
-/// `last_polled_at ASC NULLS FIRST` — B's NULL sorts before A's one-minute-old timestamp, so B wins.
+/// tier — so A's FALSE outranks B's NULL regardless of `last_attempt_at`, and A (attempted a minute
+/// ago) would be selected over B (never attempted). Under the FIX, `COALESCE(hot_until > now(),
+/// false)` maps both A and B to `false` on that first key, so they land in the same cold tier
+/// ordered by `last_attempt_at ASC NULLS FIRST` — B's NULL sorts before A's one-minute-old
+/// timestamp, so B wins.
 #[tokio::test]
 async fn expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it() {
     let pool = pool().await;
-    // A: previously hot, now expired — hot_until an hour in the past — polled a minute ago.
+    // A: previously hot, now expired — hot_until an hour in the past — attempted a minute ago.
     seed_address(&pool, "0xa-expired-hot", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", Some(-1)).await;
     sqlx::query(
-        "UPDATE deposit_addresses SET last_polled_at = now() - interval '1 minute' \
+        "UPDATE deposit_addresses SET last_attempt_at = now() - interval '1 minute' \
          WHERE user_pk = '0xa-expired-hot'",
     )
     .execute(&pool)
     .await
     .unwrap();
-    // B: never hot, never polled.
+    // B: never hot, never attempted.
     seed_address(&pool, "0xb-never-hot", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
 
     let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
@@ -383,7 +384,7 @@ async fn expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it
     assert_eq!(due.len(), 1, "the per-pass budget is a hard cap");
     assert_eq!(
         due[0].address, "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK",
-        "a never-hot, never-polled address must not be starved by one that was hot once and expired"
+        "a never-hot, never-attempted address must not be starved by one that was hot once and expired"
     );
 }
 
@@ -467,13 +468,19 @@ async fn a_one_cent_deposit_is_credited_in_full() {
     assert_eq!(got, 10_000);
 }
 
-/// `TieredPoller::poll` itself had no coverage before this: without "stamp `last_polled_at` even on
-/// failure", one broken address would be re-polled every pass forever while the others starved
+/// `TieredPoller::poll` itself had no coverage before this: without "stamp `last_attempt_at` even on
+/// failure", one broken address would be re-picked every pass forever while the others starved
 /// behind it — exactly the failure mode Task 5's per-pass budget exists to prevent. Covered here,
 /// where `poll_once`'s loop (a) (`credit_from_addresses`) finally wires `TieredPoller` in for real,
 /// against a real (mocked) TronGrid rather than `FakeChain`.
+///
+/// R23: A's failure must rotate it (`last_attempt_at` set) WITHOUT moving its read watermark
+/// (`last_polled_at` stays NULL — never successfully read) — otherwise the next pass's
+/// `min_timestamp` silently skips whatever arrived at A while it was down. B's success advances
+/// both. Exactly one aggregated alert row must name A; a row per failing address would be thousands
+/// of alerts over an hour-long outage.
 #[tokio::test]
-async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
+async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
     let pool = pool().await;
     let addr_a = "TAddrFailingA";
     let addr_b = "TAddrWorkingB";
@@ -513,11 +520,90 @@ async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
         .unwrap();
     assert_eq!(credited, 1, "B's transfer must be credited");
 
-    let stamped: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE last_polled_at IS NOT NULL")
+    let attempted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE last_attempt_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempted, 2, "both A and B must rotate — last_attempt_at set even though A's fetch failed");
+
+    let a_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(a_watermark.is_none(), "A's failed fetch must NOT advance its read watermark");
+
+    let b_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(b_watermark.is_some(), "B's successful fetch must advance its read watermark");
+
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%' || $1 || '%'")
+        .bind(addr_a)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(stamped, 2, "both A and B must be stamped even though A's fetch failed");
+    assert_eq!(alerts, 1, "exactly one aggregated alert row per pass, naming A");
+}
+
+/// The property R23 exists for, isolated to a single address mid-outage. Without the fix this
+/// address's `last_polled_at` would be stamped to `now()` regardless of the failed fetch, and the
+/// next pass's `min_timestamp` (`last_polled_at - 1h`) would silently start AFTER the outage,
+/// skipping whatever arrived during it. With the fix the watermark must stay exactly where it was.
+#[tokio::test]
+async fn a_watermark_survives_an_outage() {
+    let pool = pool().await;
+    let addr = "TAddrOutageWatermark";
+    seed_address(&pool, "0xuser-outage", addr, None).await;
+    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() - interval '3 hours' WHERE address = $1")
+        .bind(addr)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let t0: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let t0 = t0.expect("just set last_polled_at above");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let raw: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(server.uri(), "test-key".into(), USDT.into()));
+    let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 1 };
+
+    poller::credit_from_addresses(&pool, &tiered, USDT).await.unwrap();
+
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after.expect("must not be cleared, only left unmoved"),
+        t0,
+        "a failed pass must leave the watermark exactly where it was, so the next successful pass \
+         re-reads from T0 - 1h rather than silently skipping the outage"
+    );
+
+    let attempted: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_attempt_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(attempted.is_some(), "the failed attempt must still be recorded for rotation");
 }
 
 // R17 review fixes.
