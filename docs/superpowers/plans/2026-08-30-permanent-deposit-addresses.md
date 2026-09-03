@@ -828,11 +828,14 @@ async fn two_transfers_to_one_address_are_two_credits() {
     assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &a).await.unwrap());
     assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &b).await.unwrap());
 
-    let (rows, total): (i64, i64) = sqlx::query_as(
-        "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT FROM deposit_intents WHERE deposit_address = $1")
+    let (rows, total, off_par): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT,                 count(*) FILTER (WHERE amount_clt <> received_usdt OR amount_usdt <> received_usdt)            FROM deposit_intents WHERE deposit_address = $1")
         .bind(ADDR).fetch_one(&pool).await.unwrap();
     assert_eq!(rows, 2);
     assert_eq!(total, 3_500_000, "each transfer credited in full — credit everything, cap nothing");
+    // Task 6 retired `amount_clt_equals_amount_usdt_at_par` with the create() flow; the par rule
+    // (1 micro-USDT = 1 CLT base unit) now lives in credit_transfer's INSERT, so it is pinned here.
+    assert_eq!(off_par, 0, "amount_clt and amount_usdt must both equal what arrived");
 }
 
 #[tokio::test]
