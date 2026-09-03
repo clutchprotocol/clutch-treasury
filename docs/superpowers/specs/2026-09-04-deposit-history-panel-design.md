@@ -45,7 +45,8 @@ API — the API keeps returning the real status so the next reader is not lied t
 | `mint_requested` | Minting | The treasury has been asked to mint |
 | `credited` | Credited | CLT is in the balance |
 | `needs_manual` | Needs review | A human has to act; the money is safe |
-| `expired`, other legacy | not shown | Pre-dates permanent addresses |
+| `expired` | not shown | A legacy invoice nobody paid — not a deposit. Excluded in SQL, not in the UI: with `LIMIT 20` a client-side filter would still spend the cap on rows the user never sees (stage holds 33 of them) |
+| anything else | its raw status | An unrecognised state is shown as-is rather than guessed at |
 
 `Needs review` is the state that matters most. It is what the 1,000 USDT deposit became, and a user
 seeing that word with the amount and the transaction beside it knows something specific and true,

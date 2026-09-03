@@ -85,13 +85,20 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<DepositIntent>
         .await
 }
 
-/// The caller's own deposits, newest first. Scoped by `user_pk` — the only thing standing between
-/// one user's deposit history and another's, so it is not optional and not a filter applied after
-/// the fact: the WHERE clause IS the access control here, same as everywhere else in this file
-/// that a caller-scoped row matters.
+/// The caller's own deposits, newest first, excluding `expired` legacy intents. Scoped by
+/// `user_pk` — the only thing standing between one user's deposit history and another's, so it is
+/// not optional and not a filter applied after the fact: the WHERE clause IS the access control
+/// here, same as everywhere else in this file that a caller-scoped row matters.
+///
+/// `status <> 'expired'` excludes pre-permanent-address legacy intents: an expired row is an
+/// invoice nobody ever paid, not a deposit that happened, so it has no business in a deposit
+/// history. Excluded here, in SQL, rather than filtered by the caller after the fetch — with
+/// `LIMIT` below, a post-hoc filter would still spend the cap on rows the user is never shown,
+/// silently crowding out real deposits (stage currently carries 33 such rows).
 pub async fn recent_for_user(pool: &PgPool, user_pk: &str, limit: i64) -> Result<Vec<DepositIntent>, sqlx::Error> {
     sqlx::query_as::<_, DepositIntent>(&format!(
-        "SELECT {INTENT_COLS} FROM deposit_intents WHERE user_pk = $1 ORDER BY created_at DESC LIMIT $2"
+        "SELECT {INTENT_COLS} FROM deposit_intents \
+         WHERE user_pk = $1 AND status <> 'expired' ORDER BY created_at DESC LIMIT $2"
     ))
     .bind(user_pk)
     .bind(limit)
