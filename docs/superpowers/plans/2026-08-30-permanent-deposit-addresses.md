@@ -948,9 +948,14 @@ Remove `evaluate_payment` and `PaymentOutcome` from `custody.rs`, and these test
 `overpayment_settles_at_the_observed_total`, `underpayment_is_partial_never_settled`,
 `two_part_payment_settles_once_the_sum_reaches_expected`.
 
-Keep `a_duplicate_transaction_id_is_counted_once`, `absurd_amounts_saturate_rather_than_overflow`
-and `approval_events_are_dropped` — they were never about matching an expected amount. Move them to
-wherever the surviving logic lives.
+`a_duplicate_transaction_id_is_counted_once` and `absurd_amounts_saturate_rather_than_overflow` are
+deleted WITH `evaluate_payment`: both call it (custody.rs:312, :319) and there is no surviving pure
+function to move them to. Do not invent one. Their properties have moved: de-duplication is now the
+database's job (`uq_deposit_intents_tron_tx_id` + `ON CONFLICT DO NOTHING`, pinned by
+`the_same_transfer_seen_twice_is_one_credit` above), and there is no sum left to saturate — each
+transfer is credited on its own at its own `amount_usdt`.
+`approval_events_are_dropped` does NOT call `evaluate_payment` — it exercises the decoder — so it
+stays exactly where it is, untouched.
 
 Every deleted branch existed only because a user promised a figure in advance. Deleting them is the
 point of the change, not collateral damage.
