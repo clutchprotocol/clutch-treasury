@@ -427,8 +427,9 @@ async fn approval_event_never_backs_a_mint() {
     // Both paths: the known-hash path rejects it outright as hard evidence...
     let known = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval", Some("tx-approval")).await;
     // ...and the fallback path must not select it at all.
-    // A second intent at OTHER_ADDR, not DEPOSIT_ADDR: each intent's evidence is gathered at the
-    // address it names, so this proves the Approval event can't leak across intents.
+    // The fallback intent sits at OTHER_ADDR so its own query never sees this event at all —
+    // address-scoped isolation — while the known/hash assertion above is what proves an Approval
+    // is rejected by type.
     let fallback =
         seed_deposit_intent_at(&pool, 6_000_000, 6_000_088, "client-ref-approval-fb", None, OTHER_ADDR).await;
 
