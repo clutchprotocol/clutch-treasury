@@ -64,8 +64,10 @@ pub trait SweepSigner: Send + Sync {
     async fn sweep(&self, index: i64) -> SignerReply;
 }
 
-/// One pass: for every unswept deposit address, decide, sweep, record.
-pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, signer: &dyn SweepSigner) {
+/// One pass: for every unswept deposit address, decide, sweep, record. Returns the number of
+/// `approved`/`submitted`/`credited` rows that currently have NO `derivation_index` — see the
+/// warning below for why that count matters.
+pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, signer: &dyn SweepSigner) -> usize {
     let rows: Vec<(Uuid, String, i64, f64)> = match sqlx::query_as(
         // `credited` and later only. Sweeping an address whose deposit has not yet been credited
         // would move the evidence out from under the verifier before it has finished with it.
@@ -84,7 +86,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         Ok(r) => r,
         Err(e) => {
             tracing::error!("sweeper: could not list unswept addresses: {e}");
-            return;
+            return 0;
         }
     };
 
@@ -98,6 +100,47 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
     // The interval is an hour, so this costs 24 lines a day and buys a liveness signal that does
     // not depend on anything going wrong first.
     tracing::info!("sweeper: pass over {} unswept address(es)", rows.len());
+
+    // A credited deposit with no derivation_index can never satisfy the query above (it requires
+    // `derivation_index IS NOT NULL`), so it would sit unswept forever while this pass keeps logging
+    // the same "N unswept address(es)" line a healthy pass would show. Checked independently of the
+    // loop below, every pass, so a row stuck like this cannot hide behind an otherwise-quiet worker.
+    let missing_index: Vec<String> = match sqlx::query_scalar(
+        "SELECT deposit_address FROM mint_intents
+         WHERE deposit_address IS NOT NULL
+           AND derivation_index IS NULL
+           AND swept_at IS NULL
+           AND status IN ('approved', 'submitted', 'credited')",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("sweeper: could not check for deposits missing a derivation_index: {e}");
+            Vec::new()
+        }
+    };
+    let missing_count = missing_index.len();
+    if missing_count > 0 {
+        let mut distinct_addresses = missing_index;
+        distinct_addresses.sort_unstable();
+        distinct_addresses.dedup();
+        // An 'approved' row here is not yet stuck — the sweep query above only ever selects
+        // ('credited', 'submitted'), so 'approved' simply isn't sweep-eligible yet regardless of
+        // this column. It is 'submitted'/'credited' rows missing the index that are truly stuck:
+        // those statuses ARE what the sweep query selects on, so a missing index is the only thing
+        // excluding them, and derivation_index never gets set after the row is created.
+        let message = format!(
+            "sweeper: {missing_count} deposit(s) have no derivation_index — an 'approved' row is not \
+             yet eligible for sweeping, but any already 'submitted' or 'credited' can never be swept \
+             without one: {distinct_addresses:?}"
+        );
+        tracing::warn!("{message}");
+        // Beside the log line: a plain warn! is invisible to whatever watches the alerts table, and
+        // this condition is exactly as actionable as every other sweeper alert below.
+        alert(pool, "warn", "sweeper", &message).await;
+    }
 
     for (id, address, index, age_hours) in rows {
         let balance = match client.get_custody_balance(&address, &config.usdt_contract).await {
@@ -166,7 +209,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
                     ),
                 )
                 .await;
-                return;
+                return missing_count;
             }
 
             SignerReply::Failed(e) => {
@@ -174,6 +217,8 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
             }
         }
     }
+
+    missing_count
 }
 
 async fn mark_swept(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {

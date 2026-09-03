@@ -61,10 +61,11 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
-        deposit_ttl_minutes: 30,
-        min_deposit_usdt: 1_000_000,
-        max_deposit_usdt: 50_000_000,
+        // This file never exercises the deposit-create route — true just to match the
+        // non-degenerate default everywhere else.
+        permanent_deposit_addresses_enabled: true,
         poll_interval_secs: 30,
+        deposit_hot_window_hours: 24,
         redemptions_enabled,
         min_redemption_clt: 1_000_000,
         max_redemption_clt: 50_000_000,
@@ -483,6 +484,11 @@ async fn get_redemption_for_unknown_id_is_404() {
 /// the treasury payout rail is still a stub, so this must refuse before ever validating the
 /// address or bounds, and before ever calling the treasury (the mock below has no route mounted;
 /// a call to it would be a connection to a server with nothing mounted, i.e. NOT this gate).
+///
+/// The valid-auth POST and GET below show the gate applies to both routes; the no-auth POST at the
+/// end is what actually proves the gate runs BEFORE authentication — gate-then-auth and
+/// auth-then-gate both 503 a valid token, but only gate-then-auth also 503s a request with NO
+/// `Authorization` header (auth-then-gate would 401 it first).
 #[tokio::test]
 async fn both_routes_503_while_redemptions_disabled() {
     let pool = pool().await;
@@ -514,6 +520,7 @@ async fn both_routes_503_while_redemptions_disabled() {
     .unwrap();
 
     let get_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -525,6 +532,27 @@ async fn both_routes_503_while_redemptions_disabled() {
         .await
         .unwrap();
     assert_eq!(get_res.status(), StatusCode::SERVICE_UNAVAILABLE, "GET must ALSO 503 while redemptions_enabled is false, even for an existing, owned row");
+
+    // THE case that actually distinguishes gate-then-auth from auth-then-gate: no Authorization
+    // header at all. If auth ran first this would be 401; the gate must still answer 503.
+    let no_auth_res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/redemptions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"payout_tron_address": VALID_TRON_ADDRESS, "amount_clt": 2_000_000}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        no_auth_res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "must 503 even with NO Authorization header — proves the gate runs before auth, not just before a valid auth check"
+    );
 }
 
 /// Missing/invalid JWT must still be rejected on the redemption routes — proves auth wasn't

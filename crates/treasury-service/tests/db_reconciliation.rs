@@ -258,18 +258,23 @@ async fn a_reversed_mint_subtracts_from_liability() {
 /// column mint_intents has with no default (`beneficiary`, `amount_clt`, `credit_ref`, `created_by`)
 /// plus `approved_by`, since four_eyes requires a distinct approver past `created`. `swept_at` is
 /// omitted so it takes its NULL default — the "still unswept" state this test needs.
-async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str) {
+///
+/// `derivation_index` is nullable and unconstrained (treasury-service migration 0006) — `None`
+/// leaves it NULL, `Some` sets it, so this one helper can also seed the per-intent-era shape
+/// `legacy_unswept_addresses_are_still_counted` needs.
+async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str, derivation_index: Option<i64>) {
     let id = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO mint_intents (id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by,
-                                    deposit_tx_id, deposit_address)
+                                    deposit_tx_id, deposit_address, derivation_index)
          VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, 'credited', $2, 'orchestrator', 'tron-verifier',
-                 $3, $4)",
+                 $3, $4, $5)",
     )
     .bind(id)
     .bind(format!("ref-{id}"))
     .bind(tx_id)
     .bind(address)
+    .bind(derivation_index)
     .execute(pool)
     .await
     .unwrap();
@@ -281,10 +286,26 @@ async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str) {
 #[tokio::test]
 async fn one_address_on_two_unswept_rows_is_counted_once() {
     let pool = pool().await;
-    seed_unswept_mint(&pool, SHARED_ADDR, "tx-a").await;
-    seed_unswept_mint(&pool, SHARED_ADDR, "tx-b").await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-a", None).await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-b", None).await;
 
     let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
 
     assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "one address, counted once");
+}
+
+/// The design's §5 promised this test and nothing wrote it: `unswept_addresses`' predicate is
+/// independent of `derivation_index` and of how the address was issued. A non-NULL
+/// `derivation_index` is NOT the legacy shape — permanent per-user rows carry one too (since R17) —
+/// so it is not what distinguishes this row from the ones above; it is simply a per-intent-era row,
+/// seeded to pin that any unswept row's address is counted the same way, legacy or permanent, because
+/// the function's WHERE clause never mentions the column at all.
+#[tokio::test]
+async fn legacy_unswept_addresses_are_still_counted() {
+    let pool = pool().await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-legacy", Some(42)).await;
+
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+
+    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "a per-intent-era row must still be counted");
 }

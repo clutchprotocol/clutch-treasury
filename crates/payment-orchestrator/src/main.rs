@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use payment_orchestrator::custody::{CustodyWatcher, TronGridWatcher};
+use payment_orchestrator::custody::{CustodyWatcher, DepositWatcher, TronGridWatcher};
 use payment_orchestrator::derive::AddressDeriver;
 use payment_orchestrator::api;
 use payment_orchestrator::configuration::OrchConfig;
@@ -31,11 +31,25 @@ async fn main() {
         config.trongrid_api_key.clone(),
         config.usdt_contract.clone(),
     ));
+    // The per-user watcher: polls a bounded, hot-first slice of permanent addresses per pass (see
+    // poller::due_addresses) rather than every address that has ever existed.
+    let tiered: Arc<dyn DepositWatcher> = Arc::new(payment_orchestrator::poller::TieredPoller {
+        pool: pool.clone(),
+        inner: watcher.clone(),
+        budget: payment_orchestrator::poller::MAX_ADDRESSES_PER_PASS,
+    });
 
     // The ONLY detection path. Bitcart is gone: its TRX daemon attributes payments by the sender's
-    // address, which we cannot know in advance (see custody.rs). This polls each open intent's OWN
-    // derived address and matches by destination.
-    tokio::spawn(payment_orchestrator::poller::run(pool.clone(), watcher, config.poll_interval_secs));
+    // address, which we cannot know in advance (see custody.rs). This polls each user's permanent
+    // deposit address (tiered) and any still-open legacy per-intent address (watcher), matching by
+    // destination.
+    tokio::spawn(payment_orchestrator::poller::run(
+        pool.clone(),
+        tiered,
+        watcher,
+        config.usdt_contract.clone(),
+        config.poll_interval_secs,
+    ));
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
     // treasury's private zone. Same poll-interval convention as the poller above.

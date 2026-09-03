@@ -99,11 +99,15 @@ change only what fills it:
 
 ```sql
 SELECT address, derivation_index FROM deposit_addresses
- ORDER BY (hot_until > now()) DESC, last_polled_at ASC NULLS FIRST
+ ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
  LIMIT $1
 ```
 
-Stamp `last_polled_at` after each pass. Hot addresses first, the rest rotating oldest-first. Cost
+Stamp `last_polled_at` after each pass. Hot addresses first, the rest rotating oldest-first.
+The `COALESCE` is load-bearing: a bare `(hot_until > now()) DESC` sorts TRUE, FALSE, NULL as
+*three* tiers, so an address that was hot once and expired would permanently outrank one that was
+never hot, whatever their `last_polled_at` — starving never-hot users once the once-hot count
+reaches the budget. Caught in Task 5 review. Cost
 per pass is constant regardless of user count, and the cold rotation period is
 `(addresses ÷ budget) × poll_interval` — a figure that can be told to an operator rather than
 discovered.
@@ -161,6 +165,15 @@ arrived".
 That reshapes the API. `POST /api/v1/deposits` no longer creates an intent — it returns the caller's
 address, deriving and storing it on first call, and sets `hot_until`. It becomes idempotent by
 nature, because a user has exactly one address.
+
+The CLT beneficiary is the authenticated identity itself: the JWT `pk`, which the demo app already
+sets to the user's `0x` address, validated against the node's address rule (40 hex digits, optional
+`0x`) and normalized. The request body carries nothing and is ignored. A client cannot bind its
+deposits to a different CLT address, by design — under permanence a typo or a stranger's address
+would be that user's mint destination forever, and nothing between the body and the node validated
+the string. Tokens carrying a 130-hex public key instead of an address are refused with 400 until a
+client needs them (the derivation is keccak-256 of the key, as the demo app's wallet code does).
+*(Amended after Task 6 review, R14.)*
 
 Its min/max bounds have nothing left to check: there is no longer a figure supplied before money
 moves. `min_deposit_usdt` and `max_deposit_usdt` therefore become dead config. **Delete them rather

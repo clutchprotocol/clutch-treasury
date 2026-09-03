@@ -7,16 +7,22 @@
 //! intent is money credited to the wrong user.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use payment_orchestrator::custody::{CustodyWatcher, ObservedTransfer};
+use payment_orchestrator::custody::{CustodyWatcher, DepositWatcher, ObservedTransfer, TronGridWatcher};
 use payment_orchestrator::poller;
+use serde_json::json;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const USDT: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+/// Fixture address for the four crediting tests below — a real-shaped Tron address, matching what
+/// `seed_address` and `TronGridWatcher` both expect.
+const ADDR: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
 
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
@@ -27,7 +33,14 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, alerts RESTART IDENTITY CASCADE").execute(&pool).await.unwrap();
+    // deposit_addresses is included here (Task 5 test helper seed_address writes to it):
+    // otherwise its rows outlive the test that created them while the sequence below is reset
+    // to 0 every time, and the next test's first insert collides with a leftover row's
+    // derivation_index — same reasoning as db_addresses.rs's own pool() helper.
+    sqlx::query("TRUNCATE deposit_intents, alerts, deposit_addresses RESTART IDENTITY CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("ALTER SEQUENCE deposit_derivation_index_seq RESTART").execute(&pool).await.unwrap();
     pool
 }
@@ -54,7 +67,11 @@ impl FakeChain {
 
 #[async_trait]
 impl CustodyWatcher for FakeChain {
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String> {
+    async fn transfers_to(
+        &self,
+        address: &str,
+        _min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String> {
         self.asked.lock().unwrap().push(address.to_string());
         if self.fail {
             return Err("scripted TronGrid outage".into());
@@ -63,8 +80,30 @@ impl CustodyWatcher for FakeChain {
     }
 }
 
+/// `poll_once`'s loop (a) needs a `DepositWatcher` too. Returns every transfer this fake knows about
+/// regardless of address (a real `DepositWatcher` is not address-scoped either, per custody.rs) and
+/// fails the same way `CustodyWatcher::transfers_to` does when scripted to. None of `FakeChain`'s own
+/// legacy-per-intent tests seed any `deposit_addresses` rows, so `credit_from_addresses` resolves no
+/// owner for anything this returns and quietly leaves it to loop (b) — this is what R17's new test
+/// (`a_per_user_poll_outage_does_not_stop_the_legacy_loop`) needs a real failure mode for.
+#[async_trait]
+impl DepositWatcher for FakeChain {
+    async fn poll(&self) -> Result<Vec<ObservedTransfer>, String> {
+        if self.fail {
+            return Err("scripted TronGrid outage".into());
+        }
+        Ok(self.by_address.values().flatten().cloned().collect())
+    }
+}
+
 fn transfer(tx: &str, to: &str, amount: i64, ts: i64) -> ObservedTransfer {
     ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: to.into(), contract: USDT.into(), block_timestamp: ts }
+}
+
+/// Same shape as `transfer`, minus the timestamp: the four crediting tests below never depend on
+/// ordering, only on identity (`tx_id`) and amount.
+fn observed(tx_id: &str, to: &str, amount: i64) -> ObservedTransfer {
+    ObservedTransfer { tx_id: tx_id.into(), amount_usdt: amount, to: to.into(), contract: USDT.into(), block_timestamp: 1_700_000_000_000 }
 }
 
 /// Insert an intent directly, with its own address — the create path is covered elsewhere; these
@@ -93,6 +132,26 @@ async fn seed(pool: &PgPool, key: &str, address: &str, amount: i64, status: &str
     id
 }
 
+/// Insert a permanent deposit address row directly — the derive/issue path is covered elsewhere.
+/// `hot_hours: Some(n)` marks it hot for `n` hours from now; `None` leaves it cold.
+async fn seed_address(pool: &PgPool, user_pk: &str, address: &str, hot_hours: Option<i64>) {
+    let index = sqlx::query_scalar::<_, i64>("SELECT nextval('deposit_derivation_index_seq')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address, hot_until)
+         VALUES ($1, $2, $3, 'clt', $4)",
+    )
+    .bind(user_pk)
+    .bind(index)
+    .bind(address)
+    .bind(hot_hours.map(|h| chrono::Utc::now() + chrono::Duration::hours(h)))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
     sqlx::query_scalar::<_, String>("SELECT status FROM deposit_intents WHERE id = $1")
         .bind(id)
@@ -116,7 +175,7 @@ async fn a_transfer_at_the_intents_own_address_confirms_it_and_records_the_evide
     let id = seed(&pool, "k-alice", addr, 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-alice", addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
     assert_eq!(tx_of(&pool, id).await.as_deref(), Some("tx-alice"), "the evidence hash must be stored");
@@ -134,64 +193,41 @@ async fn a_payment_credits_only_the_intent_that_owns_that_address() {
 
     // Same amount, so amount alone could not tell them apart — the address must.
     let chain = FakeChain::with(bob_addr, vec![transfer("tx-bob", bob_addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, bob).await, "confirmed", "bob paid, bob confirms");
     assert_eq!(status_of(&pool, alice).await, "invoiced", "alice did not pay and must not advance");
     assert!(tx_of(&pool, alice).await.is_none(), "alice must carry no evidence");
 }
 
+// `an_underpayment_is_held_at_paying_and_never_credited` and
+// `a_second_instalment_settles_a_previously_underpaid_intent` were deleted here (Task 7, Step 5b):
+// both pinned `PaymentOutcome::Partial` — an intent held at `paying`, not credited, because a
+// transfer fell short of the amount it was created with. "Credit everything, cap nothing" now
+// applies to legacy addresses too, so the property they tested (short payments are NOT credited) is
+// gone, not moved: the FIRST unseen transfer to a legacy address settles it at its own arrived
+// amount, however small. There is nothing left to instalment toward.
+
+/// "Credit everything, cap nothing" applies to legacy addresses too: an amount over what the intent
+/// was originally created for still confirms, at the full arrived amount — there is no ceiling to
+/// compare against any more. Renamed from `an_overpayment_confirms_and_is_flagged`: the "overpaid"
+/// alert was expected-amount arithmetic (Task 7, Step 5b) and was deleted with it.
 #[tokio::test]
-async fn an_underpayment_is_held_at_paying_and_never_credited() {
-    let pool = pool().await;
-    let addr = "TAddrShort";
-    let id = seed(&pool, "k-short", addr, 2_000_000, "invoiced").await;
-
-    let chain = FakeChain::with(addr, vec![transfer("tx-short", addr, 1_999_999, 100)]);
-    poller::poll_once(&pool, &chain).await;
-
-    assert_eq!(status_of(&pool, id).await, "paying", "short of expected — held, not confirmed");
-    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%underpaid%'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(alerts, 1, "an underpayment must be flagged, not silently parked");
-}
-
-#[tokio::test]
-async fn a_second_instalment_settles_a_previously_underpaid_intent() {
-    let pool = pool().await;
-    let addr = "TAddrTwoPart";
-    let id = seed(&pool, "k-two", addr, 2_000_000, "invoiced").await;
-
-    let first = FakeChain::with(addr, vec![transfer("tx-1", addr, 1_200_000, 100)]);
-    poller::poll_once(&pool, &first).await;
-    assert_eq!(status_of(&pool, id).await, "paying");
-
-    let both = FakeChain::with(
-        addr,
-        vec![transfer("tx-1", addr, 1_200_000, 100), transfer("tx-2", addr, 800_000, 200)],
-    );
-    poller::poll_once(&pool, &both).await;
-    assert_eq!(status_of(&pool, id).await, "confirmed", "the sum now covers the expected amount");
-    assert_eq!(tx_of(&pool, id).await.as_deref(), Some("tx-1"), "evidence names the EARLIEST transfer");
-}
-
-#[tokio::test]
-async fn an_overpayment_confirms_and_is_flagged() {
+async fn an_overpayment_confirms_at_the_full_arrived_amount() {
     let pool = pool().await;
     let addr = "TAddrOver";
     let id = seed(&pool, "k-over", addr, 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-over", addr, 9_000_000, 100)]);
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
-    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%overpaid%'")
+    let received: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE id = $1")
+        .bind(id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(alerts, 1, "a surplus must be flagged for reconciliation");
+    assert_eq!(received, 9_000_000, "credited at what arrived, not capped at what was originally asked for");
 }
 
 /// A soft-expired intent is still honoured: our TTL is a local timer, and at par a late payment
@@ -203,7 +239,7 @@ async fn a_late_payment_to_an_expired_intent_still_confirms() {
     let id = seed(&pool, "k-late", addr, 2_000_000, "expired").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-late", addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
 }
@@ -215,7 +251,8 @@ async fn a_chain_outage_neither_advances_nor_loses_the_intent() {
     let pool = pool().await;
     let id = seed(&pool, "k-outage", "TAddrOutage", 2_000_000, "invoiced").await;
 
-    poller::poll_once(&pool, &FakeChain::failing()).await;
+    let chain = FakeChain::failing();
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "invoiced", "an unread chain must not change state");
     let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%custody fetch failed%'")
@@ -235,7 +272,7 @@ async fn terminal_and_flagged_intents_are_not_polled() {
     let open = seed(&pool, "k-open", "TAddrOpen", 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with("TAddrOpen", vec![transfer("tx-open", "TAddrOpen", 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     let asked = chain.asked.lock().unwrap().clone();
     assert!(asked.contains(&"TAddrOpen".to_string()), "the open intent must be polled");
@@ -255,12 +292,12 @@ async fn re_polling_a_confirmed_intent_changes_nothing() {
     let id = seed(&pool, "k-idem", addr, 2_000_000, "invoiced").await;
     let chain = FakeChain::with(addr, vec![transfer("tx-idem", addr, 2_000_000, 100)]);
 
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
     let after_first = status_of(&pool, id).await;
     let tx_first = tx_of(&pool, id).await;
 
-    poller::poll_once(&pool, &chain).await;
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, after_first, "status must not drift on re-poll");
     assert_eq!(tx_of(&pool, id).await, tx_first, "the first-seen evidence hash must stand");
@@ -283,8 +320,390 @@ async fn legacy_rows_without_an_address_are_skipped() {
     .unwrap();
 
     let chain = FakeChain::default();
-    poller::poll_once(&pool, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert!(chain.asked.lock().unwrap().is_empty(), "a row with no address must not be polled");
     assert_eq!(status_of(&pool, id).await, "created");
+}
+
+#[tokio::test]
+async fn hot_addresses_are_polled_before_cold_ones_and_the_budget_is_respected() {
+    // Cost per PASS is what is bounded, not cost per address — otherwise a permanent address per
+    // user means one TronGrid request per user who ever existed, every pass.
+    let pool = pool().await;
+    seed_address(&pool, "0xcold-1", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", None).await;
+    seed_address(&pool, "0xcold-2", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+    seed_address(&pool, "0xhot", "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx", Some(24)).await;
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 2).await.unwrap();
+
+    assert_eq!(due.len(), 2, "the per-pass budget is a hard cap");
+    assert_eq!(due[0].address, "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx", "hot first");
+}
+
+#[tokio::test]
+async fn cold_addresses_rotate_oldest_attempted_first() {
+    let pool = pool().await;
+    seed_address(&pool, "0xa", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", None).await;
+    seed_address(&pool, "0xb", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+    sqlx::query("UPDATE deposit_addresses SET last_attempt_at = now() WHERE user_pk = '0xa'")
+        .execute(&pool).await.unwrap();
+    // 0xb (expected to win) gets a last_polled_at so the two columns disagree: ordering by
+    // last_attempt_at ASC NULLS FIRST still picks 0xb (never attempted, correct); ordering by
+    // last_polled_at ASC NULLS FIRST — a revert — would pick 0xa instead, since 0xa's is NULL.
+    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE user_pk = '0xb'")
+        .execute(&pool).await.unwrap();
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
+
+    assert_eq!(due[0].user_pk, "0xb", "never-attempted sorts ahead of just-attempted");
+}
+
+/// Regression test for the three-tier bug in `due_addresses`'s ORDER BY. Under the OLD query
+/// (`(hot_until > now()) DESC NULLS LAST, last_attempt_at ASC NULLS FIRST`): A's `hot_until` is an
+/// hour in the past, so `hot_until > now()` evaluates to FALSE; B's `hot_until` is NULL (never hot),
+/// so the same expression evaluates to NULL. Boolean `DESC` ranks TRUE, then FALSE, then NULL —
+/// `NULLS LAST` only guarantees NULL does not beat TRUE, it does NOT merge FALSE and NULL into one
+/// tier — so A's FALSE outranks B's NULL regardless of `last_attempt_at`, and A (attempted a minute
+/// ago) would be selected over B (never attempted). Under the FIX, `COALESCE(hot_until > now(),
+/// false)` maps both A and B to `false` on that first key, so they land in the same cold tier
+/// ordered by `last_attempt_at ASC NULLS FIRST` — B's NULL sorts before A's one-minute-old
+/// timestamp, so B wins.
+#[tokio::test]
+async fn expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it() {
+    let pool = pool().await;
+    // A: previously hot, now expired — hot_until an hour in the past — attempted a minute ago.
+    seed_address(&pool, "0xa-expired-hot", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", Some(-1)).await;
+    sqlx::query(
+        "UPDATE deposit_addresses SET last_attempt_at = now() - interval '1 minute' \
+         WHERE user_pk = '0xa-expired-hot'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // B: never hot, never attempted.
+    seed_address(&pool, "0xb-never-hot", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
+
+    assert_eq!(due.len(), 1, "the per-pass budget is a hard cap");
+    assert_eq!(
+        due[0].address, "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK",
+        "a never-hot, never-attempted address must not be starved by one that was hot once and expired"
+    );
+}
+
+// Task 7: crediting permanent per-user addresses. Each transfer is its own deposit — there is no
+// expected amount to sum toward or cap against any more.
+
+#[tokio::test]
+async fn two_transfers_to_one_address_are_two_credits() {
+    // The core of the change, and impossible to express under the uniqueness index dropped in
+    // Task 3. One user, one address, two deposits.
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+    let index: i64 = sqlx::query_scalar("SELECT derivation_index FROM deposit_addresses WHERE address = $1")
+        .bind(ADDR)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let a = observed("tx-one", ADDR, 1_000_000);
+    let b = observed("tx-two", ADDR, 2_500_000);
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", index, &a).await.unwrap());
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", index, &b).await.unwrap());
+
+    let (rows, total, off_par, wrong_index): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT,
+                count(*) FILTER (WHERE amount_clt <> received_usdt OR amount_usdt <> received_usdt),
+                count(*) FILTER (WHERE derivation_index IS DISTINCT FROM $2)
+         FROM deposit_intents WHERE deposit_address = $1",
+    )
+    .bind(ADDR)
+    .bind(index)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 2);
+    assert_eq!(total, 3_500_000, "each transfer credited in full — credit everything, cap nothing");
+    // Task 6 retired `amount_clt_equals_amount_usdt_at_par` with the create() flow; the par rule
+    // (1 micro-USDT = 1 CLT base unit) now lives in credit_transfer's INSERT, so it is pinned here.
+    assert_eq!(off_par, 0, "amount_clt and amount_usdt must both equal what arrived");
+    // R17: credit_transfer used to silently omit derivation_index — every such row got minted
+    // (treasury_bridge.rs forwards it verbatim) and then never swept (sweeper.rs filters on it being
+    // set), with nothing in the suite noticing a NULL.
+    assert_eq!(wrong_index, 0, "both credited rows must carry the address's own derivation_index");
+}
+
+#[tokio::test]
+async fn the_same_transfer_seen_twice_is_one_credit() {
+    // A poll pass re-reads an address's recent history every rotation, so re-observation is the
+    // normal case, not an edge case. Identity is the transaction.
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+    let t = observed("tx-one", ADDR, 1_000_000);
+
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &t).await.unwrap());
+    assert!(
+        !poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &t).await.unwrap(),
+        "the second sighting creates nothing"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE deposit_address = $1")
+        .bind(ADDR)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn a_one_cent_deposit_is_credited_in_full() {
+    // "Credit everything, cap nothing" — there is no floor. Dust costs more TRX to sweep than it is
+    // worth, but that lands on the sweep threshold and the fee account, never on the user.
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+
+    poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &observed("tx-dust", ADDR, 10_000)).await.unwrap();
+
+    let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE tron_tx_id = 'tx-dust'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(got, 10_000);
+}
+
+/// `TieredPoller::poll` itself had no coverage before this: without "stamp `last_attempt_at` even on
+/// failure", one broken address would be re-picked every pass forever while the others starved
+/// behind it — exactly the failure mode Task 5's per-pass budget exists to prevent. Covered here,
+/// where `poll_once`'s loop (a) (`credit_from_addresses`) finally wires `TieredPoller` in for real,
+/// against a real (mocked) TronGrid rather than `FakeChain`.
+///
+/// R23: A's and C's failures must rotate them (`last_attempt_at` set) WITHOUT moving their read
+/// watermarks (`last_polled_at` stays NULL — never successfully read) — otherwise the next pass's
+/// `min_timestamp` silently skips whatever arrived at them while they were down. B's success advances
+/// both. TWO addresses fail on purpose, not one: a single failing address cannot tell an aggregated
+/// alert row apart from a per-address one, since both would produce exactly one row. Proving
+/// aggregation needs two failures landing in the SAME row — `count(*) WHERE source = 'poller'` stays
+/// 1, and that one row's message names both A and C.
+#[tokio::test]
+async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
+    let pool = pool().await;
+    let addr_a = "TAddrFailingA";
+    let addr_b = "TAddrWorkingB";
+    let addr_c = "TAddrFailingC";
+    seed_address(&pool, "0xuser-a", addr_a, None).await;
+    seed_address(&pool, "0xuser-b", addr_b, None).await;
+    seed_address(&pool, "0xuser-c", addr_c, None).await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr_a}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr_c}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr_b}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{
+                "transaction_id": "tx-b",
+                "to": addr_b,
+                "value": "500000",
+                "token_info": { "address": USDT },
+                "type": "Transfer",
+                "block_timestamp": 1_700_000_000_000i64,
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let raw: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(server.uri(), "test-key".into(), USDT.into()));
+    let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 3 };
+
+    let result = poller::credit_from_addresses(&pool, &tiered, USDT).await;
+    assert!(result.is_ok(), "A's and C's failures must be logged, not propagated: {result:?}");
+
+    let credited: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-b'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(credited, 1, "B's transfer must be credited");
+
+    let attempted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE last_attempt_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attempted, 3,
+        "A, B, and C must all rotate — last_attempt_at set even though A's and C's fetches failed"
+    );
+
+    let a_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(a_watermark.is_none(), "A's failed fetch must NOT advance its read watermark");
+
+    let c_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(c_watermark.is_none(), "C's failed fetch must NOT advance its read watermark");
+
+    let b_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(b_watermark.is_some(), "B's successful fetch must advance its read watermark");
+
+    let alert_count: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'poller'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        alert_count, 1,
+        "two failing addresses must still produce exactly one aggregated alert row — a per-address \
+         implementation would have produced two"
+    );
+
+    let alert_message: String = sqlx::query_scalar("SELECT message FROM alerts WHERE source = 'poller'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(alert_message.contains(addr_a), "the single alert must name A");
+    assert!(alert_message.contains(addr_c), "the single alert must name C");
+}
+
+/// The property R23 exists for, isolated to a single address mid-outage. Without the fix this
+/// address's `last_polled_at` would be stamped to `now()` regardless of the failed fetch, and the
+/// next pass's `min_timestamp` (`last_polled_at - 1h`) would silently start AFTER the outage,
+/// skipping whatever arrived during it. With the fix the watermark must stay exactly where it was.
+#[tokio::test]
+async fn a_watermark_survives_an_outage() {
+    let pool = pool().await;
+    let addr = "TAddrOutageWatermark";
+    seed_address(&pool, "0xuser-outage", addr, None).await;
+    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() - interval '3 hours' WHERE address = $1")
+        .bind(addr)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let t0: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let t0 = t0.expect("just set last_polled_at above");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let raw: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(server.uri(), "test-key".into(), USDT.into()));
+    let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 1 };
+
+    poller::credit_from_addresses(&pool, &tiered, USDT).await.unwrap();
+
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after.expect("must not be cleared, only left unmoved"),
+        t0,
+        "a failed pass must leave the watermark exactly where it was, so the next successful pass \
+         re-reads from T0 - 1h rather than silently skipping the outage"
+    );
+
+    let attempted: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_attempt_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(attempted.is_some(), "the failed attempt must still be recorded for rotation");
+}
+
+// R17 review fixes.
+
+/// TRON dust-poisoning sends 0-value TRC-20 transfers routinely — this must be a no-op, not the
+/// recurring `CHECK (amount_usdt > 0)` violation it would be if credited verbatim.
+#[tokio::test]
+async fn a_zero_value_transfer_is_ignored_not_an_error() {
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+
+    assert!(
+        !poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &observed("tx-dust-zero", ADDR, 0))
+            .await
+            .unwrap(),
+        "a zero-value transfer must not be credited"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-dust-zero'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// Defence in depth for the `DepositWatcher` seam: it is deliberately not address-scoped (custody.rs
+/// module docs), so a future cursor-based implementation that filters locally has nothing upstream of
+/// `credit_from_addresses` guaranteed to have already checked the contract.
+#[tokio::test]
+async fn a_transfer_of_another_token_is_not_credited() {
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+
+    let wrong_token = ObservedTransfer {
+        tx_id: "tx-wrong-token".into(),
+        amount_usdt: 1_000_000,
+        to: ADDR.into(),
+        contract: "TWrongTokenContract111111111111111".into(),
+        block_timestamp: 1_700_000_000_000,
+    };
+    let chain = FakeChain::with(ADDR, vec![wrong_token]);
+
+    let result = poller::credit_from_addresses(&pool, &chain, USDT).await;
+    assert!(result.is_ok());
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-wrong-token'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a transfer in the wrong contract must never be credited");
+}
+
+/// The property that is the whole reason `poll_once` stays `()`-returning instead of propagating
+/// loop (a)'s `Result` with a bare `?`: a per-user `DepositWatcher` outage must not stop loop (b)
+/// from reaching the legacy intents behind it.
+#[tokio::test]
+async fn a_per_user_poll_outage_does_not_stop_the_legacy_loop() {
+    let pool = pool().await;
+    let addr = "TAddrLegacyDuringOutage";
+    let id = seed(&pool, "k-legacy-outage", addr, 2_000_000, "invoiced").await;
+
+    let failing = FakeChain::failing();
+    let healthy = FakeChain::with(addr, vec![transfer("tx-legacy", addr, 2_000_000, 100)]);
+
+    poller::poll_once(&pool, &failing, &healthy, USDT).await;
+
+    assert_eq!(status_of(&pool, id).await, "confirmed", "a per-user outage must not block the legacy loop");
 }

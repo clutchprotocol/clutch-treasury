@@ -527,6 +527,18 @@ In `crates/payment-orchestrator/src/configuration.rs`, beside `poll_interval_sec
     pub deposit_hot_window_hours: i64,
 ```
 
+`OrchConfig` fields have no serde defaults — `redemptions_enabled` boots only because
+`config/default.toml` carries `redemptions_enabled = false`. So add to `crates/payment-orchestrator/config/default.toml`:
+
+```toml
+# Hours a user's deposit address stays on the fast poll tier after they open the deposit panel.
+# See OrchConfig::deposit_hot_window_hours. Very large values collapse tiering into polling everything.
+deposit_hot_window_hours = 24
+```
+
+Without this line the orchestrator PANICS at boot the moment this field exists, before any env var is
+consulted. This is the same trap the payout rail hit twice; do not rely on compose alone.
+
 - [ ] **Step 4: Add the selection query**
 
 In `crates/payment-orchestrator/src/poller.rs`:
@@ -546,7 +558,7 @@ pub struct DueAddress {
 pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>, String> {
     sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT user_pk, address, last_polled_at FROM deposit_addresses
-         ORDER BY (hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST
+         ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
          LIMIT $1",
     )
     .bind(budget)
@@ -561,7 +573,15 @@ pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>
 }
 ```
 
-- [ ] **Step 5: Add the DepositWatcher seam**
+- [ ] **Step 5: Widen `CustodyWatcher::transfers_to` to take a lower bound**
+
+In `crates/payment-orchestrator/src/custody.rs`, change the trait method to
+`async fn transfers_to(&self, address: &str, min_timestamp_ms: Option<i64>) -> Result<Vec<ObservedTransfer>, String>;`
+and have the TronGrid implementation pass it as the `min_timestamp` query parameter when `Some`.
+Update every existing caller and test double to pass `None` — `grep -rn "transfers_to(" crates/` finds
+them, including the sweeper's. Behaviour for `None` is unchanged.
+
+- [ ] **Step 6: Add the DepositWatcher seam**
 
 In `crates/payment-orchestrator/src/custody.rs`, below `CustodyWatcher`:
 
@@ -578,7 +598,7 @@ pub trait DepositWatcher: Send + Sync {
 }
 ```
 
-- [ ] **Step 6: Implement TieredPoller behind the seam**
+- [ ] **Step 7: Implement TieredPoller behind the seam**
 
 Without this the trait is dead code and the seam is decorative. In `crates/payment-orchestrator/src/poller.rs`:
 
@@ -601,7 +621,12 @@ impl DepositWatcher for TieredPoller {
         let mut found = Vec::new();
 
         for a in &due {
-            match self.inner.transfers_to(&a.address).await {
+            // Only transfers since we last looked, minus an hour of overlap. Permanent addresses
+            // otherwise re-fetch their entire history every rotation. The overlap is free: a
+            // transfer landing between the query and the stamp is re-observed next pass, and
+            // credit_transfer is idempotent on tron_tx_id. Epoch MILLISECONDS, per ObservedTransfer.
+            let since = a.last_polled_at.map(|t| (t - chrono::Duration::hours(1)).timestamp_millis());
+            match self.inner.transfers_to(&a.address, since).await {
                 Ok(mut ts) => found.append(&mut ts),
                 // One unreadable address must not abort the pass: the others are still due, and a
                 // TronGrid blip on one address would otherwise stall every deposit behind it.
@@ -624,7 +649,7 @@ impl DepositWatcher for TieredPoller {
 Stamp even the addresses whose read failed. Otherwise a permanently unreadable address pins itself
 to the front of the rotation and starves every other address of its budget slot.
 
-- [ ] **Step 7: Verify and commit**
+- [ ] **Step 8: Verify and commit**
 
 CI. Then:
 
@@ -636,6 +661,16 @@ git commit -m "feat: tiered address selection behind a DepositWatcher seam"
 ---
 
 ### Task 6: The endpoint returns an address
+
+> **Amendment R14 (landed as the Task 6 fix loop, after review).** The body field is GONE.
+> `POST /api/v1/deposits` takes no body (any body an old client still sends is ignored — no `Json`
+> extractor). The beneficiary is the authenticated identity: `user_pk` must satisfy the node's address
+> rule (`clutch-node/src/node/transactions/address.rs::is_valid_address` — strip optional `0x`/`0X`,
+> 40 ASCII hex digits) or the route answers 400; `clt_address` stored on `deposit_addresses` is the
+> canonical lowercase `0x`-prefixed form, computed by a private helper in `api.rs` (`clutch-chain`'s
+> `normalize_address` is private and the orchestrator does not depend on that crate — do not add the
+> dependency for two lines). Route-level test fixtures therefore use real-shaped
+> addresses, not `"0xuser-a"`. Everything below that says `{"clt_address": ...}` is superseded.
 
 **Files:**
 - Modify: `crates/payment-orchestrator/src/api.rs:71-95`
@@ -655,11 +690,24 @@ Add to `crates/payment-orchestrator/tests/db_deposit_api.rs`, following that fil
 async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
     // The user asks where to send, not how much they promise to send. Two calls must give the same
     // address, or money sent to the first arrives somewhere nothing watches.
-    let (pool, config) = api_fixture().await;
-    let token = jwt_for(&config, "0xuser-a");
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
+    let app = router_with(pool.clone(), config);
 
-    let first = post_deposit(&pool, &config, &token).await;
-    let second = post_deposit(&pool, &config, &token).await;
+    let post = |app: axum::Router| async move {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/deposits")
+            .header("authorization", bearer_for("0xuser-a"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"clt_address":"0xclt-a"}"#))
+            .unwrap();
+        body_json(tower::ServiceExt::oneshot(app, req).await.unwrap()).await
+    };
+
+    let first = post(app.clone()).await;
+    let second = post(app).await;
 
     assert_eq!(first["address"], second["address"]);
     assert!(first["address"].as_str().unwrap().starts_with('T'));
@@ -667,7 +715,21 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
 }
 ```
 
-`api_fixture`, `jwt_for` and a request helper already exist in that file under some names — read it and reuse them. Add `post_deposit` only if no equivalent exists.
+These helpers already exist in that file: `pool()`, `mock_treasury_with_generous_headroom()`,
+`test_config(treasury_url)`, `bearer_for(pk)`, `router_with(pool, config)`, `body_json(resp)`. Read how
+the existing tests there build and send a request — match that exactly (they may use a different
+request idiom than the sketch above; the sketch shows intent, the file shows the convention).
+
+**Retire exactly these FIVE tests in that file** — every one exercises the amount-bearing,
+idempotency-keyed create flow this task removes, so deleting them is the point, not collateral:
+`replay_same_key_same_body_returns_original_status_and_body`, `same_key_different_body_returns_409`,
+`retry_while_processing_returns_409_with_retry_after`, `out_of_bounds_amount_returns_400`,
+`missing_idempotency_key_returns_400`.
+
+**Keep** `get_deposit_rejects_non_owner` (the GET path is unchanged) and `missing_auth_returns_401`
+(auth still gates the route) — but update the latter's request to the new body shape
+(`{"clt_address": ...}`, no amount, no `idempotency-key` header) so it exercises the route as it now
+exists rather than a request the handler no longer parses.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -725,7 +787,17 @@ stated in the doc comment so it is a decision rather than an accident.
 
 - [ ] **Step 4: Remove the now-unreachable intent-creation path**
 
-`deposits::create_and_invoice` and its `insert_new` are no longer called by the API. Delete them along with `ApiError::OutOfBounds` and the `same_body` idempotency helper. Leave everything that reads or advances existing intents — the poller and treasury bridge still use those.
+`deposits::create_and_invoice` and its `insert_new` are no longer called by the API. Delete them
+along with BOTH deposit-side bounds variants — `ApiError::OutOfBounds` (`deposits.rs`, raised inside
+`insert_new`) and `DepositOutcome::OutOfBounds` (`deposits.rs`, matched by the old handler at
+`api.rs:107`) — and the `same_body` idempotency helper. If `CreateOutcome` or `DepositOutcome` has no
+remaining constructor after that, delete the enum too rather than leaving an unreachable variant set.
+
+**Do NOT touch `RedemptionOutcome::OutOfBounds`** (`redemptions.rs`, matched at `api.rs:220`) — that is
+the redemption bounds check, a different flow, and it stays.
+
+Leave everything that reads or advances existing intents — `deposits::find_by_id` (used by the kept
+`get_deposit_handler`), the poller, and the treasury bridge all still use those.
 
 If any test covers only the deleted path, delete that test too; do not keep a test alive by pointing it at something else.
 
@@ -742,14 +814,25 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 
 ### Task 7: Credit each transfer on its own
 
+> **Amendment R17 (from the Task 7 review).** `credit_transfer` MUST write `derivation_index`, read from
+> `deposit_addresses` alongside `user_pk`/`clt_address`. The treasury's sweeper selects
+> `WHERE derivation_index IS NOT NULL` (`treasury-service/src/sweeper.rs`), and `treasury_bridge` forwards
+> the column verbatim — a NULL means the deposit is minted against and then never swept, silently
+> (the sweeper logs "0 unswept addresses"), while reconciliation's fan-out grows with every depositor.
+> Also: ignore zero-value transfers (`amount_usdt <= 0` → `Ok(false)`; the CHECK constraints would
+> otherwise turn TRON's routine dust-poisoning into a recurring error), and re-check `t.contract`
+> against the configured USDT contract on the credit path — defence in depth for the `DepositWatcher`
+> seam, whose future cursor-based implementation filters locally.
+
 **Files:**
 - Modify: `crates/payment-orchestrator/src/custody.rs` (delete `evaluate_payment` and `PaymentOutcome`)
 - Modify: `crates/payment-orchestrator/src/poller.rs`
+- Modify: `crates/payment-orchestrator/src/main.rs` (build the `TieredPoller { pool, inner, budget: MAX_ADDRESSES_PER_PASS }` and hand it to `run` — Step 5 already requires this; listed here so the file is in scope)
 - Test: `crates/payment-orchestrator/tests/db_poller.rs`
 
 **Interfaces:**
 - Consumes: `due_addresses`, `DepositWatcher` (Task 5); `uq_deposit_intents_tron_tx_id` (Task 2).
-- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
+- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, clt_address: &str, derivation_index: i64, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -763,14 +846,17 @@ async fn two_transfers_to_one_address_are_two_credits() {
 
     let a = observed("tx-one", ADDR, 1_000_000);
     let b = observed("tx-two", ADDR, 2_500_000);
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &a).await.unwrap());
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &b).await.unwrap());
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &a).await.unwrap());
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &b).await.unwrap());
 
-    let (rows, total): (i64, i64) = sqlx::query_as(
-        "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT FROM deposit_intents WHERE deposit_address = $1")
+    let (rows, total, off_par): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT,                 count(*) FILTER (WHERE amount_clt <> received_usdt OR amount_usdt <> received_usdt)            FROM deposit_intents WHERE deposit_address = $1")
         .bind(ADDR).fetch_one(&pool).await.unwrap();
     assert_eq!(rows, 2);
     assert_eq!(total, 3_500_000, "each transfer credited in full — credit everything, cap nothing");
+    // Task 6 retired `amount_clt_equals_amount_usdt_at_par` with the create() flow; the par rule
+    // (1 micro-USDT = 1 CLT base unit) now lives in credit_transfer's INSERT, so it is pinned here.
+    assert_eq!(off_par, 0, "amount_clt and amount_usdt must both equal what arrived");
 }
 
 #[tokio::test]
@@ -781,8 +867,8 @@ async fn the_same_transfer_seen_twice_is_one_credit() {
     seed_address(&pool, "0xuser-a", ADDR, None).await;
     let t = observed("tx-one", ADDR, 1_000_000);
 
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &t).await.unwrap());
-    assert!(!payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &t).await.unwrap(),
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap());
+    assert!(!payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap(),
         "the second sighting creates nothing");
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE deposit_address = $1")
@@ -797,11 +883,29 @@ async fn a_one_cent_deposit_is_credited_in_full() {
     let pool = pool().await;
     seed_address(&pool, "0xuser-a", ADDR, None).await;
 
-    payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
+    payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
 
     let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE tron_tx_id = 'tx-dust'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(got, 10_000);
+}
+```
+
+A fourth test, added after Task 5's review: `TieredPoller::poll` itself had no coverage, and its
+"stamp `last_polled_at` even when TronGrid fails" property is what stops one broken address from being
+re-polled every pass while the others starve. Cover it here, where the poller is finally wired in:
+
+```rust
+#[tokio::test]
+async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
+    // Two users with permanent addresses (via `address_for_user`), budget covering both.
+    // wiremock: 500 for A's `/v1/accounts/{A}/transactions/trc20`, one valid transfer for B.
+    // Run one pass over the per-user loop (poll_once, or TieredPoller::poll + credit_transfer —
+    // whichever Step 5 makes natural).
+    // Assert: B's transfer is credited (one deposit_intents row carrying its tx id);
+    //         last_polled_at IS NOT NULL for BOTH A and B;
+    //         the pass returned Ok — A's failure was logged, not propagated.
+    // Fails if stamping moves inside the success branch, or if a `?` on one address aborts the loop.
 }
 ```
 
@@ -827,13 +931,19 @@ In `crates/payment-orchestrator/src/poller.rs`:
 pub async fn credit_transfer(
     pool: &PgPool,
     user_pk: &str,
+    clt_address: &str,
     t: &ObservedTransfer,
 ) -> Result<bool, String> {
     let done = sqlx::query(
+        // client_key is NOT NULL and was the user's idempotency key when users created intents. The
+        // chain creates them now, so the tx id IS the idempotency key — and it makes the pre-existing
+        // UNIQUE (user_pk, client_key) a second guard behind uq_deposit_intents_tron_tx_id.
+        // expires_at is NOT NULL and meaningless for an observed transfer; now() reads as "already
+        // settled" rather than inventing a deadline nothing enforces.
         "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, amount_clt, status,
-             deposit_address, tron_tx_id, received_usdt, expires_at)
-         VALUES ($1, $2, $2, $3, $3, 'confirmed', $4, $5, $3, now())
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
+             deposit_address, tron_tx_id, received_usdt, expires_at, derivation_index)
+         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now(), $7)
          ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
     )
     .bind(uuid::Uuid::new_v4())
@@ -841,6 +951,7 @@ pub async fn credit_transfer(
     .bind(t.amount_usdt)
     .bind(&t.to)
     .bind(&t.tx_id)
+    .bind(clt_address)
     .execute(pool)
     .await
     .map_err(|e| format!("crediting {}: {e}", t.tx_id))?;
@@ -858,21 +969,48 @@ Remove `evaluate_payment` and `PaymentOutcome` from `custody.rs`, and these test
 `overpayment_settles_at_the_observed_total`, `underpayment_is_partial_never_settled`,
 `two_part_payment_settles_once_the_sum_reaches_expected`.
 
-Keep `a_duplicate_transaction_id_is_counted_once`, `absurd_amounts_saturate_rather_than_overflow`
-and `approval_events_are_dropped` — they were never about matching an expected amount. Move them to
-wherever the surviving logic lives.
+`a_duplicate_transaction_id_is_counted_once` and `absurd_amounts_saturate_rather_than_overflow` are
+deleted WITH `evaluate_payment`: both call it (custody.rs:312, :319) and there is no surviving pure
+function to move them to. Do not invent one. Their properties have moved: de-duplication is now the
+database's job (`uq_deposit_intents_tron_tx_id` + `ON CONFLICT DO NOTHING`, pinned by
+`the_same_transfer_seen_twice_is_one_credit` above), and there is no sum left to saturate — each
+transfer is credited on its own at its own `amount_usdt`.
+`approval_events_are_dropped` does NOT call `evaluate_payment` — it exercises the decoder — so it
+stays exactly where it is, untouched.
 
 Every deleted branch existed only because a user promised a figure in advance. Deleting them is the
 point of the change, not collateral damage.
 
 - [ ] **Step 5: Rewrite `poll_once` around addresses**
 
-`poll_once` currently walks due intents and takes a `&dyn CustodyWatcher`. Change it to take a
-`&dyn DepositWatcher`, call `watcher.poll().await?` once, and pass each returned transfer to
-`credit_transfer`. Address selection and `last_polled_at` stamping now live inside `TieredPoller`
-(Task 5), so `poll_once` no longer knows how transfers were found — which is the entire point of
-the seam. Update `run()`'s signature and its caller in `main.rs` to construct a `TieredPoller`
-wrapping the existing `CustodyWatcher`.
+`poll_once` currently walks due intents and takes a `&dyn CustodyWatcher`. It becomes TWO loops, and
+the second one is easy to delete by mistake — do not.
+
+**(a) Per-user addresses.** Take a `&dyn DepositWatcher`, call `watcher.poll().await?` once, and pass
+each returned transfer to `credit_transfer`, resolving `user_pk` and `clt_address` from
+`deposit_addresses` by `t.to`. A transfer whose `to` has no `deposit_addresses` row is NOT an error —
+it is a legacy address, handled by (b). Address selection and `last_polled_at` stamping live inside
+`TieredPoller` (Task 5), so this loop never learns how transfers were found — the point of the seam.
+
+**(b) Legacy per-intent addresses.** Keep the existing `due_intents` loop — the SELECT over
+`deposit_intents WHERE deposit_address IS NOT NULL AND NOT payment_window_closed AND status IN (...)`
+— so stage's 28 legacy rows stay watched until their payment windows close. Nothing in
+`deposit_addresses` covers them, and silently unwatching a payable address is the exact loss this
+change exists to prevent. Keep the settle-by-intent mechanics (`set_tron_tx_id`, `set_received_usdt`,
+the `transition` to confirmed) but drop the expected-amount arithmetic: "credit everything" applies to
+legacy too, so the FIRST unseen transfer to a legacy address settles that intent at the full arrived
+amount. `Partial` is meaningless when nothing is expected; delete that arm with `evaluate_payment`.
+Pass `None` as `min_timestamp` here — a legacy address has no `last_polled_at`.
+
+Give this loop its own small cap (the legacy set is 28 rows and only shrinks) so it cannot eat the
+per-user budget. **Keep `sweep_expired` and `close_stale_watch_windows` running each pass** — they are
+what retires legacy rows (`created` → `expired` → window closed `WATCH_WINDOW_HOURS` later; never
+`needs_manual`). Without them the legacy set never shrinks and loop (b) runs forever. When
+`due_intents` returns nothing for good this loop is dead code — leave a comment saying so and when it
+can be removed.
+
+Update `run()`'s signature and its caller in `main.rs` to construct a `TieredPoller` wrapping the
+existing `CustodyWatcher`, and pass the raw `CustodyWatcher` through as well for loop (b).
 
 Pass each address's previous `last_polled_at` to the TronGrid call as `min_timestamp` (epoch
 MILLISECONDS — `ObservedTransfer::block_timestamp` documents that unit). Addresses are permanent
@@ -881,7 +1019,7 @@ generous overlap (an hour) before sending it: a transfer landing between the que
 would otherwise be skipped forever, and re-observing one is free because `credit_transfer` is
 idempotent on `tron_tx_id`.
 
-Resolve each transfer's `user_pk` by looking up `t.to` in `deposit_addresses`. A transfer to an
+Resolve each transfer's `user_pk` AND `clt_address` by looking up `t.to` in `deposit_addresses` (both columns live there). A transfer to an
 address with no row is a legacy per-intent address — leave those to the existing intent path and do
 not credit them here.
 
@@ -911,6 +1049,12 @@ Mirror `redemptions_enabled`'s existing shape exactly — read it in `configurat
 and follow it. When the flag is false, the deposit route returns `503` with a body saying deposits
 are temporarily unavailable, before authentication, the same ordering `redemptions_enabled` uses.
 
+Add `permanent_deposit_addresses_enabled = false` to `crates/payment-orchestrator/config/default.toml`
+next to `redemptions_enabled = false` — `OrchConfig` has no serde defaults, and a bool field absent from
+both TOML and env panics `OrchConfig::load()` at boot. `false` is the only safe default: the flag
+protects the rollout, and a service that boots with new addresses enabled by accident has already
+issued addresses nothing planned to watch.
+
 Document on the field that **the flag protects the rollout, not the decision**: once a user has been
 handed an address and sent USDT to it, that address must be watched and swept forever regardless of
 what is switched off later. Turning it off stops new addresses being issued; it does not un-issue
@@ -918,13 +1062,25 @@ the ones already out.
 
 - [ ] **Step 2: Delete the dead deposit bounds**
 
-Remove `min_deposit_usdt` and `max_deposit_usdt` from `OrchConfig`, from `config/default.toml`, and
-from `docker-compose.treasury.yml`'s orchestrator env block. Nothing reads them after Task 6, and a
+Remove `min_deposit_usdt` and `max_deposit_usdt` from `OrchConfig` and from `config/default.toml`.
+`docker-compose.treasury.yml` has NO corresponding env lines (verified) — confirm with a grep and skip;
+do not go hunting for them. Nothing reads them after Task 6, and a
 bound that is read by nothing but still appears in config reads to the next person like a live
 control on how much a user may deposit — and they would be wrong.
 
-Also remove `deposit_ttl_minutes` if nothing else reads it after Task 6; check with
-`grep -rn deposit_ttl_minutes crates/` before deleting, and say what you found.
+Also remove `deposit_ttl_minutes` — verified: after Task 6 nothing in `src/` reads it.
+
+Exact deletions, verified against the tree:
+- `config/default.toml` lines `deposit_ttl_minutes = 30`, `min_deposit_usdt = 1000000`, `max_deposit_usdt = 50000000`.
+- The three fields from every `OrchConfig { .. }` literal under `tests/` — at the time of writing `tests/db_bridge.rs`, `tests/db_deposit_api.rs`, `tests/db_redemptions.rs`
+  (`tests/db_deposits.rs` no longer builds one since Task 6 recreated it) — a literal naming a removed field
+  fails to compile.
+- The three `pub` fields from `OrchConfig` itself.
+Re-grep `min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes` across `crates/` afterwards; it must
+return nothing. Do NOT touch `min_redemption_clt` / `max_redemption_clt` — those are the redemption
+bounds and stay.
+
+Do not trust that list: run `grep -nE 'min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes' crates/payment-orchestrator/tests/*.rs` and fix EVERY hit (four files at the time of writing, `db_redemptions.rs` included), or the crate's test suites stop compiling the moment the fields leave `OrchConfig`.
 
 - [ ] **Step 3: Verify and commit**
 
@@ -944,6 +1100,10 @@ git commit -m "feat: gate permanent deposit addresses, drop the dead amount boun
 
 - [ ] **Step 1: Remove the amount step**
 
+Branch from the demo app's CURRENT `main` first. A separate map-tile fix (`fix/map-tiles-no-api-key`,
+`src/config.js`) may have merged since this plan was written; it touches a different file, but basing
+on stale `main` invites a needless conflict on merge.
+
 Read the file first — it currently collects an amount and calls `POST /api/v1/deposits` with it.
 Replace that flow with: on mount (or on opening the panel), call the endpoint with no body, show the
 returned address plus a QR code if the component already has one, and keep the existing testnet
@@ -953,7 +1113,16 @@ Keep the warning that only Nile USDT (TRC-20) is creditable — that text is unc
 and remains true.
 
 Remove any copy implying an exact figure must be sent, including the "minimum" wording added
-earlier: there is no minimum any more.
+earlier: there is no minimum any more. Also remove the discriminator-era copy about an "exact
+`pay_amount_usdt`" — that mechanism is long gone and the words are simply false now.
+
+**Remove the per-intent status polling.** The panel currently POSTs, keeps the returned intent `id`,
+and polls `GET /api/v1/deposits/{id}` every 5s while a deposit is "open". After this change the POST
+returns `{"address": ...}` and no id — the user never creates an intent, so there is nothing to poll
+and no "open deposit" state to track. Delete the poll loop, the `idempotencyKeyRef`, the
+`Idempotency-Key` header, and the amount input/validation. The panel's job now ends at showing the
+address; crediting appears where balances and transaction history already do. Do not invent an id to
+keep the loop alive.
 
 - [ ] **Step 2: Verify and commit**
 
@@ -972,7 +1141,7 @@ git commit -m "feat: show a permanent deposit address instead of asking for an a
 **Files:**
 - Modify: `../clutch-deploy/docker-compose.treasury.yml`
 - Modify: `../clutch-deploy/CLAUDE.md`, `../CLAUDE.md`
-- Modify: `crates/payment-orchestrator/config/default.toml`
+- Read only: `crates/payment-orchestrator/config/default.toml` — confirm the two entries exist (Tasks 5 and 8); this task edits NOTHING under `clutch-treasury`, so it may run alongside a treasury task.
 
 - [ ] **Step 1: Environment**
 
@@ -989,23 +1158,262 @@ Add to the orchestrator's env block, and REMOVE `MIN_DEPOSIT_USDT` / `MAX_DEPOSI
 ```
 
 Confirm each name against the actual `OrchConfig` field names — `APP_` + the field name uppercased.
-A mismatch panics the orchestrator at boot.
+Both fields now have `config/default.toml` entries (Tasks 5 and 8), so these compose lines are
+OVERRIDES, not requirements: a misnamed one does not panic the orchestrator, it silently fails to
+override — which is quieter and therefore worth getting right the first time.
 
 - [ ] **Step 2: Correct the deposit-detection docs**
 
-`../clutch-deploy/CLAUDE.md`'s "Deposit detection" section says **"Every deposit intent gets its own
-freshly derived TRON address... one unique index per intent"** and that `get_reserve_balance` "sums
-unswept addresses plus the treasury". Both are now wrong: addresses are per USER, and the reserve
+`../clutch-deploy/CLAUDE.md`'s "Deposit detection" section (verified: lines ~133–134) says **"Every
+deposit intent gets its own freshly derived TRON address... one unique index per intent"**, and line
+~169 says `get_reserve_balance` "sums unswept addresses plus the treasury". Both are now wrong: addresses are per USER, and the reserve
 also sums the payout float. Rewrite that section to describe the tiered poller, the per-user
 address, and transaction-keyed identity.
 
-Do the same for the equivalent passage in `../CLAUDE.md` (not a git repo — edit in place).
+In `../CLAUDE.md` (workspace root — not a git repo, edit in place) there are TWO passages, both
+verified present:
+- the repo table row for `clutch-treasury/` (around line 15): "deposit intents on per-intent derived
+  TRON addresses" → "one permanent derived TRON address per user";
+- the data-flow diagram (around lines 28–29): "derives a TRON address per intent from the account
+  xpub → watches TronGrid for USDT paid TO it" → "derives one TRON address per user from the account
+  xpub → polls it (hot first, then a bounded cold rotation) for USDT paid TO it".
+Fix both. A grep for `per-intent` and `per intent` across that file must return nothing afterwards.
+In BOTH files, also state in one sentence that the CLT beneficiary of a deposit is the authenticated
+identity (the JWT `pk`, address form), that the deposit request carries no body, and that a public-key
+token is refused — so nobody later "adds back" a `clt_address` field thinking it was forgotten (R14).
 
 - [ ] **Step 3: Commit**
 
 ```bash
 cd ../clutch-deploy && git add docker-compose.treasury.yml CLAUDE.md && git commit -m "feat: config and docs for permanent deposit addresses"
 ```
+
+---
+
+### Task 11: Branch cleanup before the final review
+
+**Files:**
+- Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list), `crates/payment-orchestrator/src/custody.rs` (line 1 summary only)
+- Modify: `crates/treasury-service/src/sweeper.rs` (warn on unswept rows without a derivation_index), `crates/treasury-service/tests/db_sweeper.rs` (stale comments + one new test), `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
+- Modify: `crates/payment-orchestrator/tests/db_derivation_index.rs` (one test rename)
+- Modify: `crates/payment-orchestrator/tests/db_deposit_api.rs`, `crates/payment-orchestrator/tests/db_redemptions.rs` (no-auth companion assertions in the two 503 tests)
+
+- Consumes: everything above; runs after Task 9 has stopped the UI sending `idempotency-key`.
+- Produces: nothing new — this is the debt the reviews deferred, paid in one commit so the final
+  whole-branch review reads clean code.
+
+- [ ] **Step 1: Pin `canonical_clt_address`'s edge cases**
+
+Add a `#[cfg(test)] mod tests` block in `api.rs` with plain unit tests (no DB, no HTTP) for the
+helper: `"0X"` uppercase prefix accepted and lowercased; a bare 40-hex string with no prefix accepted
+and given `0x`; 39 and 41 hex digits rejected; empty string rejected; a non-ASCII hex lookalike
+rejected. Each is one `assert_eq!` on `canonical_clt_address(..)`. The review of 811a96c found these
+cases verified only by reading — a future edit to the prefix stripping would compile and pass every
+existing test.
+
+- [ ] **Step 2: Remove `idempotency-key` from the CORS allow-headers**
+
+Task 6 removed the only route that read it and Task 9 stopped the UI sending it. Delete it from the
+allow-list in `build_cors` and from its doc comment. Grep the whole repo for `idempotency-key` and
+`idempotency_key` afterwards — the only hits may be in the demo app's git history and in these plan
+documents.
+
+- [ ] **Step 3: Fix comments that cite constraints Task 3 dropped**
+
+`payment-orchestrator/src/custody.rs` line 1 (`//! Watching per-intent deposit addresses ...` — the Task 7
+review rewrote the body of that module doc but this summary line was missed), `db_sweeper.rs` (around lines 17
+and 261 at the time of writing) and `db_tron_verifier.rs` (around line 430) still explain behaviour in terms of `uq_mint_intents_deposit_address` /
+`uq_deposit_address`, which no longer exist. Re-read each comment against what the test actually
+asserts now and rewrite it in one or two sentences. Do not change any test logic; if a test's
+assertion itself turns out to depend on a dropped constraint, STOP and report it instead of editing.
+
+- [ ] **Step 4: Rename the overclaiming test**
+
+`indexes_come_from_the_shared_sequence_and_never_repeat` (actually in `tests/db_addresses.rs`, not
+`db_derivation_index.rs` — moved to Task 12 Step 0b) asserts less than its name promises. Read what it asserts and rename it to exactly that — nothing else in
+the file changes.
+
+- [ ] **Step 5: Make a missing `derivation_index` loud in the sweeper**
+
+`treasury-service/src/sweeper.rs` selects `WHERE deposit_address IS NOT NULL AND derivation_index IS NOT NULL
+AND swept_at IS NULL`, so a credited deposit whose row lacks an index is simply never swept, and the pass
+logs "0 unswept address(es)" exactly as it does when idle. The Task 7 review caught that bug before it
+shipped (R17); the next writer who forgets the column will not have a reviewer. In the same pass, count
+`mint_intents WHERE deposit_address IS NOT NULL AND derivation_index IS NULL AND swept_at IS NULL AND
+status IN ('approved','submitted','credited')` and, when it is non-zero, `tracing::warn!` with the count and
+the distinct addresses — every pass, not once. One test in `tests/db_sweeper.rs`: seed such a row and
+assert the pass reports it (return the count from the pass function, or expose it however the existing
+tests observe the sweeper's decisions — read them first). Do not change what gets swept.
+
+- [ ] **Step 6: Prove the two rollout gates run BEFORE authentication**
+
+`deposit_route_503s_while_disabled_even_with_valid_auth` (`tests/db_deposit_api.rs`) and the older
+`both_routes_503_while_redemptions_disabled` (`tests/db_redemptions.rs`) each send a VALID token and
+assert 503 — which both orderings (gate-then-auth, auth-then-gate) produce, so neither test proves
+the "before authentication" claim in its own doc comment. In EACH test, add one more request with
+the flag still off and NO `Authorization` header, asserting 503 (not 401) — the only case where the
+two orderings diverge. `oneshot` consumes the router, so `app.clone()` for the first call. Fix the
+doc comments to say what is now actually proven.
+
+- [ ] **Step 7: Verify and commit**
+
+CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, dead CORS header, stale comments`.
+
+---
+
+### Task 12: Paginate TronGrid so a full page cannot drop a deposit
+
+**Files:**
+- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only), `crates/payment-orchestrator/tests/db_addresses.rs` (one test rename), `crates/treasury-service/tests/db_tron_verifier.rs` (one comment)
+- Test: NEW `crates/payment-orchestrator/tests/trongrid_pagination.rs` — wiremock only, NO database (`transfers_to`
+  never touches Postgres, so this file must not call `pool()`); construct the watcher the way `tests/db_poller.rs`
+  already does for its wiremock test (`TronGridWatcher::new(server.uri(), api_key, usdt_contract)`), and copy its
+  TronGrid row JSON shape (`transaction_id`, `to`, `value` as a decimal STRING, `token_info.address`, `type`,
+  `block_timestamp`) from the same file. `Trc20Response` today is `{ #[serde(default)] data: Vec<Trc20Row> }`
+  (custody.rs ~126) — add `#[serde(default)] meta: Option<Trc20Meta>` beside it.
+
+- Consumes: `TronGridWatcher::transfers_to(address, min_timestamp_ms)` (Task 5), `TieredPoller` stamping (Task 5).
+- Produces: `transfers_to` follows TronGrid's `meta.fingerprint` cursor until a short page, bounded by a page cap.
+
+**Why (R20).** `transfers_to` asks for `limit=200` and, on a full page, only `tracing::warn!`s and returns the
+newest 200 (custody.rs ~163). `TieredPoller` then stamps `last_polled_at = now()` for that address
+regardless, so on the next pass `min_timestamp = now - 1h` and anything older than those 200 rows is
+never requested again. The funds sit at the derived address with no `deposit_intents` row — not swept
+(the sweeper keys on rows), not in the reserve sum (`unswept_addresses` derives from rows), invisible
+except for one warn line. The realistic trigger is not 200 real deposits; it is dust-spam: zero-value
+TRC-20 transfers to a victim's address are cheap on TRON and fill the page before `rows_to_transfers`
+filters them. Same cap existed under the per-intent model; permanence makes the loss permanent.
+
+- [ ] **Step 0: Drop the dead Bitcart keys from `config/default.toml`** (separate commit, one minute)
+
+`bitcart_url`, `bitcart_token`, `bitcart_store_id` and any `*invoice_currency` key are not `OrchConfig` fields
+(grep `src/configuration.rs` to confirm each) — leftovers from the Bitcart integration the TronGrid watcher
+replaced. Delete the lines. The loader ignores unknown keys, so nothing changes at runtime; the point is
+that the file stops advertising configuration that does not exist. Commit: `chore(orchestrator): drop dead
+bitcart keys from default.toml`.
+
+- [ ] **Step 0b: The rename Task 11 could not reach** (same small commit as Step 0)
+
+`indexes_come_from_the_shared_sequence_and_never_repeat` lives in `tests/db_addresses.rs` (lines ~68-84), not
+`db_derivation_index.rs` as Task 11 was told. It asserts only that `address_for_user` draws an index AFTER one
+already burned by a legacy allocation. Rename it to
+`address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit`; nothing else in the file changes.
+
+- [ ] **Step 0c: One imprecise comment from Task 11** (same small commit as Step 0)
+
+`crates/treasury-service/tests/db_tron_verifier.rs` ~430-431 (inside `approval_event_never_backs_a_mint`) now says
+the `OTHER_ADDR` fallback intent "proves the Approval event can't leak across intents". It does not: each
+intent's TronGrid query is scoped to its own `deposit_address` before any event-type check, and only
+`DEPOSIT_ADDR`'s path is mocked, so the fallback resolves `Evidence::Transient` regardless of event type.
+Reword to: the fallback intent sits at `OTHER_ADDR` so its own query never sees this event at all —
+address-scoped isolation — while the `known`/hash assertion above is what proves an `Approval` is rejected
+by type. Comment only.
+
+- [ ] **Step 1: Write the failing test**
+
+Two wiremock responses for the same address: the first request (no `fingerprint` query param) returns
+exactly 200 rows — dust, `value: "0"`, or any filler — plus `meta: {"fingerprint": "abc"}`; the second
+request (query `fingerprint=abc`) returns one real transfer to the address with `meta` lacking a
+fingerprint. Assert `transfers_to` returns that transfer. Against the current code the test fails: the
+second page is never requested.
+
+A second test: a response whose `meta.fingerprint` is present on every page (a misbehaving or
+adversarial upstream) must stop after the page cap with an `Err` naming the address and the cap — not
+loop forever, and not return `Ok` with a silently partial result.
+
+- [ ] **Step 2: Paginate**
+
+Add `meta: Option<Trc20Meta>` (`fingerprint: Option<String>`) to `Trc20Response`. In `transfers_to`, loop:
+send the request (with `fingerprint` when you have one), append `data`, stop when `data.len() < 200` or
+`meta.fingerprint` is absent; otherwise continue with the new fingerprint. Cap at `MAX_PAGES` (10 —
+2,000 rows per address per poll; put the reasoning in a comment: beyond that something is wrong and a
+partial `Ok` would be a silent loss, so return `Err`). `TieredPoller` already logs an `Err` per address
+and still stamps it — that is acceptable here because an `Err` is loud and the address is re-polled with
+the same one-hour overlap; document that in the comment rather than changing the stamping.
+
+- [ ] **Step 3: Verify and commit**
+
+CI. Then one commit: `fix(orchestrator): follow TronGrid's fingerprint cursor so a full page cannot drop a deposit`.
+
+---
+
+### Task 13: Final-review fixes — the poll watermark, the verifier's page, the CORS header
+
+**Files:**
+- Create: `crates/payment-orchestrator/migrations/0012_deposit_addresses_last_attempt.sql`
+- Modify: `crates/payment-orchestrator/src/poller.rs`, `src/api.rs`, `src/deposits.rs`, `src/redemptions.rs`
+- Test: `crates/payment-orchestrator/tests/db_poller.rs`, `tests/db_deposit_api.rs`, `tests/db_addresses.rs`
+- Modify: `crates/treasury-service/src/tron_verifier.rs`, `src/sweeper.rs`
+- Test: `crates/treasury-service/tests/db_tron_verifier.rs`, `tests/db_sweeper.rs`, `tests/db_reconciliation.rs`
+- (clutch-deploy, separate agent) `scripts/inspect-stage.sh`: restore `APP_DEPOSIT_MATCH_WINDOW_HOURS` — it is live treasury-service config.
+
+- Consumes: everything above. Produces: the fixes the final whole-branch review required before Deploy B.
+
+- [ ] **Step 1 (Critical, R23): the watermark must not move on failure**
+
+`TieredPoller::poll` stamps `last_polled_at = now()` for every due address even when `transfers_to` failed,
+and the next poll's `min_timestamp` is derived from that stamp — so a TronGrid outage or throttling episode
+longer than the one-hour overlap permanently drops every deposit made during it, silently (no row, no alert,
+nothing downstream ever looks). Task 5 chose that stamping to stop a failing address starving the rotation;
+keep the fairness, separate it from the watermark:
+
+- Migration 0012: `ALTER TABLE deposit_addresses ADD COLUMN last_attempt_at TIMESTAMPTZ;` (additive; old
+  images ignore it).
+- `due_addresses` orders by `COALESCE(hot_until > now(), false) DESC, last_attempt_at ASC NULLS FIRST` and
+  still returns `last_polled_at` for the watermark.
+- `TieredPoller::poll`: stamp `last_attempt_at = now()` for EVERY due address (rotation fairness, as before);
+  stamp `last_polled_at = now()` ONLY for addresses whose fetch returned `Ok`; collect the failures and write
+  ONE aggregated `alerts` row per pass (`alert(pool, "warn", "poller", ...)` naming the count and the first few
+  addresses) — not one row per address; an hour-long outage must not write thousands.
+- Tests in `db_poller.rs`: replace `a_failing_address_is_still_stamped_and_does_not_block_the_others` with
+  `a_failing_address_keeps_its_watermark_but_rotates_to_the_back`: A fails, B succeeds → B credited;
+  `last_attempt_at` set for BOTH; `last_polled_at` set for B only (A's stays what it was — NULL if never read);
+  exactly one alerts row naming A. Re-point the two ordering tests at `last_attempt_at` (rename
+  `cold_addresses_rotate_oldest_polled_first` → `cold_addresses_rotate_oldest_attempted_first`;
+  `expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it` keeps its name and sets
+  `last_attempt_at`). Add `a_watermark_survives_an_outage`: seed A with `last_polled_at = T0`; run a failing
+  pass; assert `last_polled_at` is still `T0`, so the next successful pass re-reads from `T0 - 1h`.
+
+- [ ] **Step 2 (Important, R24): the verifier bounds and paginates its TronGrid read**
+
+`treasury-service/src/tron_verifier.rs::trc20_transfers` requests one 200-row page with no `min_timestamp`
+and no cursor — the bug Task 12 fixed on the orchestrator, left standing on the side that decides mints.
+Under permanent addresses a user's own history or a dust flood fills page 1 and the intent stays `created`
+until the 24h P1 (safe direction, but a stalled deposit and a human). Pass
+`min_timestamp = (intent.created_at - deposit_match_window_hours).timestamp_millis()` — the bound the
+fallback path already computes — and follow `meta.fingerprint` until a short page, capped at 10 pages → `Err`
+(mirror `custody.rs`'s loop; duplicating ~25 lines across crates is acceptable, a shared crate is not worth
+it). One wiremock test in `db_tron_verifier.rs`: the deposit's transfer only on page 2 → the intent still
+approves.
+
+- [ ] **Step 3 (Important, R25): put `idempotency-key` back in the CORS allow-list**
+
+Stage sets `ALLOWED_ORIGINS` explicitly, so the specific-origins branch applies and the header list is
+enforced on preflight. The demo app on `main` still sends `Idempotency-Key`; between Deploy B step 2 and
+step 5 the OLD UI's POST is blocked in the browser instead of receiving the clean 503, and a UI-only rollback
+is broken the same way. Restore `HeaderName::from_static("idempotency-key")` with a comment: kept for
+clients that still send it; remove only after no deployed UI does.
+
+- [ ] **Step 4: minors from the same review**
+
+- `sweeper.rs`: beside the "no derivation_index" `warn!`, write an `alert(pool, "warn", "sweeper", ...)` row so
+  it reaches the same pipeline as every other actionable sweeper condition; reword the message — an
+  `approved` row is "not yet eligible", not "can never be swept". `db_sweeper.rs`: assert the alert row.
+- `tests/db_deposit_api.rs`: add `deposit_addresses` to `pool()`'s TRUNCATE; drop the manual
+  `DELETE FROM deposit_addresses WHERE user_pk = $1` in the beneficiary test.
+- `deposits.rs`: delete `find_by_invoice_id` (no callers; its doc names deleted code). `redemptions.rs` ~line 5:
+  the comment still points at the deleted `create_and_invoice` — fix it.
+- `tests/db_addresses.rs`: rename `address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit`
+  → `address_for_user_draws_indexes_after_any_already_burned_by_nextval` (that is what it proves).
+- `tests/db_reconciliation.rs`: add `legacy_unswept_addresses_are_still_counted` — seed a per-intent-era row
+  (deposit_address set, swept_at NULL, status credited) and assert `unswept_addresses` returns it; the design
+  §5 promised this test and nothing wrote it.
+
+- [ ] **Step 5: Verify and commit**
+
+CI. Three commits: `fix(orchestrator): the poll watermark only advances on a successful read` (Step 1),
+`fix(treasury): the verifier bounds and paginates its TronGrid read` (Step 2),
+`fix(orchestrator): keep idempotency-key in CORS while old clients send it; final-review minors` (Steps 3-4).
 
 ---
 
@@ -1021,3 +1429,23 @@ stack is healthy and reconciliation still `ok`, then flip the flag.
 Legacy per-intent addresses are left alone throughout. They stay in `mint_intents`, so the reserve
 sum already includes them with no extra work, and they are swept until drained by the existing
 sweeper. Nothing new joins that set.
+
+**Deploy B ordering (after Task 6).** The old per-intent create path is deleted, so with
+`permanent_deposit_addresses_enabled=false` the deposit route answers 503 — top-ups are OFF, not
+reverted. The flag flip and the demo-app deploy (Task 9's UI, which sends no body and shows the
+permanent address) must land in the same window: flip first and the old UI breaks on the new
+response shape; deploy the UI first and it gets 503s.
+
+Mechanics: `clutch-deploy`'s `deploy-stage.yml` auto-deploys on any `main` push touching
+`docker-compose.treasury.yml`, `config/**` or `scripts/**`, using whatever images GHCR holds at that
+moment; `clutch-treasury`'s `docker-build-push.yml` builds images on `main` push but never deploys.
+So: (1) merge `clutch-treasury` → images exist; (2) merge the Task 10 compose change with
+`APP_PERMANENT_DEPOSIT_ADDRESSES_ENABLED=false` → auto-deploy → the orchestrator applies migration 0012
+(`last_attempt_at`, additive) at boot, the deposit route answers 503, top-ups OFF on stage; (3) reconciliation
+`ok`, breaker clear; (4) a one-line `clutch-deploy` commit flipping
+the value to `true` → auto-deploy; (5) merge `clutch-hub-demo-app`'s `feat/permanent-deposit-address`
+→ `docker-publish` → new top-up UI; (6) one small Nile deposit credited end to end, and confirm the
+treasury sweeper picks the row up (its `derivation_index` is set). Steps 4–5 back to back are "the
+same window"; top-ups are unavailable between 2 and 4 — acceptable on testnet, keep it short. Once
+any user has been handed an address, the flag protects nothing any more (see the spec §6) — the
+watch and sweep of that address are permanent.

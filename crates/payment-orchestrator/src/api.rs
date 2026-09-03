@@ -11,10 +11,11 @@ use sqlx::PgPool;
 use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::addresses;
 use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::derive::AddressDeriver;
-use crate::deposits::{self, DepositOutcome};
+use crate::deposits;
 use crate::redemptions::{self, RedemptionOutcome};
 
 #[derive(Clone)]
@@ -32,8 +33,14 @@ async fn health() -> Json<serde_json::Value> {
 /// `"*"` allows any origin (local/dev default); otherwise a comma-separated allowlist.
 /// Same config style as clutch-hub-api's `build_cors` (`hub/server.rs`) — different crate
 /// because this service is Axum, not Actix, but the origin-parsing rule is identical.
-/// Must explicitly allow `Idempotency-Key` (deposits require it) and `Authorization` (the JWT
-/// bearer token) since the specific-origins branch can't use a header wildcard.
+/// Must explicitly allow `Authorization` (the JWT bearer token) since the specific-origins
+/// branch can't use a header wildcard.
+///
+/// `idempotency-key` is ALSO explicitly allowed even though no route reads it any more (R25):
+/// stage's `ALLOWED_ORIGINS` takes the specific-origins branch, so the header list is enforced on
+/// preflight, and the demo app still deployed there sends `Idempotency-Key` on every deposit POST.
+/// Dropping it here would turn the deposit route's clean 503 into a browser-blocked CORS preflight
+/// failure during the rollout window. Remove it only once no deployed UI sends it.
 fn build_cors(allowed_origins: &str) -> CorsLayer {
     let layer = CorsLayer::new().allow_methods([Method::GET, Method::POST, Method::OPTIONS]);
 
@@ -51,83 +58,86 @@ fn build_cors(allowed_origins: &str) -> CorsLayer {
             .allow_headers(AllowHeaders::list([
                 HeaderName::from_static("authorization"),
                 HeaderName::from_static("content-type"),
+                // Kept for clients that still send it — see this function's doc comment.
                 HeaderName::from_static("idempotency-key"),
             ]))
     }
 }
 
-#[derive(Deserialize)]
-struct CreateDepositBody {
-    clt_address: String,
-    amount_usdt: i64,
+/// Mirrors clutch-node/src/node/transactions/address.rs::is_valid_address (optional 0x/0X, then
+/// exactly 40 ASCII hex digits): the node turns this string into a state key verbatim, so a
+/// malformed one mints into an account no key can spend. Returns the canonical lowercase
+/// `0x`-prefixed form — the same rule clutch-chain applies before encoding a Mint.
+fn canonical_clt_address(s: &str) -> Option<String> {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    (hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("0x{}", hex.to_ascii_lowercase()))
 }
 
-/// `POST /api/v1/deposits` — the create-flow: idempotency layer 1 (client-key dedup,
-/// Task 2) meets layer 4 (invoice-store compare-and-set). No gateway call: the pay address is
-/// the configured custody address and detection is the custody poller's job (`custody.rs`).
-/// Thin by design: every actual decision (replay/conflict/still-processing/bounds/CAS) is
-/// made in `deposits::create_and_invoice`; this handler only extracts the request and
-/// translates the resulting `DepositOutcome` into a status code, headers, and body.
+/// `POST /api/v1/deposits` — where to send USDT.
+///
+/// No body. The beneficiary is the caller's own authenticated identity (`user_pk`), never a
+/// client-supplied field — the demo app used to send `clt_address: publicKey`, the SAME value it
+/// used to obtain the JWT, so `user_pk` already IS the beneficiary. A separate field was a live
+/// foot-gun: under permanent addresses (`address_for_user`'s `ON CONFLICT (user_pk) DO NOTHING`)
+/// a typo or someone else's address in that field would become this user's mint destination
+/// forever, with no later request able to correct it.
+///
+/// `user_pk` must be address-shaped (`canonical_clt_address`) — a public-key-shaped token 400s
+/// here rather than being normalized into an account no key can spend from.
+///
+/// This is idempotent by nature rather than by an idempotency key: a user has exactly one
+/// address, so a repeat call is the same answer.
+///
+/// Marking the address hot here is the whole reason the tiered poller can stay cheap — this call IS
+/// the signal that a deposit is imminent.
+///
+/// 503s while `config.permanent_deposit_addresses_enabled` is false (default) — before auth even
+/// runs, the same ordering `redemptions_enabled` uses on the redemption routes; see
+/// `OrchConfig::permanent_deposit_addresses_enabled`'s doc comment for why this gate exists
+/// before anything else in this handler runs.
 async fn create_deposit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateDepositBody>,
-) -> Result<(StatusCode, HeaderMap, Json<serde_json::Value>), StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    // Gated before auth, same ordering as create_redemption_handler: a disabled feature 503s
+    // uniformly regardless of whether the caller's JWT would otherwise have been valid.
+    if !state.config.permanent_deposit_addresses_enabled {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "deposits are temporarily unavailable"})),
+        ));
+    }
     let user_pk = authenticated_pk(&headers, &state.config)?;
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let outcome = deposits::create_and_invoice(
-        &state.pool,
-        &state.config,
-        state.deriver.as_ref(),
-        &user_pk,
-        &body.clt_address,
-        body.amount_usdt,
-        idempotency_key,
-    )
-    .await;
-
-    let mut resp_headers = HeaderMap::new();
-    let (status, payload) = match outcome {
-        // Fall back to 500, not 200: an unparseable stored status is a bug in whatever
-        // wrote it, and replaying it as success would tell the client their deposit is
-        // fine on the strength of a value we couldn't read.
-        DepositOutcome::Respond { status, body } => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            body,
-        ),
-        DepositOutcome::Conflict => (StatusCode::CONFLICT, json!({"error": "idempotency key already used with a different request body"})),
-        DepositOutcome::StillProcessing => {
-            resp_headers.insert("retry-after", "2".parse().unwrap());
-            (StatusCode::CONFLICT, json!({"error": "a request with this idempotency key is still being processed"}))
-        }
-        DepositOutcome::OutOfBounds { min, max } => (
-            StatusCode::BAD_REQUEST,
-            json!({"error": format!("amount_usdt must be between {min} and {max}")}),
-        ),
-        // Fail closed (T2b's deferred headroom check, landed in 5b): the treasury couldn't be
-        // asked whether it could mint against this deposit — 503 + Retry-After, same shape as
-        // any other "ask again shortly" backpressure signal.
-        DepositOutcome::TreasuryUnavailable => {
-            resp_headers.insert("retry-after", "30".parse().unwrap());
-            (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "treasury unreachable — cannot verify mint headroom, try again shortly"}))
-        }
-        // A clear 4xx, not a 503: the treasury DID answer, and the answer is "not enough room
-        // today" — retrying immediately won't change that, so this isn't the same kind of
-        // "try again shortly" signal a 503 implies.
-        DepositOutcome::InsufficientHeadroom { headroom_clt } => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({"error": format!("insufficient daily mint headroom ({headroom_clt} CLT remaining) to cover this deposit")}),
-        ),
-        DepositOutcome::Failed(msg) => {
-            tracing::error!("create_and_invoice failed: {msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal error"}))
+    let clt_address = match canonical_clt_address(&user_pk) {
+        Some(a) => a,
+        None => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "deposits require an address-form token (0x + 40 hex); public-key tokens are not accepted"})),
+            ))
         }
     };
-    Ok((status, resp_headers, Json(payload)))
+
+    let address =
+        addresses::address_for_user(&state.pool, state.deriver.as_ref(), &user_pk, &clt_address)
+            .await
+            .map_err(|e| {
+                tracing::error!("deposit address for {user_pk}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    if let Err(e) =
+        addresses::mark_hot(&state.pool, &user_pk, state.config.deposit_hot_window_hours).await
+    {
+        // Not fatal: the address is still watched on the cold rotation, so a deposit is credited
+        // late rather than lost. Worth an error line because a persistent failure here quietly
+        // degrades every deposit to the slow tier.
+        tracing::error!("marking {user_pk} hot: {e}");
+    }
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "address": address }))))
 }
 
 /// `GET /api/v1/deposits/:id` — owner-checked: a JWT that authenticates fine but names a
@@ -297,4 +307,55 @@ pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) ->
         .route("/api/v1/redemptions/:id", get(get_redemption_handler))
         .layer(cors)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_clt_address;
+
+    /// Case-insensitive prefix: `0X` must be recognised exactly like `0x`, and the payload
+    /// lowercased regardless of the case it arrived in.
+    #[test]
+    fn uppercase_0x_prefix_is_accepted_and_lowercased() {
+        assert_eq!(
+            canonical_clt_address("0X0123456789ABCDEF0123456789ABCDEF01234567"),
+            Some("0x0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    /// No prefix at all is still address-shaped and must be given one, not rejected for lacking it.
+    #[test]
+    fn bare_hex_with_no_prefix_is_given_0x() {
+        assert_eq!(
+            canonical_clt_address("0123456789abcdef0123456789abcdef01234567"),
+            Some("0x0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    /// One digit short of 40: every character is valid hex, only the length is wrong.
+    #[test]
+    fn thirty_nine_hex_digits_is_rejected() {
+        assert_eq!(canonical_clt_address("0x0123456789abcdef0123456789abcdef0123456"), None);
+    }
+
+    /// One digit over 40: same fixture as above with an extra valid hex digit appended.
+    #[test]
+    fn forty_one_hex_digits_is_rejected() {
+        assert_eq!(canonical_clt_address("0x0123456789abcdef0123456789abcdef012345678"), None);
+    }
+
+    #[test]
+    fn empty_string_is_rejected() {
+        assert_eq!(canonical_clt_address(""), None);
+    }
+
+    /// Cyrillic "а" (U+0430) reads identically to Latin "a" but is not ASCII. It is also TWO UTF-8
+    /// bytes where the Latin letter is one, so a 38-ASCII-hex-char string plus this one lookalike is
+    /// 39 characters but exactly 40 bytes — enough to pass a byte-length-only check. Only the
+    /// per-character `is_ascii_hexdigit` test catches it, which is the property this pins.
+    #[test]
+    fn non_ascii_hex_lookalike_is_rejected() {
+        let lookalike = "0x0123456789abcdef0123456789abcdef012345\u{0430}";
+        assert_eq!(canonical_clt_address(lookalike), None);
+    }
 }

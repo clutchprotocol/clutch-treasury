@@ -1,4 +1,5 @@
-//! Watching per-intent deposit addresses, which is what replaced Bitcart.
+//! Watching permanent per-user deposit addresses, plus a shrinking legacy set of per-intent ones,
+//! which is what replaced Bitcart.
 //!
 //! # Why Bitcart is gone
 //!
@@ -20,10 +21,11 @@
 //!
 //! # How matching works now
 //!
-//! Each intent has its OWN derived address (`derive.rs`), so the destination address identifies the
-//! payer. That is a strictly better identity than the amount discriminator it replaced: it has no
-//! 999-slot ceiling, no cross-user collision risk from a freed slot, and a payer who rounds their
-//! amount is still correctly attributed.
+//! Each user has ONE permanent derived address (`derive.rs`, `deposit_addresses`), issued once and
+//! reused for every deposit they make — not one address per intent any more. The destination still
+//! identifies the payer, which remains a strictly better identity than the amount discriminator it
+//! replaced: no 999-slot ceiling, no cross-user collision risk from a freed slot, and a payer who
+//! rounds their amount is still correctly attributed.
 //!
 //! # The unavoidable cost
 //!
@@ -31,10 +33,12 @@
 //! group — derived addresses are unrelated on-chain. So this is one request per address being
 //! watched, not one per poll pass as it was under a single shared custody address.
 //!
-//! What keeps that bounded is that only OPEN intents are polled: the set is the number of in-flight
-//! deposits inside the TTL, not the number ever created. The poller caps it per tick and says so
-//! when it does, because an unkeyed TronGrid throttles hard and a throttled watcher is
-//! indistinguishable from "nobody is paying" — a failure mode already paid for once.
+//! What keeps that bounded now is `poller::due_addresses`'s per-pass budget, not the open-intent
+//! count: every address is permanent and stays watched for as long as its user might ever deposit
+//! again, so cost is capped by how many addresses are polled each pass — hot ones first, the rest
+//! rotating cold — rather than by how many deposits happen to be in flight. The reason to bound it
+//! at all is unchanged: an unkeyed TronGrid throttles hard, and a throttled watcher is
+//! indistinguishable from "nobody is paying."
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -54,56 +58,25 @@ pub struct ObservedTransfer {
 
 #[async_trait]
 pub trait CustodyWatcher: Send + Sync {
-    /// Confirmed TRC-20 transfers into ONE address.
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String>;
+    /// Confirmed TRC-20 transfers into ONE address, optionally bounded below by
+    /// `min_timestamp_ms` (epoch milliseconds). `None` fetches unbounded, same as before this
+    /// parameter existed.
+    async fn transfers_to(
+        &self,
+        address: &str,
+        min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String>;
 }
 
-/// What the observed transfers to an intent's address add up to.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PaymentOutcome {
-    /// Nothing has arrived at this address yet.
-    None,
-    /// Something arrived but it is short of the expected amount. NOT creditable — crediting the
-    /// expected amount here would mint CLT the deposit does not back.
-    Partial { received_usdt: i64 },
-    /// At least the expected amount arrived. `tx_id` is the EARLIEST contributing transfer, which
-    /// is the evidence the treasury's verifier re-checks independently.
-    Settled { tx_id: String, received_usdt: i64 },
-}
-
-/// Decide an intent's payment state from the transfers observed at its address.
+/// Everything credit-worthy observed since the last call.
 ///
-/// Amounts are SUMMED over distinct transaction ids, so a payer who sends in two parts settles once
-/// both land. Duplicate ids are collapsed: the same transfer appearing twice in a response (or
-/// across a retry) must not count twice, or a single payment could satisfy twice its value.
-///
-/// Overpayment settles at the observed total, deliberately. The ledger records what arrived, not
-/// what was intended — the reconciliation cross-check compares against custody, so recording the
-/// intended figure would build in a permanent discrepancy.
-pub fn evaluate_payment(transfers: &[ObservedTransfer], expected_amount_usdt: i64) -> PaymentOutcome {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut total: i64 = 0;
-    let mut earliest: Option<&ObservedTransfer> = None;
-
-    for t in transfers {
-        if seen.contains(&t.tx_id.as_str()) {
-            continue;
-        }
-        seen.push(&t.tx_id);
-        // Saturating: a hostile or corrupt amount must not wrap into something that looks settled.
-        total = total.saturating_add(t.amount_usdt);
-        if earliest.is_none_or(|e| t.block_timestamp < e.block_timestamp) {
-            earliest = Some(t);
-        }
-    }
-
-    match earliest {
-        None => PaymentOutcome::None,
-        Some(e) if total >= expected_amount_usdt => {
-            PaymentOutcome::Settled { tx_id: e.tx_id.clone(), received_usdt: total }
-        }
-        Some(_) => PaymentOutcome::Partial { received_usdt: total },
-    }
+/// Deliberately NOT address-oriented, unlike `CustodyWatcher`. A future implementation that follows
+/// the USDT contract's Transfer events from a stored cursor cannot express itself as
+/// `transfers_to(address)` — it asks for everything since a point in time and filters locally. With
+/// the seam here instead, that implementation drops in without the credit path learning about it.
+#[async_trait]
+pub trait DepositWatcher: Send + Sync {
+    async fn poll(&self) -> Result<Vec<ObservedTransfer>, String>;
 }
 
 pub struct TronGridWatcher {
@@ -113,10 +86,25 @@ pub struct TronGridWatcher {
     usdt_contract: String,
 }
 
-/// TronGrid caps `limit` at 200 and defaults it to 20. A per-intent address should only ever see a
-/// handful of transfers, so this is headroom rather than a real bound — but the default of 20 is
-/// small enough to truncate a pathological case, and a truncated page reads as a missing payment.
+/// TronGrid caps `limit` at 200 and defaults it to 20. Under permanent addresses an address
+/// accumulates transfers for its whole life, so this can no longer rely on a handful-per-address
+/// premise to stay headroom — what keeps a page from truncating is `min_timestamp` bounding each
+/// fetch to what has arrived since the last poll, which is exactly what `TieredPoller` passes. The
+/// default of 20 is still small enough to truncate a pathological case, and a truncated page reads
+/// as a missing payment.
 const PAGE_LIMIT: &str = "200";
+
+/// Hard cap on pages followed per address per call. 10 pages x 200 rows/page = 2,000 rows for one
+/// address in one poll — far beyond what a real deposit history should ever produce. Past that,
+/// TronGrid is still offering a fingerprint cursor and something is wrong (most plausibly a
+/// misbehaving or adversarial upstream); returning a partial `Ok` at that point would be exactly
+/// the silent loss this fix exists to close, so `transfers_to` returns `Err` naming the address
+/// and this cap instead. `TieredPoller` (poller.rs) does NOT advance the address's watermark on
+/// that `Err` — only `last_attempt_at` is stamped, rotating the address to the back of the queue —
+/// so the next successful pass re-reads from the same `last_polled_at` instead of silently skipping
+/// whatever arrived while this cap kept tripping. A persistent cap `Err` on one address is therefore
+/// loud (an aggregated alert every pass) and needs a human, not a wait.
+const MAX_PAGES: usize = 10;
 
 /// Only this TRC-20 event kind moves value. An `Approval` carries a `to` and a `value` too, so
 /// without this check an approval could satisfy an amount check with nothing having moved.
@@ -148,40 +136,88 @@ struct TokenInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct Trc20Meta {
+    /// Present when another page exists; TronGrid's v1 account endpoints accept this back as the
+    /// `fingerprint` query parameter to fetch the next page.
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Trc20Response {
     #[serde(default)]
     data: Vec<Trc20Row>,
+    #[serde(default)]
+    meta: Option<Trc20Meta>,
 }
 
 #[async_trait]
 impl CustodyWatcher for TronGridWatcher {
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String> {
+    async fn transfers_to(
+        &self,
+        address: &str,
+        min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String> {
         let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, address);
-        let resp = self
-            .http
-            .get(&url)
-            .header("TRON-PRO-API-KEY", &self.api_key)
-            .query(&[
-                // Confirmed only. This doubles as the confirmation gate: TronGrid excludes
-                // transfers from blocks that are not yet irreversible, so anything appearing here
-                // already has the depth the treasury's verifier separately re-checks.
-                ("only_confirmed", "true"),
-                ("contract_address", self.usdt_contract.as_str()),
-                ("limit", PAGE_LIMIT),
-            ])
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid trc20 list for {address} failed: {status} {text}"));
+        let page_limit = PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX);
+        let mut all_rows: Vec<Trc20Row> = Vec::new();
+        let mut fingerprint: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut req = self
+                .http
+                .get(&url)
+                .header("TRON-PRO-API-KEY", &self.api_key)
+                .query(&[
+                    // Confirmed only. This doubles as the confirmation gate: TronGrid excludes
+                    // transfers from blocks that are not yet irreversible, so anything appearing here
+                    // already has the depth the treasury's verifier separately re-checks.
+                    ("only_confirmed", "true"),
+                    ("contract_address", self.usdt_contract.as_str()),
+                    ("limit", PAGE_LIMIT),
+                ]);
+            if let Some(ts) = min_timestamp_ms {
+                // Lower bound only — TronGrid still returns newest-first up to `limit`. Bounding here
+                // is what keeps a permanent address's page from growing with its whole lifetime.
+                req = req.query(&[("min_timestamp", ts.to_string())]);
+            }
+            if let Some(fp) = &fingerprint {
+                // TronGrid's pagination cursor: carried over from the previous page's
+                // `meta.fingerprint`, which is present whenever older rows still exist.
+                req = req.query(&[("fingerprint", fp.as_str())]);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("trongrid trc20 list for {address} failed: {status} {text}"));
+            }
+            let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
+            let page_len = parsed.data.len();
+            all_rows.extend(parsed.data);
+            // An empty string is treated the same as an absent cursor — TronGrid should never send
+            // one, but "no more pages" must not silently depend on that.
+            let next_fingerprint = parsed.meta.and_then(|m| m.fingerprint).filter(|f| !f.is_empty());
+            // Ok on purpose, not Err: an address that legitimately has exactly page_limit rows and
+            // nothing more would otherwise fail forever, since every re-poll re-hits this same
+            // full-page-no-cursor case. TronGrid is documented to always send a fingerprint when
+            // more rows exist — this is only a warning in case that contract ever breaks.
+            if page_len >= page_limit && next_fingerprint.is_none() {
+                tracing::warn!(
+                    "trongrid returned a full page of {page_len} transfers for {address} with no fingerprint cursor — \
+                     if more rows exist they cannot be fetched; verify TronGrid's pagination contract"
+                );
+            }
+            if page_len < page_limit || next_fingerprint.is_none() {
+                return Ok(rows_to_transfers(all_rows, address, &self.usdt_contract));
+            }
+            fingerprint = next_fingerprint;
         }
-        let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
-        if parsed.data.len() >= PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX) {
-            tracing::warn!("trongrid returned a full page of transfers for {address} — older ones may be truncated");
-        }
-        Ok(rows_to_transfers(parsed.data, address, &self.usdt_contract))
+        // Exhausted MAX_PAGES with TronGrid still offering a fingerprint on the last page fetched —
+        // see MAX_PAGES's doc comment for why this is a loud Err rather than a partial, silently
+        // truncated Ok.
+        Err(format!(
+            "trongrid trc20 list for {address} exceeded the {MAX_PAGES}-page cap with more pages still offered"
+        ))
     }
 }
 
@@ -231,68 +267,6 @@ mod tests {
 
     fn t(tx: &str, amount: i64, ts: i64) -> ObservedTransfer {
         ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: ADDR.into(), contract: USDT.into(), block_timestamp: ts }
-    }
-
-    #[test]
-    fn nothing_observed_is_none() {
-        assert_eq!(evaluate_payment(&[], 1_000_000), PaymentOutcome::None);
-    }
-
-    #[test]
-    fn exact_amount_settles() {
-        let got = evaluate_payment(&[t("a", 1_000_000, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "a".into(), received_usdt: 1_000_000 });
-    }
-
-    /// A rounded payment settles now, where the amount discriminator would have left it unmatched
-    /// and stranded. This is the practical win of address-based identity.
-    #[test]
-    fn a_rounded_payment_settles_instead_of_stranding() {
-        let got = evaluate_payment(&[t("round", 1_000_000, 10)], 1_000_000);
-        assert!(matches!(got, PaymentOutcome::Settled { .. }));
-    }
-
-    /// Overpayment records what ARRIVED, not what was intended — the reconciliation cross-check
-    /// compares the ledger against custody, so recording the intended figure builds in a permanent
-    /// discrepancy.
-    #[test]
-    fn overpayment_settles_at_the_observed_total() {
-        let got = evaluate_payment(&[t("over", 5_000_000, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "over".into(), received_usdt: 5_000_000 });
-    }
-
-    /// Underpayment must NOT settle. Crediting the expected amount here mints CLT the deposit does
-    /// not back.
-    #[test]
-    fn underpayment_is_partial_never_settled() {
-        let got = evaluate_payment(&[t("short", 999_999, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Partial { received_usdt: 999_999 });
-    }
-
-    #[test]
-    fn two_part_payment_settles_once_the_sum_reaches_expected() {
-        let parts = vec![t("p1", 400_000, 10), t("p2", 600_000, 20)];
-        let got = evaluate_payment(&parts, 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "p1".into(), received_usdt: 1_000_000 },
-                   "evidence must name the EARLIEST contributing transfer");
-    }
-
-    /// The same transfer seen twice — a duplicated response, or a retry — must not count twice, or
-    /// one payment could satisfy twice its value.
-    #[test]
-    fn a_duplicate_transaction_id_is_counted_once() {
-        let dupes = vec![t("same", 600_000, 10), t("same", 600_000, 10)];
-        assert_eq!(evaluate_payment(&dupes, 1_000_000), PaymentOutcome::Partial { received_usdt: 600_000 });
-    }
-
-    /// A corrupt or hostile amount must not wrap into something that looks settled.
-    #[test]
-    fn absurd_amounts_saturate_rather_than_overflow() {
-        let huge = vec![t("h1", i64::MAX, 10), t("h2", i64::MAX, 20)];
-        match evaluate_payment(&huge, 1_000_000) {
-            PaymentOutcome::Settled { received_usdt, .. } => assert_eq!(received_usdt, i64::MAX),
-            other => panic!("expected saturated Settled, got {other:?}"),
-        }
     }
 
     #[test]

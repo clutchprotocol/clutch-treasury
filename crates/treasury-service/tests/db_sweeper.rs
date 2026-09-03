@@ -14,9 +14,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ADDR: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
 
-/// One address per intent, because uq_mint_intents_deposit_address forbids sharing — which is the
-/// point. These are real derived addresses from the published fixture; the balance read
-/// base58check-decodes them, so placeholders would be rejected.
+/// Five real, distinct derived addresses for these tests to assign across seeded rows — nothing in
+/// the schema requires per-intent uniqueness any more (a permanent address can back many deposits).
+/// They must be genuinely valid because the balance read base58check-decodes them; a placeholder
+/// would be rejected.
 const ADDRS: [&str; 5] = [
     "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH",
     "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK",
@@ -258,8 +259,8 @@ async fn a_dry_fee_account_stops_the_pass_and_alerts_once() {
     let pool = pool().await;
     let server = MockServer::start().await;
     mount_balance(&server, 500_000_000).await;
-    // Distinct addresses (uq_mint_intents_deposit_address) and distinct ages, so the order the
-    // worker walks them in is deterministic — the pass is ordered by created_at.
+    // Distinct ages make the walk order deterministic — the pass is ordered by created_at, so the
+    // older row (index 10) is asked first.
     seed(&pool, "credited", 10, 5).await;
     seed(&pool, "credited", 11, 1).await;
 
@@ -332,6 +333,44 @@ async fn re_running_over_an_empty_address_settles_it_without_a_second_transfer()
     let first = swept_at(&pool, id).await;
     sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
     assert_eq!(swept_at(&pool, id).await, first, "swept_at must not be rewritten by a later pass");
+}
+
+/// The bug the Task 7 review caught before it shipped (R17): the query above only ever selects rows
+/// WITH a `derivation_index`, so a credited deposit whose row lacks one is skipped forever, and the
+/// pass logs the same "unswept address(es)" line a healthy, idle pass would show. `sweep_once` must
+/// surface it instead of staying silent.
+#[tokio::test]
+async fn a_credited_row_missing_derivation_index_is_reported_and_left_unswept() {
+    let pool = pool().await;
+    let server = MockServer::start().await; // no balance mock — this row must never reach the sweep loop
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, approved_by, client_ref,
+             expected_amount_usdt, deposit_address, derivation_index, status, created_at)
+         VALUES ($1, 'TBene', 1000000, $2, 'orchestrator', 'tron-verifier', $3, 1000000, $4, NULL, 'credited', now())",
+    )
+    .bind(id)
+    .bind(format!("ref-{id}"))
+    .bind(format!("client-{id}"))
+    .bind(ADDRS[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let signer = FakeSigner::new(SignerReply::Swept { tx_id: "tx-unreachable".into() });
+    let missing = sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+
+    assert_eq!(missing, 1, "the pass must count the credited row with no derivation_index");
+    assert!(signer.asked().is_empty(), "a row with no index must be reported, not swept");
+    assert!(swept_at(&pool, id).await.is_none(), "unchanged behaviour: the row is still left unswept");
+
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'sweeper'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts, 1, "a credited row with no derivation_index must reach the alerts pipeline, not just the log");
 }
 
 fn tron(server: &MockServer) -> treasury_service::tron_verifier::TronClient {
