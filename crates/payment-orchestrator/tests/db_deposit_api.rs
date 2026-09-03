@@ -504,7 +504,13 @@ async fn the_list_is_newest_first_and_capped_at_twenty() {
 }
 
 /// `received_usdt` is what actually arrived; `amount_usdt` alone is only what was once asked for.
-/// The response's `amount_usdt` must report the former whenever it is set.
+/// The response's `amount_usdt` must report the former whenever it is set, AND must still fall
+/// back to `amount_usdt` when `received_usdt` is NULL — a live state, not a hypothetical one: the
+/// legacy per-intent loop leaves rows with `received_usdt = NULL` until `set_received_usdt` runs,
+/// and `recent_for_user` has no status filter, so such rows come back from this endpoint too. Pin
+/// both directions, or a fallback mis-edited to `.unwrap_or(0)`/`.unwrap_or_default()` would
+/// silently zero every not-yet-settled deposit and nothing here would fail. Rows are looked up by
+/// `tron_tx_id` rather than by position, since ordering is not what this test is about.
 #[tokio::test]
 async fn the_list_reports_what_arrived_not_what_was_asked_for() {
     let pool = pool().await;
@@ -513,6 +519,7 @@ async fn the_list_reports_what_arrived_not_what_was_asked_for() {
     let app = router_with(pool.clone(), config);
 
     seed_deposit(&pool, USER_A, 20_000_000, Some(25_000_000), "tx-overpaid", chrono::Utc::now()).await;
+    seed_deposit(&pool, USER_A, 30_000_000, None, "tx-unsettled", chrono::Utc::now()).await;
 
     let res = app
         .oneshot(
@@ -530,11 +537,21 @@ async fn the_list_reports_what_arrived_not_what_was_asked_for() {
     assert_eq!(status, StatusCode::OK);
 
     let rows = body["deposits"].as_array().expect("deposits must be an array");
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
+    let find = |tx_id: &str| {
+        rows.iter()
+            .find(|r| r["tron_tx_id"].as_str() == Some(tx_id))
+            .unwrap_or_else(|| panic!("no row with tron_tx_id {tx_id}"))
+    };
     assert_eq!(
-        rows[0]["amount_usdt"].as_i64().unwrap(),
+        find("tx-overpaid")["amount_usdt"].as_i64().unwrap(),
         25_000_000,
-        "amount_usdt must report what arrived (received_usdt), not what was asked for"
+        "amount_usdt must report what arrived (received_usdt) when it is set"
+    );
+    assert_eq!(
+        find("tx-unsettled")["amount_usdt"].as_i64().unwrap(),
+        30_000_000,
+        "amount_usdt must fall back to amount_usdt when received_usdt is NULL, not silently zero it"
     );
 }
 
