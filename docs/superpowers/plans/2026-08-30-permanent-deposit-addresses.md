@@ -1015,8 +1015,9 @@ the ones already out.
 
 - [ ] **Step 2: Delete the dead deposit bounds**
 
-Remove `min_deposit_usdt` and `max_deposit_usdt` from `OrchConfig`, from `config/default.toml`, and
-from `docker-compose.treasury.yml`'s orchestrator env block. Nothing reads them after Task 6, and a
+Remove `min_deposit_usdt` and `max_deposit_usdt` from `OrchConfig` and from `config/default.toml`.
+`docker-compose.treasury.yml` has NO corresponding env lines (verified) — confirm with a grep and skip;
+do not go hunting for them. Nothing reads them after Task 6, and a
 bound that is read by nothing but still appears in config reads to the next person like a live
 control on how much a user may deposit — and they would be wrong.
 
