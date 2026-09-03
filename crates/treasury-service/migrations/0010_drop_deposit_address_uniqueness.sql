@@ -1,0 +1,11 @@
+-- The treasury's half of the same change. This one is a money control, not bookkeeping: it exists
+-- so one address cannot be minted against twice.
+--
+-- That guarantee moves to uq_mint_intents_deposit_tx (migration 0002), which is already enforced
+-- and already tested — every mint keyed to exactly one on-chain transaction. Both drops land in
+-- their own migrations but the same deploy, so no window exists where neither key applies.
+--
+-- Reserve safety depends on reconciliation.rs's SELECT DISTINCT, which MUST already be deployed:
+-- without it, an address on several unswept rows is summed once per row and the reserve reads high,
+-- licensing mints nothing backs.
+DROP INDEX IF EXISTS uq_mint_intents_deposit_address;
