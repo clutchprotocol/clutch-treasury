@@ -867,6 +867,24 @@ async fn a_one_cent_deposit_is_credited_in_full() {
 }
 ```
 
+A fourth test, added after Task 5's review: `TieredPoller::poll` itself had no coverage, and its
+"stamp `last_polled_at` even when TronGrid fails" property is what stops one broken address from being
+re-polled every pass while the others starve. Cover it here, where the poller is finally wired in:
+
+```rust
+#[tokio::test]
+async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
+    // Two users with permanent addresses (via `address_for_user`), budget covering both.
+    // wiremock: 500 for A's `/v1/accounts/{A}/transactions/trc20`, one valid transfer for B.
+    // Run one pass over the per-user loop (poll_once, or TieredPoller::poll + credit_transfer —
+    // whichever Step 5 makes natural).
+    // Assert: B's transfer is credited (one deposit_intents row carrying its tx id);
+    //         last_polled_at IS NOT NULL for BOTH A and B;
+    //         the pass returned Ok — A's failure was logged, not propagated.
+    // Fails if stamping moves inside the success branch, or if a `?` on one address aborts the loop.
+}
+```
+
 Add `const ADDR: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";` and an `observed(tx_id, to, amount)` helper building an `ObservedTransfer` with the configured USDT contract and a fixed `block_timestamp`.
 
 - [ ] **Step 2: Run to verify they fail**
