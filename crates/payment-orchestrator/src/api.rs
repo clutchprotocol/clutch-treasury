@@ -11,10 +11,11 @@ use sqlx::PgPool;
 use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::addresses;
 use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::derive::AddressDeriver;
-use crate::deposits::{self, DepositOutcome};
+use crate::deposits;
 use crate::redemptions::{self, RedemptionOutcome};
 
 #[derive(Clone)]
@@ -59,75 +60,46 @@ fn build_cors(allowed_origins: &str) -> CorsLayer {
 #[derive(Deserialize)]
 struct CreateDepositBody {
     clt_address: String,
-    amount_usdt: i64,
 }
 
-/// `POST /api/v1/deposits` — the create-flow: idempotency layer 1 (client-key dedup,
-/// Task 2) meets layer 4 (invoice-store compare-and-set). No gateway call: the pay address is
-/// the configured custody address and detection is the custody poller's job (`custody.rs`).
-/// Thin by design: every actual decision (replay/conflict/still-processing/bounds/CAS) is
-/// made in `deposits::create_and_invoice`; this handler only extracts the request and
-/// translates the resulting `DepositOutcome` into a status code, headers, and body.
+/// `POST /api/v1/deposits` — where to send USDT.
+///
+/// No amount, and no intent. The user has one permanent address; whatever arrives at it is credited
+/// in full by the poller. This is idempotent by nature rather than by an idempotency key: a user has
+/// exactly one address, so a repeat call is the same answer.
+///
+/// On a repeat call the stored `clt_address` wins: `addresses::address_for_user`'s `ON CONFLICT
+/// (user_pk) DO NOTHING` means a user who sends a different one later keeps their original
+/// destination. That is deliberate — silently re-pointing where someone's future deposits mint is
+/// worse than ignoring the change.
+///
+/// Marking the address hot here is the whole reason the tiered poller can stay cheap — this call IS
+/// the signal that a deposit is imminent.
 async fn create_deposit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateDepositBody>,
-) -> Result<(StatusCode, HeaderMap, Json<serde_json::Value>), StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let user_pk = authenticated_pk(&headers, &state.config)?;
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let outcome = deposits::create_and_invoice(
-        &state.pool,
-        &state.config,
-        state.deriver.as_ref(),
-        &user_pk,
-        &body.clt_address,
-        body.amount_usdt,
-        idempotency_key,
-    )
-    .await;
+    let address =
+        addresses::address_for_user(&state.pool, state.deriver.as_ref(), &user_pk, &body.clt_address)
+            .await
+            .map_err(|e| {
+                tracing::error!("deposit address for {user_pk}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-    let mut resp_headers = HeaderMap::new();
-    let (status, payload) = match outcome {
-        // Fall back to 500, not 200: an unparseable stored status is a bug in whatever
-        // wrote it, and replaying it as success would tell the client their deposit is
-        // fine on the strength of a value we couldn't read.
-        DepositOutcome::Respond { status, body } => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            body,
-        ),
-        DepositOutcome::Conflict => (StatusCode::CONFLICT, json!({"error": "idempotency key already used with a different request body"})),
-        DepositOutcome::StillProcessing => {
-            resp_headers.insert("retry-after", "2".parse().unwrap());
-            (StatusCode::CONFLICT, json!({"error": "a request with this idempotency key is still being processed"}))
-        }
-        DepositOutcome::OutOfBounds { min, max } => (
-            StatusCode::BAD_REQUEST,
-            json!({"error": format!("amount_usdt must be between {min} and {max}")}),
-        ),
-        // Fail closed (T2b's deferred headroom check, landed in 5b): the treasury couldn't be
-        // asked whether it could mint against this deposit — 503 + Retry-After, same shape as
-        // any other "ask again shortly" backpressure signal.
-        DepositOutcome::TreasuryUnavailable => {
-            resp_headers.insert("retry-after", "30".parse().unwrap());
-            (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "treasury unreachable — cannot verify mint headroom, try again shortly"}))
-        }
-        // A clear 4xx, not a 503: the treasury DID answer, and the answer is "not enough room
-        // today" — retrying immediately won't change that, so this isn't the same kind of
-        // "try again shortly" signal a 503 implies.
-        DepositOutcome::InsufficientHeadroom { headroom_clt } => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({"error": format!("insufficient daily mint headroom ({headroom_clt} CLT remaining) to cover this deposit")}),
-        ),
-        DepositOutcome::Failed(msg) => {
-            tracing::error!("create_and_invoice failed: {msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal error"}))
-        }
-    };
-    Ok((status, resp_headers, Json(payload)))
+    if let Err(e) =
+        addresses::mark_hot(&state.pool, &user_pk, state.config.deposit_hot_window_hours).await
+    {
+        // Not fatal: the address is still watched on the cold rotation, so a deposit is credited
+        // late rather than lost. Worth an error line because a persistent failure here quietly
+        // degrades every deposit to the slow tier.
+        tracing::error!("marking {user_pk} hot: {e}");
+    }
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "address": address }))))
 }
 
 /// `GET /api/v1/deposits/:id` — owner-checked: a JWT that authenticates fine but names a
