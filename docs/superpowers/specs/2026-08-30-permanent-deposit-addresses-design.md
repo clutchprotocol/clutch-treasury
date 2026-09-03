@@ -166,6 +166,15 @@ That reshapes the API. `POST /api/v1/deposits` no longer creates an intent — i
 address, deriving and storing it on first call, and sets `hot_until`. It becomes idempotent by
 nature, because a user has exactly one address.
 
+The CLT beneficiary is the authenticated identity itself: the JWT `pk`, which the demo app already
+sets to the user's `0x` address, validated against the node's address rule (40 hex digits, optional
+`0x`) and normalized. The request body carries nothing and is ignored. A client cannot bind its
+deposits to a different CLT address, by design — under permanence a typo or a stranger's address
+would be that user's mint destination forever, and nothing between the body and the node validated
+the string. Tokens carrying a 130-hex public key instead of an address are refused with 400 until a
+client needs them (the derivation is keccak-256 of the key, as the demo app's wallet code does).
+*(Amended after Task 6 review, R14.)*
+
 Its min/max bounds have nothing left to check: there is no longer a figure supplied before money
 moves. `min_deposit_usdt` and `max_deposit_usdt` therefore become dead config. **Delete them rather
 than leaving them set** — a bound that is read by nothing but still appears in `.env` and the

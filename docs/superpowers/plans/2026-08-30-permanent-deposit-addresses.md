@@ -662,6 +662,14 @@ git commit -m "feat: tiered address selection behind a DepositWatcher seam"
 
 ### Task 6: The endpoint returns an address
 
+> **Amendment R14 (landed as the Task 6 fix loop, after review).** The body field is GONE.
+> `POST /api/v1/deposits` takes no body (any body an old client still sends is ignored — no `Json`
+> extractor). The beneficiary is the authenticated identity: `user_pk` must satisfy the node's address
+> rule (`clutch-node/src/node/transactions/address.rs::is_valid_address` — strip optional `0x`/`0X`,
+> 40 ASCII hex digits) or the route answers 400; `clt_address` stored on `deposit_addresses` is
+> `clutch_chain::tx::normalize_address(user_pk)`. Route-level test fixtures therefore use real-shaped
+> addresses, not `"0xuser-a"`. Everything below that says `{"clt_address": ...}` is superseded.
+
 **Files:**
 - Modify: `crates/payment-orchestrator/src/api.rs:71-95`
 - Modify: `crates/payment-orchestrator/src/deposits.rs`
@@ -1157,6 +1165,9 @@ verified present:
   xpub → watches TronGrid for USDT paid TO it" → "derives one TRON address per user from the account
   xpub → polls it (hot first, then a bounded cold rotation) for USDT paid TO it".
 Fix both. A grep for `per-intent` and `per intent` across that file must return nothing afterwards.
+In BOTH files, also state in one sentence that the CLT beneficiary of a deposit is the authenticated
+identity (the JWT `pk`, address form), that the deposit request carries no body, and that a public-key
+token is refused — so nobody later "adds back" a `clt_address` field thinking it was forgotten (R14).
 
 - [ ] **Step 3: Commit**
 
