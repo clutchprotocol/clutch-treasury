@@ -710,9 +710,16 @@ These helpers already exist in that file: `pool()`, `mock_treasury_with_generous
 the existing tests there build and send a request — match that exactly (they may use a different
 request idiom than the sketch above; the sketch shows intent, the file shows the convention).
 
-**Delete the three existing tests in that file** — `replay_same_key_same_body_returns_original_status_and_body`,
-`same_key_different_body_returns_409`, `retry_while_processing_returns_409_with_retry_after`. Every one
-exercises the idempotency-key create flow this task removes. Deleting them is the point, not collateral.
+**Retire exactly these FIVE tests in that file** — every one exercises the amount-bearing,
+idempotency-keyed create flow this task removes, so deleting them is the point, not collateral:
+`replay_same_key_same_body_returns_original_status_and_body`, `same_key_different_body_returns_409`,
+`retry_while_processing_returns_409_with_retry_after`, `out_of_bounds_amount_returns_400`,
+`missing_idempotency_key_returns_400`.
+
+**Keep** `get_deposit_rejects_non_owner` (the GET path is unchanged) and `missing_auth_returns_401`
+(auth still gates the route) — but update the latter's request to the new body shape
+(`{"clt_address": ...}`, no amount, no `idempotency-key` header) so it exercises the route as it now
+exists rather than a request the handler no longer parses.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -981,8 +988,17 @@ from `docker-compose.treasury.yml`'s orchestrator env block. Nothing reads them 
 bound that is read by nothing but still appears in config reads to the next person like a live
 control on how much a user may deposit — and they would be wrong.
 
-Also remove `deposit_ttl_minutes` if nothing else reads it after Task 6; check with
-`grep -rn deposit_ttl_minutes crates/` before deleting, and say what you found.
+Also remove `deposit_ttl_minutes` — verified: after Task 6 nothing in `src/` reads it.
+
+Exact deletions, verified against the tree:
+- `config/default.toml` lines `deposit_ttl_minutes = 30`, `min_deposit_usdt = 1000000`, `max_deposit_usdt = 50000000`.
+- The three fields from every `OrchConfig { .. }` literal in `tests/db_bridge.rs`, `tests/db_deposit_api.rs`,
+  `tests/db_deposits.rs` — these are the only remaining readers, and a literal naming a removed field
+  fails to compile.
+- The three `pub` fields from `OrchConfig` itself.
+Re-grep `min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes` across `crates/` afterwards; it must
+return nothing. Do NOT touch `min_redemption_clt` / `max_redemption_clt` — those are the redemption
+bounds and stay.
 
 - [ ] **Step 3: Verify and commit**
 
