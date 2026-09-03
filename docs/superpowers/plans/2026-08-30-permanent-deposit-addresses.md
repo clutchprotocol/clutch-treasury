@@ -1046,8 +1046,8 @@ Also remove `deposit_ttl_minutes` — verified: after Task 6 nothing in `src/` r
 
 Exact deletions, verified against the tree:
 - `config/default.toml` lines `deposit_ttl_minutes = 30`, `min_deposit_usdt = 1000000`, `max_deposit_usdt = 50000000`.
-- The three fields from every `OrchConfig { .. }` literal in `tests/db_bridge.rs`, `tests/db_deposit_api.rs`,
-  `tests/db_deposits.rs` — these plus `tests/db_redemptions.rs` are the remaining readers, and a literal naming a removed field
+- The three fields from every `OrchConfig { .. }` literal under `tests/` — at the time of writing `tests/db_bridge.rs`, `tests/db_deposit_api.rs`, `tests/db_redemptions.rs`
+  (`tests/db_deposits.rs` no longer builds one since Task 6 recreated it) — a literal naming a removed field
   fails to compile.
 - The three `pub` fields from `OrchConfig` itself.
 Re-grep `min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes` across `crates/` afterwards; it must
