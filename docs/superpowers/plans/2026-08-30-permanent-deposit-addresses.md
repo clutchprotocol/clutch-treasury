@@ -1196,6 +1196,7 @@ cd ../clutch-deploy && git add docker-compose.treasury.yml CLAUDE.md && git comm
 - Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list), `crates/payment-orchestrator/src/custody.rs` (line 1 summary only)
 - Modify: `crates/treasury-service/src/sweeper.rs` (warn on unswept rows without a derivation_index), `crates/treasury-service/tests/db_sweeper.rs` (stale comments + one new test), `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
 - Modify: `crates/payment-orchestrator/tests/db_derivation_index.rs` (one test rename)
+- Modify: `crates/payment-orchestrator/tests/db_deposit_api.rs`, `crates/payment-orchestrator/tests/db_redemptions.rs` (no-auth companion assertions in the two 503 tests)
 
 - Consumes: everything above; runs after Task 9 has stopped the UI sending `idempotency-key`.
 - Produces: nothing new — this is the debt the reviews deferred, paid in one commit so the final
@@ -1244,7 +1245,17 @@ the distinct addresses — every pass, not once. One test in `tests/db_sweeper.r
 assert the pass reports it (return the count from the pass function, or expose it however the existing
 tests observe the sweeper's decisions — read them first). Do not change what gets swept.
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 6: Prove the two rollout gates run BEFORE authentication**
+
+`deposit_route_503s_while_disabled_even_with_valid_auth` (`tests/db_deposit_api.rs`) and the older
+`both_routes_503_while_redemptions_disabled` (`tests/db_redemptions.rs`) each send a VALID token and
+assert 503 — which both orderings (gate-then-auth, auth-then-gate) produce, so neither test proves
+the "before authentication" claim in its own doc comment. In EACH test, add one more request with
+the flag still off and NO `Authorization` header, asserting 503 (not 401) — the only case where the
+two orderings diverge. `oneshot` consumes the router, so `app.clone()` for the first call. Fix the
+doc comments to say what is now actually proven.
+
+- [ ] **Step 7: Verify and commit**
 
 CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, dead CORS header, stale comments`.
 
