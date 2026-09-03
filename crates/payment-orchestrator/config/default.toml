@@ -18,13 +18,13 @@ treasury_url = "http://localhost:8090"
 treasury_initiator_token = ""
 treasury_readonly_token = ""
 custody_tron_address = ""
-deposit_ttl_minutes = 30
-min_deposit_usdt = 1000000
-max_deposit_usdt = 50000000
 poll_interval_secs = 30
 # Hours a user's deposit address stays on the fast poll tier after they open the deposit panel.
 # See OrchConfig::deposit_hot_window_hours. Very large values collapse tiering into polling everything.
 deposit_hot_window_hours = 24
+# Task 8: gates POST /api/v1/deposits (permanent per-user addresses). While false, the route
+# 503s before authentication — see OrchConfig::permanent_deposit_addresses_enabled doc comment.
+permanent_deposit_addresses_enabled = false
 # Plan C T6: the payout rail is a real TRC-20 transfer now (tron-signer's /internal/payout), but
 # this stays false until its rollout finishes (float funded, reconciliation verified) — see
 # OrchConfig::redemptions_enabled doc comment.

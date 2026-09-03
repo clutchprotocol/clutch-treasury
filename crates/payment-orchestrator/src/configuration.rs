@@ -37,9 +37,15 @@ pub struct OrchConfig {
     /// nothing else, which is why this service may hold it while the signer holds the mnemonic.
     /// Parsed once at startup so a malformed value fails at boot rather than per request.
     pub deposit_account_xpub: String,
-    pub deposit_ttl_minutes: i64,
-    pub min_deposit_usdt: i64,
-    pub max_deposit_usdt: i64,
+    /// Gates `POST /api/v1/deposits` (`create_deposit_handler`) — same shape as
+    /// `redemptions_enabled` below: while this is `false` (the default) the route 503s before
+    /// authentication even runs, rather than deriving and handing out a new address.
+    ///
+    /// This flag protects the rollout, not the decision: once a user has been handed an address
+    /// and sent USDT to it, that address must be watched and swept forever, regardless of what
+    /// this is switched to later. Turning it off only stops NEW addresses from being issued — it
+    /// does not un-issue, stop watching, or stop sweeping the ones already out.
+    pub permanent_deposit_addresses_enabled: bool,
     pub poll_interval_secs: u64,
     /// How long a user's address stays on the fast poll tier after they open the deposit panel.
     ///

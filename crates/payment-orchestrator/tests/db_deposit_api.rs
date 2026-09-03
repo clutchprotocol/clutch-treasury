@@ -68,7 +68,7 @@ async fn pool() -> PgPool {
     pool
 }
 
-fn test_config(treasury_url: String) -> OrchConfig {
+fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) -> OrchConfig {
     OrchConfig {
         http_addr: "0.0.0.0:0".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
@@ -82,9 +82,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
-        deposit_ttl_minutes: 30,
-        min_deposit_usdt: 1_000_000,
-        max_deposit_usdt: 50_000_000,
+        permanent_deposit_addresses_enabled,
         poll_interval_secs: 30,
         deposit_hot_window_hours: 24,
         // This file never exercises the redemption routes (Plan C T6) — off by default,
@@ -140,7 +138,7 @@ async fn seed_intent(pool: &PgPool, user_pk: &str) -> Uuid {
 async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
-    let config = test_config(treasury.uri());
+    let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config);
 
     let post = |app: axum::Router| async move {
@@ -199,7 +197,7 @@ async fn the_beneficiary_is_the_authenticated_identity_not_the_body() {
         .await
         .unwrap();
     let treasury = mock_treasury_with_generous_headroom().await;
-    let config = test_config(treasury.uri());
+    let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config);
 
     let res = app
@@ -235,7 +233,7 @@ async fn the_beneficiary_is_the_authenticated_identity_not_the_body() {
 async fn a_public_key_token_is_refused() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
-    let config = test_config(treasury.uri());
+    let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config);
 
     let pubkey = format!("04{}", "ab".repeat(64));
@@ -266,7 +264,7 @@ async fn a_public_key_token_is_refused() {
 async fn get_deposit_rejects_non_owner() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
-    let config = test_config(treasury.uri());
+    let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config.clone());
 
     let id = seed_intent(&pool, "0xowner").await;
@@ -310,7 +308,7 @@ async fn get_deposit_rejects_non_owner() {
 async fn missing_auth_returns_401() {
     let pool = pool().await;
     let treasury = mock_treasury_with_generous_headroom().await;
-    let config = test_config(treasury.uri());
+    let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config.clone());
 
     let res = app
@@ -324,4 +322,46 @@ async fn missing_auth_returns_401() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Task 8: `permanent_deposit_addresses_enabled` gates this route the same way
+/// `redemptions_enabled` gates the redemption routes (see
+/// `db_redemptions.rs::both_routes_503_while_redemptions_disabled`) — 503 before authentication
+/// even runs. A VALID bearer token proves the ordering: this must refuse before ever reaching
+/// `authenticated_pk`, not merely whenever auth also happens to be missing.
+///
+/// Uses its own pk rather than `USER_A`: `deposit_addresses` persists across every test in this
+/// file (see `the_beneficiary_is_the_authenticated_identity_not_the_body`'s comment), and the gate
+/// fires before `canonical_clt_address` ever runs, so an address-shaped token isn't needed either.
+#[tokio::test]
+async fn deposit_route_503s_while_disabled_even_with_valid_auth() {
+    const USER_DISABLED: &str = "0xflag-disabled-test-user";
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), false);
+    let app = router_with(pool.clone(), config);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_DISABLED))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "must 503 while permanent_deposit_addresses_enabled is false, even with a valid bearer token"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE user_pk = $1")
+        .bind(USER_DISABLED)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a disabled route must not create a deposit_addresses row");
 }

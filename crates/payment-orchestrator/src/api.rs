@@ -84,10 +84,23 @@ fn canonical_clt_address(s: &str) -> Option<String> {
 ///
 /// Marking the address hot here is the whole reason the tiered poller can stay cheap — this call IS
 /// the signal that a deposit is imminent.
+///
+/// 503s while `config.permanent_deposit_addresses_enabled` is false (default) — before auth even
+/// runs, the same ordering `redemptions_enabled` uses on the redemption routes; see
+/// `OrchConfig::permanent_deposit_addresses_enabled`'s doc comment for why this gate exists
+/// before anything else in this handler runs.
 async fn create_deposit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    // Gated before auth, same ordering as create_redemption_handler: a disabled feature 503s
+    // uniformly regardless of whether the caller's JWT would otherwise have been valid.
+    if !state.config.permanent_deposit_addresses_enabled {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "deposits are temporarily unavailable"})),
+        ));
+    }
     let user_pk = authenticated_pk(&headers, &state.config)?;
 
     let clt_address = match canonical_clt_address(&user_pk) {

@@ -61,9 +61,9 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         trongrid_url: "http://localhost:0".to_string(),
         trongrid_api_key: "test-key".to_string(),
         usdt_contract: "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf".to_string(),
-        deposit_ttl_minutes: 30,
-        min_deposit_usdt: 1_000_000,
-        max_deposit_usdt: 50_000_000,
+        // This file never exercises the deposit-create route — true just to match the
+        // non-degenerate default everywhere else.
+        permanent_deposit_addresses_enabled: true,
         poll_interval_secs: 30,
         deposit_hot_window_hours: 24,
         redemptions_enabled,
