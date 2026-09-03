@@ -1337,6 +1337,86 @@ CI. Then one commit: `fix(orchestrator): follow TronGrid's fingerprint cursor so
 
 ---
 
+### Task 13: Final-review fixes — the poll watermark, the verifier's page, the CORS header
+
+**Files:**
+- Create: `crates/payment-orchestrator/migrations/0012_deposit_addresses_last_attempt.sql`
+- Modify: `crates/payment-orchestrator/src/poller.rs`, `src/api.rs`, `src/deposits.rs`, `src/redemptions.rs`
+- Test: `crates/payment-orchestrator/tests/db_poller.rs`, `tests/db_deposit_api.rs`, `tests/db_addresses.rs`
+- Modify: `crates/treasury-service/src/tron_verifier.rs`, `src/sweeper.rs`
+- Test: `crates/treasury-service/tests/db_tron_verifier.rs`, `tests/db_sweeper.rs`, `tests/db_reconciliation.rs`
+- (clutch-deploy, separate agent) `scripts/inspect-stage.sh`: restore `APP_DEPOSIT_MATCH_WINDOW_HOURS` — it is live treasury-service config.
+
+- Consumes: everything above. Produces: the fixes the final whole-branch review required before Deploy B.
+
+- [ ] **Step 1 (Critical, R23): the watermark must not move on failure**
+
+`TieredPoller::poll` stamps `last_polled_at = now()` for every due address even when `transfers_to` failed,
+and the next poll's `min_timestamp` is derived from that stamp — so a TronGrid outage or throttling episode
+longer than the one-hour overlap permanently drops every deposit made during it, silently (no row, no alert,
+nothing downstream ever looks). Task 5 chose that stamping to stop a failing address starving the rotation;
+keep the fairness, separate it from the watermark:
+
+- Migration 0012: `ALTER TABLE deposit_addresses ADD COLUMN last_attempt_at TIMESTAMPTZ;` (additive; old
+  images ignore it).
+- `due_addresses` orders by `COALESCE(hot_until > now(), false) DESC, last_attempt_at ASC NULLS FIRST` and
+  still returns `last_polled_at` for the watermark.
+- `TieredPoller::poll`: stamp `last_attempt_at = now()` for EVERY due address (rotation fairness, as before);
+  stamp `last_polled_at = now()` ONLY for addresses whose fetch returned `Ok`; collect the failures and write
+  ONE aggregated `alerts` row per pass (`alert(pool, "warn", "poller", ...)` naming the count and the first few
+  addresses) — not one row per address; an hour-long outage must not write thousands.
+- Tests in `db_poller.rs`: replace `a_failing_address_is_still_stamped_and_does_not_block_the_others` with
+  `a_failing_address_keeps_its_watermark_but_rotates_to_the_back`: A fails, B succeeds → B credited;
+  `last_attempt_at` set for BOTH; `last_polled_at` set for B only (A's stays what it was — NULL if never read);
+  exactly one alerts row naming A. Re-point the two ordering tests at `last_attempt_at` (rename
+  `cold_addresses_rotate_oldest_polled_first` → `cold_addresses_rotate_oldest_attempted_first`;
+  `expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it` keeps its name and sets
+  `last_attempt_at`). Add `a_watermark_survives_an_outage`: seed A with `last_polled_at = T0`; run a failing
+  pass; assert `last_polled_at` is still `T0`, so the next successful pass re-reads from `T0 - 1h`.
+
+- [ ] **Step 2 (Important, R24): the verifier bounds and paginates its TronGrid read**
+
+`treasury-service/src/tron_verifier.rs::trc20_transfers` requests one 200-row page with no `min_timestamp`
+and no cursor — the bug Task 12 fixed on the orchestrator, left standing on the side that decides mints.
+Under permanent addresses a user's own history or a dust flood fills page 1 and the intent stays `created`
+until the 24h P1 (safe direction, but a stalled deposit and a human). Pass
+`min_timestamp = (intent.created_at - deposit_match_window_hours).timestamp_millis()` — the bound the
+fallback path already computes — and follow `meta.fingerprint` until a short page, capped at 10 pages → `Err`
+(mirror `custody.rs`'s loop; duplicating ~25 lines across crates is acceptable, a shared crate is not worth
+it). One wiremock test in `db_tron_verifier.rs`: the deposit's transfer only on page 2 → the intent still
+approves.
+
+- [ ] **Step 3 (Important, R25): put `idempotency-key` back in the CORS allow-list**
+
+Stage sets `ALLOWED_ORIGINS` explicitly, so the specific-origins branch applies and the header list is
+enforced on preflight. The demo app on `main` still sends `Idempotency-Key`; between Deploy B step 2 and
+step 5 the OLD UI's POST is blocked in the browser instead of receiving the clean 503, and a UI-only rollback
+is broken the same way. Restore `HeaderName::from_static("idempotency-key")` with a comment: kept for
+clients that still send it; remove only after no deployed UI does.
+
+- [ ] **Step 4: minors from the same review**
+
+- `sweeper.rs`: beside the "no derivation_index" `warn!`, write an `alert(pool, "warn", "sweeper", ...)` row so
+  it reaches the same pipeline as every other actionable sweeper condition; reword the message — an
+  `approved` row is "not yet eligible", not "can never be swept". `db_sweeper.rs`: assert the alert row.
+- `tests/db_deposit_api.rs`: add `deposit_addresses` to `pool()`'s TRUNCATE; drop the manual
+  `DELETE FROM deposit_addresses WHERE user_pk = $1` in the beneficiary test.
+- `deposits.rs`: delete `find_by_invoice_id` (no callers; its doc names deleted code). `redemptions.rs` ~line 5:
+  the comment still points at the deleted `create_and_invoice` — fix it.
+- `tests/db_addresses.rs`: rename `address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit`
+  → `address_for_user_draws_indexes_after_any_already_burned_by_nextval` (that is what it proves).
+- `tests/db_reconciliation.rs`: add `legacy_unswept_addresses_are_still_counted` — seed a per-intent-era row
+  (deposit_address set, swept_at NULL, status credited) and assert `unswept_addresses` returns it; the design
+  §5 promised this test and nothing wrote it.
+
+- [ ] **Step 5: Verify and commit**
+
+CI. Three commits: `fix(orchestrator): the poll watermark only advances on a successful read` (Step 1),
+`fix(treasury): the verifier bounds and paginates its TronGrid read` (Step 2),
+`fix(orchestrator): keep idempotency-key in CORS while old clients send it; final-review minors` (Steps 3-4).
+
+---
+
 ## Rollout
 
 **Deploy A — after Task 3.** Behaviour-neutral. Then **verify reconciliation reads `ok`** via
