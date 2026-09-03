@@ -527,6 +527,18 @@ In `crates/payment-orchestrator/src/configuration.rs`, beside `poll_interval_sec
     pub deposit_hot_window_hours: i64,
 ```
 
+`OrchConfig` fields have no serde defaults — `redemptions_enabled` boots only because
+`config/default.toml` carries `redemptions_enabled = false`. So add to `crates/payment-orchestrator/config/default.toml`:
+
+```toml
+# Hours a user's deposit address stays on the fast poll tier after they open the deposit panel.
+# See OrchConfig::deposit_hot_window_hours. Very large values collapse tiering into polling everything.
+deposit_hot_window_hours = 24
+```
+
+Without this line the orchestrator PANICS at boot the moment this field exists, before any env var is
+consulted. This is the same trap the payout rail hit twice; do not rely on compose alone.
+
 - [ ] **Step 4: Add the selection query**
 
 In `crates/payment-orchestrator/src/poller.rs`:
@@ -950,6 +962,12 @@ git commit -m "feat: credit every arriving transfer on its own"
 Mirror `redemptions_enabled`'s existing shape exactly — read it in `configuration.rs` and `api.rs`
 and follow it. When the flag is false, the deposit route returns `503` with a body saying deposits
 are temporarily unavailable, before authentication, the same ordering `redemptions_enabled` uses.
+
+Add `permanent_deposit_addresses_enabled = false` to `crates/payment-orchestrator/config/default.toml`
+next to `redemptions_enabled = false` — `OrchConfig` has no serde defaults, and a bool field absent from
+both TOML and env panics `OrchConfig::load()` at boot. `false` is the only safe default: the flag
+protects the rollout, and a service that boots with new addresses enabled by accident has already
+issued addresses nothing planned to watch.
 
 Document on the field that **the flag protects the rollout, not the decision**: once a user has been
 handed an address and sent USDT to it, that address must be watched and swept forever regardless of
