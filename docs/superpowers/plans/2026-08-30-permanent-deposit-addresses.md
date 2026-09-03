@@ -1239,3 +1239,12 @@ stack is healthy and reconciliation still `ok`, then flip the flag.
 Legacy per-intent addresses are left alone throughout. They stay in `mint_intents`, so the reserve
 sum already includes them with no extra work, and they are swept until drained by the existing
 sweeper. Nothing new joins that set.
+
+**Deploy B ordering (after Task 6).** The old per-intent create path is deleted, so with
+`permanent_deposit_addresses_enabled=false` the deposit route answers 503 — top-ups are OFF, not
+reverted. The flag flip and the demo-app deploy (Task 9's UI, which sends no body and shows the
+permanent address) must land in the same window: flip first and the old UI breaks on the new
+response shape; deploy the UI first and it gets 503s. Sequence: images live with flag off →
+reconciliation `ok` → flip the flag on the orchestrator → deploy the demo app → one small Nile
+deposit credited end to end. Once any user has been handed an address, the flag protects nothing
+any more (see the spec §6) — the watch and sweep of that address are permanent.
