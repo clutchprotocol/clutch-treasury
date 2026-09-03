@@ -193,7 +193,19 @@ impl CustodyWatcher for TronGridWatcher {
             let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
             let page_len = parsed.data.len();
             all_rows.extend(parsed.data);
-            let next_fingerprint = parsed.meta.and_then(|m| m.fingerprint);
+            // An empty string is treated the same as an absent cursor — TronGrid should never send
+            // one, but "no more pages" must not silently depend on that.
+            let next_fingerprint = parsed.meta.and_then(|m| m.fingerprint).filter(|f| !f.is_empty());
+            // Ok on purpose, not Err: an address that legitimately has exactly page_limit rows and
+            // nothing more would otherwise fail forever, since every re-poll re-hits this same
+            // full-page-no-cursor case. TronGrid is documented to always send a fingerprint when
+            // more rows exist — this is only a warning in case that contract ever breaks.
+            if page_len >= page_limit && next_fingerprint.is_none() {
+                tracing::warn!(
+                    "trongrid returned a full page of {page_len} transfers for {address} with no fingerprint cursor — \
+                     if more rows exist they cannot be fetched; verify TronGrid's pagination contract"
+                );
+            }
             if page_len < page_limit || next_fingerprint.is_none() {
                 return Ok(rows_to_transfers(all_rows, address, &self.usdt_contract));
             }
