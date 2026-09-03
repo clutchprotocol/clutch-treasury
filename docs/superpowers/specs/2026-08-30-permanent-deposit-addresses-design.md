@@ -99,11 +99,15 @@ change only what fills it:
 
 ```sql
 SELECT address, derivation_index FROM deposit_addresses
- ORDER BY (hot_until > now()) DESC, last_polled_at ASC NULLS FIRST
+ ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
  LIMIT $1
 ```
 
-Stamp `last_polled_at` after each pass. Hot addresses first, the rest rotating oldest-first. Cost
+Stamp `last_polled_at` after each pass. Hot addresses first, the rest rotating oldest-first.
+The `COALESCE` is load-bearing: a bare `(hot_until > now()) DESC` sorts TRUE, FALSE, NULL as
+*three* tiers, so an address that was hot once and expired would permanently outrank one that was
+never hot, whatever their `last_polled_at` — starving never-hot users once the once-hot count
+reaches the budget. Caught in Task 5 review. Cost
 per pass is constant regardless of user count, and the cold rotation period is
 `(addresses ÷ budget) × poll_interval` — a figure that can be told to an operator rather than
 discovered.

@@ -558,7 +558,7 @@ pub struct DueAddress {
 pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>, String> {
     sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT user_pk, address, last_polled_at FROM deposit_addresses
-         ORDER BY (hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST
+         ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
          LIMIT $1",
     )
     .bind(budget)
