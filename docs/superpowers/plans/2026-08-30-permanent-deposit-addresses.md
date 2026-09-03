@@ -1229,8 +1229,8 @@ assertion itself turns out to depend on a dropped constraint, STOP and report it
 
 - [ ] **Step 4: Rename the overclaiming test**
 
-`indexes_come_from_the_shared_sequence_and_never_repeat` in `tests/db_derivation_index.rs` asserts
-less than its name promises. Read what it asserts and rename it to exactly that — nothing else in
+`indexes_come_from_the_shared_sequence_and_never_repeat` (actually in `tests/db_addresses.rs`, not
+`db_derivation_index.rs` — moved to Task 12 Step 0b) asserts less than its name promises. Read what it asserts and rename it to exactly that — nothing else in
 the file changes.
 
 - [ ] **Step 5: Make a missing `derivation_index` loud in the sweeper**
@@ -1264,7 +1264,7 @@ CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, 
 ### Task 12: Paginate TronGrid so a full page cannot drop a deposit
 
 **Files:**
-- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only)
+- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only), `crates/payment-orchestrator/tests/db_addresses.rs` (one test rename)
 - Test: NEW `crates/payment-orchestrator/tests/trongrid_pagination.rs` — wiremock only, NO database (`transfers_to`
   never touches Postgres, so this file must not call `pool()`); construct the watcher the way `tests/db_poller.rs`
   already does for its wiremock test (`TronGridWatcher::new(server.uri(), api_key, usdt_contract)`), and copy its
@@ -1291,6 +1291,13 @@ filters them. Same cap existed under the per-intent model; permanence makes the 
 replaced. Delete the lines. The loader ignores unknown keys, so nothing changes at runtime; the point is
 that the file stops advertising configuration that does not exist. Commit: `chore(orchestrator): drop dead
 bitcart keys from default.toml`.
+
+- [ ] **Step 0b: The rename Task 11 could not reach** (same small commit as Step 0)
+
+`indexes_come_from_the_shared_sequence_and_never_repeat` lives in `tests/db_addresses.rs` (lines ~68-84), not
+`db_derivation_index.rs` as Task 11 was told. It asserts only that `address_for_user` draws an index AFTER one
+already burned by a legacy allocation. Rename it to
+`address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit`; nothing else in the file changes.
 
 - [ ] **Step 1: Write the failing test**
 
