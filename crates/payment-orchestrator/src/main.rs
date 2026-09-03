@@ -43,7 +43,13 @@ async fn main() {
     // address, which we cannot know in advance (see custody.rs). This polls each user's permanent
     // deposit address (tiered) and any still-open legacy per-intent address (watcher), matching by
     // destination.
-    tokio::spawn(payment_orchestrator::poller::run(pool.clone(), tiered, watcher, config.poll_interval_secs));
+    tokio::spawn(payment_orchestrator::poller::run(
+        pool.clone(),
+        tiered,
+        watcher,
+        config.usdt_contract.clone(),
+        config.poll_interval_secs,
+    ));
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
     // treasury's private zone. Same poll-interval convention as the poller above.

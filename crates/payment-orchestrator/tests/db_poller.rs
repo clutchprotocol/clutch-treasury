@@ -80,14 +80,19 @@ impl CustodyWatcher for FakeChain {
     }
 }
 
-/// `poll_once`'s loop (a) needs a `DepositWatcher` too. None of `FakeChain`'s own tests seed any
-/// `deposit_addresses` rows — they are all legacy per-intent scenarios — so there is never anything
-/// for loop (a) to find; an empty poll leaves everything to loop (b), which polls `FakeChain` via
-/// `CustodyWatcher` instead.
+/// `poll_once`'s loop (a) needs a `DepositWatcher` too. Returns every transfer this fake knows about
+/// regardless of address (a real `DepositWatcher` is not address-scoped either, per custody.rs) and
+/// fails the same way `CustodyWatcher::transfers_to` does when scripted to. None of `FakeChain`'s own
+/// legacy-per-intent tests seed any `deposit_addresses` rows, so `credit_from_addresses` resolves no
+/// owner for anything this returns and quietly leaves it to loop (b) — this is what R17's new test
+/// (`a_per_user_poll_outage_does_not_stop_the_legacy_loop`) needs a real failure mode for.
 #[async_trait]
 impl DepositWatcher for FakeChain {
     async fn poll(&self) -> Result<Vec<ObservedTransfer>, String> {
-        Ok(Vec::new())
+        if self.fail {
+            return Err("scripted TronGrid outage".into());
+        }
+        Ok(self.by_address.values().flatten().cloned().collect())
     }
 }
 
@@ -170,7 +175,7 @@ async fn a_transfer_at_the_intents_own_address_confirms_it_and_records_the_evide
     let id = seed(&pool, "k-alice", addr, 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-alice", addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
     assert_eq!(tx_of(&pool, id).await.as_deref(), Some("tx-alice"), "the evidence hash must be stored");
@@ -188,7 +193,7 @@ async fn a_payment_credits_only_the_intent_that_owns_that_address() {
 
     // Same amount, so amount alone could not tell them apart — the address must.
     let chain = FakeChain::with(bob_addr, vec![transfer("tx-bob", bob_addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, bob).await, "confirmed", "bob paid, bob confirms");
     assert_eq!(status_of(&pool, alice).await, "invoiced", "alice did not pay and must not advance");
@@ -214,7 +219,7 @@ async fn an_overpayment_confirms_at_the_full_arrived_amount() {
     let id = seed(&pool, "k-over", addr, 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-over", addr, 9_000_000, 100)]);
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
     let received: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE id = $1")
@@ -234,7 +239,7 @@ async fn a_late_payment_to_an_expired_intent_still_confirms() {
     let id = seed(&pool, "k-late", addr, 2_000_000, "expired").await;
 
     let chain = FakeChain::with(addr, vec![transfer("tx-late", addr, 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "confirmed");
 }
@@ -247,7 +252,7 @@ async fn a_chain_outage_neither_advances_nor_loses_the_intent() {
     let id = seed(&pool, "k-outage", "TAddrOutage", 2_000_000, "invoiced").await;
 
     let chain = FakeChain::failing();
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, "invoiced", "an unread chain must not change state");
     let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%custody fetch failed%'")
@@ -267,7 +272,7 @@ async fn terminal_and_flagged_intents_are_not_polled() {
     let open = seed(&pool, "k-open", "TAddrOpen", 2_000_000, "invoiced").await;
 
     let chain = FakeChain::with("TAddrOpen", vec![transfer("tx-open", "TAddrOpen", 2_000_000, 100)]);
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     let asked = chain.asked.lock().unwrap().clone();
     assert!(asked.contains(&"TAddrOpen".to_string()), "the open intent must be polled");
@@ -287,12 +292,12 @@ async fn re_polling_a_confirmed_intent_changes_nothing() {
     let id = seed(&pool, "k-idem", addr, 2_000_000, "invoiced").await;
     let chain = FakeChain::with(addr, vec![transfer("tx-idem", addr, 2_000_000, 100)]);
 
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
     let after_first = status_of(&pool, id).await;
     let tx_first = tx_of(&pool, id).await;
 
-    poller::poll_once(&pool, &chain, &chain).await;
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert_eq!(status_of(&pool, id).await, after_first, "status must not drift on re-poll");
     assert_eq!(tx_of(&pool, id).await, tx_first, "the first-seen evidence hash must stand");
@@ -315,7 +320,7 @@ async fn legacy_rows_without_an_address_are_skipped() {
     .unwrap();
 
     let chain = FakeChain::default();
-    poller::poll_once(&pool, &chain, &chain).await;
+    poller::poll_once(&pool, &chain, &chain, USDT).await;
 
     assert!(chain.asked.lock().unwrap().is_empty(), "a row with no address must not be polled");
     assert_eq!(status_of(&pool, id).await, "created");
@@ -391,18 +396,25 @@ async fn two_transfers_to_one_address_are_two_credits() {
     // Task 3. One user, one address, two deposits.
     let pool = pool().await;
     seed_address(&pool, "0xuser-a", ADDR, None).await;
+    let index: i64 = sqlx::query_scalar("SELECT derivation_index FROM deposit_addresses WHERE address = $1")
+        .bind(ADDR)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
     let a = observed("tx-one", ADDR, 1_000_000);
     let b = observed("tx-two", ADDR, 2_500_000);
-    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &a).await.unwrap());
-    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &b).await.unwrap());
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", index, &a).await.unwrap());
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", index, &b).await.unwrap());
 
-    let (rows, total, off_par): (i64, i64, i64) = sqlx::query_as(
+    let (rows, total, off_par, wrong_index): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT,
-                count(*) FILTER (WHERE amount_clt <> received_usdt OR amount_usdt <> received_usdt)
+                count(*) FILTER (WHERE amount_clt <> received_usdt OR amount_usdt <> received_usdt),
+                count(*) FILTER (WHERE derivation_index IS DISTINCT FROM $2)
          FROM deposit_intents WHERE deposit_address = $1",
     )
     .bind(ADDR)
+    .bind(index)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -411,6 +423,10 @@ async fn two_transfers_to_one_address_are_two_credits() {
     // Task 6 retired `amount_clt_equals_amount_usdt_at_par` with the create() flow; the par rule
     // (1 micro-USDT = 1 CLT base unit) now lives in credit_transfer's INSERT, so it is pinned here.
     assert_eq!(off_par, 0, "amount_clt and amount_usdt must both equal what arrived");
+    // R17: credit_transfer used to silently omit derivation_index — every such row got minted
+    // (treasury_bridge.rs forwards it verbatim) and then never swept (sweeper.rs filters on it being
+    // set), with nothing in the suite noticing a NULL.
+    assert_eq!(wrong_index, 0, "both credited rows must carry the address's own derivation_index");
 }
 
 #[tokio::test]
@@ -421,9 +437,9 @@ async fn the_same_transfer_seen_twice_is_one_credit() {
     seed_address(&pool, "0xuser-a", ADDR, None).await;
     let t = observed("tx-one", ADDR, 1_000_000);
 
-    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap());
+    assert!(poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &t).await.unwrap());
     assert!(
-        !poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap(),
+        !poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &t).await.unwrap(),
         "the second sighting creates nothing"
     );
 
@@ -442,7 +458,7 @@ async fn a_one_cent_deposit_is_credited_in_full() {
     let pool = pool().await;
     seed_address(&pool, "0xuser-a", ADDR, None).await;
 
-    poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
+    poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &observed("tx-dust", ADDR, 10_000)).await.unwrap();
 
     let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE tron_tx_id = 'tx-dust'")
         .fetch_one(&pool)
@@ -488,7 +504,7 @@ async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
     let raw: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(server.uri(), "test-key".into(), USDT.into()));
     let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 2 };
 
-    let result = poller::credit_from_addresses(&pool, &tiered).await;
+    let result = poller::credit_from_addresses(&pool, &tiered, USDT).await;
     assert!(result.is_ok(), "A's failure must be logged, not propagated: {result:?}");
 
     let credited: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-b'")
@@ -502,4 +518,71 @@ async fn a_failing_address_is_still_stamped_and_does_not_block_the_others() {
         .await
         .unwrap();
     assert_eq!(stamped, 2, "both A and B must be stamped even though A's fetch failed");
+}
+
+// R17 review fixes.
+
+/// TRON dust-poisoning sends 0-value TRC-20 transfers routinely — this must be a no-op, not the
+/// recurring `CHECK (amount_usdt > 0)` violation it would be if credited verbatim.
+#[tokio::test]
+async fn a_zero_value_transfer_is_ignored_not_an_error() {
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+
+    assert!(
+        !poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", 0, &observed("tx-dust-zero", ADDR, 0))
+            .await
+            .unwrap(),
+        "a zero-value transfer must not be credited"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-dust-zero'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// Defence in depth for the `DepositWatcher` seam: it is deliberately not address-scoped (custody.rs
+/// module docs), so a future cursor-based implementation that filters locally has nothing upstream of
+/// `credit_from_addresses` guaranteed to have already checked the contract.
+#[tokio::test]
+async fn a_transfer_of_another_token_is_not_credited() {
+    let pool = pool().await;
+    seed_address(&pool, "0xuser-a", ADDR, None).await;
+
+    let wrong_token = ObservedTransfer {
+        tx_id: "tx-wrong-token".into(),
+        amount_usdt: 1_000_000,
+        to: ADDR.into(),
+        contract: "TWrongTokenContract111111111111111".into(),
+        block_timestamp: 1_700_000_000_000,
+    };
+    let chain = FakeChain::with(ADDR, vec![wrong_token]);
+
+    let result = poller::credit_from_addresses(&pool, &chain, USDT).await;
+    assert!(result.is_ok());
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-wrong-token'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a transfer in the wrong contract must never be credited");
+}
+
+/// The property that is the whole reason `poll_once` stays `()`-returning instead of propagating
+/// loop (a)'s `Result` with a bare `?`: a per-user `DepositWatcher` outage must not stop loop (b)
+/// from reaching the legacy intents behind it.
+#[tokio::test]
+async fn a_per_user_poll_outage_does_not_stop_the_legacy_loop() {
+    let pool = pool().await;
+    let addr = "TAddrLegacyDuringOutage";
+    let id = seed(&pool, "k-legacy-outage", addr, 2_000_000, "invoiced").await;
+
+    let failing = FakeChain::failing();
+    let healthy = FakeChain::with(addr, vec![transfer("tx-legacy", addr, 2_000_000, 100)]);
+
+    poller::poll_once(&pool, &failing, &healthy, USDT).await;
+
+    assert_eq!(status_of(&pool, id).await, "confirmed", "a per-user outage must not block the legacy loop");
 }

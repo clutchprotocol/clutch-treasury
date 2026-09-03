@@ -20,10 +20,11 @@
 //!
 //! # How matching works now
 //!
-//! Each intent has its OWN derived address (`derive.rs`), so the destination address identifies the
-//! payer. That is a strictly better identity than the amount discriminator it replaced: it has no
-//! 999-slot ceiling, no cross-user collision risk from a freed slot, and a payer who rounds their
-//! amount is still correctly attributed.
+//! Each user has ONE permanent derived address (`derive.rs`, `deposit_addresses`), issued once and
+//! reused for every deposit they make — not one address per intent any more. The destination still
+//! identifies the payer, which remains a strictly better identity than the amount discriminator it
+//! replaced: no 999-slot ceiling, no cross-user collision risk from a freed slot, and a payer who
+//! rounds their amount is still correctly attributed.
 //!
 //! # The unavoidable cost
 //!
@@ -31,10 +32,12 @@
 //! group — derived addresses are unrelated on-chain. So this is one request per address being
 //! watched, not one per poll pass as it was under a single shared custody address.
 //!
-//! What keeps that bounded is that only OPEN intents are polled: the set is the number of in-flight
-//! deposits inside the TTL, not the number ever created. The poller caps it per tick and says so
-//! when it does, because an unkeyed TronGrid throttles hard and a throttled watcher is
-//! indistinguishable from "nobody is paying" — a failure mode already paid for once.
+//! What keeps that bounded now is `poller::due_addresses`'s per-pass budget, not the open-intent
+//! count: every address is permanent and stays watched for as long as its user might ever deposit
+//! again, so cost is capped by how many addresses are polled each pass — hot ones first, the rest
+//! rotating cold — rather than by how many deposits happen to be in flight. The reason to bound it
+//! at all is unchanged: an unkeyed TronGrid throttles hard, and a throttled watcher is
+//! indistinguishable from "nobody is paying."
 
 use async_trait::async_trait;
 use serde::Deserialize;

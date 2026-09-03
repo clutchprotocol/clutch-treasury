@@ -51,9 +51,17 @@ const MAX_LEGACY_INTENTS_PER_PASS: i64 = 50;
 
 /// Record one observed transfer as its own deposit.
 ///
-/// Returns `Ok(false)` when the transaction was already recorded. That is the normal case, not an
-/// error: a poll pass re-reads an address's recent history every rotation, so the same transfer is
-/// seen many times. `uq_deposit_intents_tron_tx_id` is what makes re-observation free.
+/// Returns `Ok(false)` when the transaction was already recorded, or when nothing actually moved
+/// (`t.amount_usdt <= 0`). Neither is an error: a poll pass re-reads an address's recent history
+/// every rotation, so the same transaction is seen many times, and TRON dust-poisoning sends 0-value
+/// TRC-20 transfers routinely — `amount_usdt`/`received_usdt` both carry `CHECK (> 0)`, so crediting
+/// one verbatim would be a recurring database error, not a real deposit. `uq_deposit_intents_tron_tx_id`
+/// is what makes re-observation free.
+///
+/// `derivation_index` is the address's own (`deposit_addresses.derivation_index`), not derived from
+/// the transfer. It is not optional: `treasury_bridge.rs` forwards it verbatim, and the treasury's
+/// sweeper only ever selects `WHERE derivation_index IS NOT NULL` (`sweeper.rs`) — a credited deposit
+/// that does not carry it is minted and then silently never swept.
 ///
 /// The amount credited is what ARRIVED. There is no expected figure to reconcile against any more —
 /// the user was never asked for one.
@@ -61,8 +69,13 @@ pub async fn credit_transfer(
     pool: &PgPool,
     user_pk: &str,
     clt_address: &str,
+    derivation_index: i64,
     t: &ObservedTransfer,
 ) -> Result<bool, String> {
+    if t.amount_usdt <= 0 {
+        return Ok(false);
+    }
+
     let done = sqlx::query(
         // client_key is NOT NULL and was the user's idempotency key when users created intents. The
         // chain creates them now, so the tx id IS the idempotency key — and it makes the pre-existing
@@ -73,8 +86,8 @@ pub async fn credit_transfer(
         // 0011) no longer applies — nothing else this table still requires NOT NULL is missing here.
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
-             deposit_address, tron_tx_id, received_usdt, expires_at)
-         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now())
+             deposit_address, tron_tx_id, received_usdt, expires_at, derivation_index)
+         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now(), $7)
          ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
     )
     .bind(uuid::Uuid::new_v4())
@@ -83,6 +96,7 @@ pub async fn credit_transfer(
     .bind(&t.to)
     .bind(&t.tx_id)
     .bind(clt_address)
+    .bind(derivation_index)
     .execute(pool)
     .await
     .map_err(|e| format!("crediting {}: {e}", t.tx_id))?;
@@ -90,14 +104,17 @@ pub async fn credit_transfer(
     Ok(done.rows_affected() == 1)
 }
 
-/// Who owns a permanent address, if `to` is one. `Ok(None)` means it is not a `deposit_addresses`
-/// row at all — a legacy per-intent address, which loop (b) of `poll_once` owns instead.
-async fn user_for_address(pool: &PgPool, to: &str) -> Result<Option<(String, String)>, String> {
-    sqlx::query_as::<_, (String, String)>("SELECT user_pk, clt_address FROM deposit_addresses WHERE address = $1")
-        .bind(to)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("resolving the owner of {to}: {e}"))
+/// Who owns a permanent address, if `to` is one, plus the derivation index `credit_transfer` must
+/// carry so the treasury's sweeper can find it. `Ok(None)` means it is not a `deposit_addresses` row
+/// at all — a legacy per-intent address, which loop (b) of `poll_once` owns instead.
+async fn user_for_address(pool: &PgPool, to: &str) -> Result<Option<(String, String, i64)>, String> {
+    sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT user_pk, clt_address, derivation_index FROM deposit_addresses WHERE address = $1",
+    )
+    .bind(to)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("resolving the owner of {to}: {e}"))
 }
 
 /// Loop (a): one pass over the permanent per-user addresses. `watcher.poll()` already selected which
@@ -106,12 +123,30 @@ async fn user_for_address(pool: &PgPool, to: &str) -> Result<Option<(String, Str
 ///
 /// A transfer to an address with no `deposit_addresses` row is not an error — it is a legacy
 /// per-intent address, left to loop (b). A failure crediting one transfer must not stop the rest.
-pub async fn credit_from_addresses(pool: &PgPool, watcher: &dyn DepositWatcher) -> Result<(), String> {
+///
+/// `usdt_contract` is re-checked here rather than trusted from upstream: `DepositWatcher` is
+/// deliberately not address-scoped (see custody.rs's module docs), so a future implementation that
+/// follows the USDT contract's Transfer events from a cursor and filters locally would have nothing
+/// upstream of this function guaranteed to have already checked it.
+pub async fn credit_from_addresses(
+    pool: &PgPool,
+    watcher: &dyn DepositWatcher,
+    usdt_contract: &str,
+) -> Result<(), String> {
     let transfers = watcher.poll().await?;
     for t in &transfers {
+        if t.contract != usdt_contract {
+            tracing::warn!(
+                "poller: transfer {} to {} carries contract {} (expected {usdt_contract}) — skipped",
+                t.tx_id,
+                t.to,
+                t.contract
+            );
+            continue;
+        }
         match user_for_address(pool, &t.to).await {
-            Ok(Some((user_pk, clt_address))) => {
-                if let Err(e) = credit_transfer(pool, &user_pk, &clt_address, t).await {
+            Ok(Some((user_pk, clt_address, derivation_index))) => {
+                if let Err(e) = credit_transfer(pool, &user_pk, &clt_address, derivation_index, t).await {
                     tracing::error!("poller: failed to credit {}: {e}", t.tx_id);
                 }
             }
@@ -125,9 +160,14 @@ pub async fn credit_from_addresses(pool: &PgPool, watcher: &dyn DepositWatcher) 
 /// One pass: credit every transfer arriving at a permanent per-user address (a) or a still-open
 /// legacy per-intent address (b), then expire and close. Neither loop's failure blocks the other,
 /// and both are attempted — success or failure — before the expiry sweep and window close run.
-pub async fn poll_once(pool: &PgPool, watcher: &dyn DepositWatcher, legacy: &dyn CustodyWatcher) {
+pub async fn poll_once(
+    pool: &PgPool,
+    watcher: &dyn DepositWatcher,
+    legacy: &dyn CustodyWatcher,
+    usdt_contract: &str,
+) {
     // (a) Permanent per-user addresses.
-    if let Err(e) = credit_from_addresses(pool, watcher).await {
+    if let Err(e) = credit_from_addresses(pool, watcher, usdt_contract).await {
         tracing::error!("poller: per-user address pass failed: {e}");
     }
 
@@ -261,12 +301,13 @@ pub async fn run(
     pool: PgPool,
     watcher: Arc<dyn DepositWatcher>,
     legacy: Arc<dyn CustodyWatcher>,
+    usdt_contract: String,
     poll_interval_secs: u64,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
     loop {
         interval.tick().await;
-        poll_once(&pool, watcher.as_ref(), legacy.as_ref()).await;
+        poll_once(&pool, watcher.as_ref(), legacy.as_ref(), &usdt_contract).await;
     }
 }
 
