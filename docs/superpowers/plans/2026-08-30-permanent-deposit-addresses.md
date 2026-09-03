@@ -1267,7 +1267,17 @@ sweeper. Nothing new joins that set.
 `permanent_deposit_addresses_enabled=false` the deposit route answers 503 — top-ups are OFF, not
 reverted. The flag flip and the demo-app deploy (Task 9's UI, which sends no body and shows the
 permanent address) must land in the same window: flip first and the old UI breaks on the new
-response shape; deploy the UI first and it gets 503s. Sequence: images live with flag off →
-reconciliation `ok` → flip the flag on the orchestrator → deploy the demo app → one small Nile
-deposit credited end to end. Once any user has been handed an address, the flag protects nothing
-any more (see the spec §6) — the watch and sweep of that address are permanent.
+response shape; deploy the UI first and it gets 503s.
+
+Mechanics: `clutch-deploy`'s `deploy-stage.yml` auto-deploys on any `main` push touching
+`docker-compose.treasury.yml`, `config/**` or `scripts/**`, using whatever images GHCR holds at that
+moment; `clutch-treasury`'s `docker-build-push.yml` builds images on `main` push but never deploys.
+So: (1) merge `clutch-treasury` → images exist; (2) merge the Task 10 compose change with
+`APP_PERMANENT_DEPOSIT_ADDRESSES_ENABLED=false` → auto-deploy → deposit route answers 503, top-ups
+OFF on stage; (3) reconciliation `ok`, breaker clear; (4) a one-line `clutch-deploy` commit flipping
+the value to `true` → auto-deploy; (5) merge `clutch-hub-demo-app`'s `feat/permanent-deposit-address`
+→ `docker-publish` → new top-up UI; (6) one small Nile deposit credited end to end, and confirm the
+treasury sweeper picks the row up (its `derivation_index` is set). Steps 4–5 back to back are "the
+same window"; top-ups are unavailable between 2 and 4 — acceptable on testnet, keep it short. Once
+any user has been handed an address, the flag protects nothing any more (see the spec §6) — the
+watch and sweep of that address are permanent.
