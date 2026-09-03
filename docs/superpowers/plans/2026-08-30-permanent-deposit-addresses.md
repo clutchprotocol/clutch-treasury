@@ -1194,7 +1194,7 @@ cd ../clutch-deploy && git add docker-compose.treasury.yml CLAUDE.md && git comm
 
 **Files:**
 - Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list)
-- Modify: `crates/treasury-service/tests/db_sweeper.rs`, `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
+- Modify: `crates/treasury-service/src/sweeper.rs` (warn on unswept rows without a derivation_index), `crates/treasury-service/tests/db_sweeper.rs` (stale comments + one new test), `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
 - Modify: `crates/payment-orchestrator/tests/db_derivation_index.rs` (one test rename)
 
 - Consumes: everything above; runs after Task 9 has stopped the UI sending `idempotency-key`.
@@ -1231,7 +1231,19 @@ assertion itself turns out to depend on a dropped constraint, STOP and report it
 less than its name promises. Read what it asserts and rename it to exactly that — nothing else in
 the file changes.
 
-- [ ] **Step 5: Verify and commit**
+- [ ] **Step 5: Make a missing `derivation_index` loud in the sweeper**
+
+`treasury-service/src/sweeper.rs` selects `WHERE deposit_address IS NOT NULL AND derivation_index IS NOT NULL
+AND swept_at IS NULL`, so a credited deposit whose row lacks an index is simply never swept, and the pass
+logs "0 unswept address(es)" exactly as it does when idle. The Task 7 review caught that bug before it
+shipped (R17); the next writer who forgets the column will not have a reviewer. In the same pass, count
+`mint_intents WHERE deposit_address IS NOT NULL AND derivation_index IS NULL AND swept_at IS NULL AND
+status IN ('approved','submitted','credited')` and, when it is non-zero, `tracing::warn!` with the count and
+the distinct addresses — every pass, not once. One test in `tests/db_sweeper.rs`: seed such a row and
+assert the pass reports it (return the count from the pass function, or expose it however the existing
+tests observe the sweeper's decisions — read them first). Do not change what gets swept.
+
+- [ ] **Step 6: Verify and commit**
 
 CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, dead CORS header, stale comments`.
 
