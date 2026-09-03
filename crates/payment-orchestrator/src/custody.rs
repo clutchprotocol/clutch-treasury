@@ -94,6 +94,17 @@ pub struct TronGridWatcher {
 /// as a missing payment.
 const PAGE_LIMIT: &str = "200";
 
+/// Hard cap on pages followed per address per call. 10 pages x 200 rows/page = 2,000 rows for one
+/// address in one poll — far beyond what a real deposit history should ever produce. Past that,
+/// TronGrid is still offering a fingerprint cursor and something is wrong (most plausibly a
+/// misbehaving or adversarial upstream); returning a partial `Ok` at that point would be exactly
+/// the silent loss this fix exists to close, so `transfers_to` returns `Err` naming the address
+/// and this cap instead. `TieredPoller` (poller.rs) logs that `Err` and still stamps
+/// `last_polled_at` for the address regardless — deliberately unchanged here — so the address is
+/// re-polled next pass with the same one-hour overlap rather than wedged forever if the cause was
+/// transient.
+const MAX_PAGES: usize = 10;
+
 /// Only this TRC-20 event kind moves value. An `Approval` carries a `to` and a `value` too, so
 /// without this check an approval could satisfy an amount check with nothing having moved.
 const TRANSFER_EVENT: &str = "Transfer";
@@ -124,9 +135,19 @@ struct TokenInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct Trc20Meta {
+    /// Present when another page exists; TronGrid's v1 account endpoints accept this back as the
+    /// `fingerprint` query parameter to fetch the next page.
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Trc20Response {
     #[serde(default)]
     data: Vec<Trc20Row>,
+    #[serde(default)]
+    meta: Option<Trc20Meta>,
 }
 
 #[async_trait]
@@ -137,34 +158,53 @@ impl CustodyWatcher for TronGridWatcher {
         min_timestamp_ms: Option<i64>,
     ) -> Result<Vec<ObservedTransfer>, String> {
         let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, address);
-        let mut req = self
-            .http
-            .get(&url)
-            .header("TRON-PRO-API-KEY", &self.api_key)
-            .query(&[
-                // Confirmed only. This doubles as the confirmation gate: TronGrid excludes
-                // transfers from blocks that are not yet irreversible, so anything appearing here
-                // already has the depth the treasury's verifier separately re-checks.
-                ("only_confirmed", "true"),
-                ("contract_address", self.usdt_contract.as_str()),
-                ("limit", PAGE_LIMIT),
-            ]);
-        if let Some(ts) = min_timestamp_ms {
-            // Lower bound only — TronGrid still returns newest-first up to `limit`. Bounding here
-            // is what keeps a permanent address's page from growing with its whole lifetime.
-            req = req.query(&[("min_timestamp", ts.to_string())]);
+        let page_limit = PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX);
+        let mut all_rows: Vec<Trc20Row> = Vec::new();
+        let mut fingerprint: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut req = self
+                .http
+                .get(&url)
+                .header("TRON-PRO-API-KEY", &self.api_key)
+                .query(&[
+                    // Confirmed only. This doubles as the confirmation gate: TronGrid excludes
+                    // transfers from blocks that are not yet irreversible, so anything appearing here
+                    // already has the depth the treasury's verifier separately re-checks.
+                    ("only_confirmed", "true"),
+                    ("contract_address", self.usdt_contract.as_str()),
+                    ("limit", PAGE_LIMIT),
+                ]);
+            if let Some(ts) = min_timestamp_ms {
+                // Lower bound only — TronGrid still returns newest-first up to `limit`. Bounding here
+                // is what keeps a permanent address's page from growing with its whole lifetime.
+                req = req.query(&[("min_timestamp", ts.to_string())]);
+            }
+            if let Some(fp) = &fingerprint {
+                // TronGrid's pagination cursor: carried over from the previous page's
+                // `meta.fingerprint`, which is present whenever older rows still exist.
+                req = req.query(&[("fingerprint", fp.as_str())]);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("trongrid trc20 list for {address} failed: {status} {text}"));
+            }
+            let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
+            let page_len = parsed.data.len();
+            all_rows.extend(parsed.data);
+            let next_fingerprint = parsed.meta.and_then(|m| m.fingerprint);
+            if page_len < page_limit || next_fingerprint.is_none() {
+                return Ok(rows_to_transfers(all_rows, address, &self.usdt_contract));
+            }
+            fingerprint = next_fingerprint;
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid trc20 list for {address} failed: {status} {text}"));
-        }
-        let parsed: Trc20Response = resp.json().await.map_err(|e| e.to_string())?;
-        if parsed.data.len() >= PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX) {
-            tracing::warn!("trongrid returned a full page of transfers for {address} — older ones may be truncated");
-        }
-        Ok(rows_to_transfers(parsed.data, address, &self.usdt_contract))
+        // Exhausted MAX_PAGES with TronGrid still offering a fingerprint on the last page fetched —
+        // see MAX_PAGES's doc comment for why this is a loud Err rather than a partial, silently
+        // truncated Ok.
+        Err(format!(
+            "trongrid trc20 list for {address} exceeded the {MAX_PAGES}-page cap with more pages still offered"
+        ))
     }
 }
 
