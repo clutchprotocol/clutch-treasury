@@ -1180,6 +1180,53 @@ cd ../clutch-deploy && git add docker-compose.treasury.yml CLAUDE.md && git comm
 
 ---
 
+### Task 11: Branch cleanup before the final review
+
+**Files:**
+- Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list)
+- Modify: `crates/treasury-service/tests/db_sweeper.rs`, `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
+- Modify: `crates/payment-orchestrator/tests/db_derivation_index.rs` (one test rename)
+
+- Consumes: everything above; runs after Task 9 has stopped the UI sending `idempotency-key`.
+- Produces: nothing new — this is the debt the reviews deferred, paid in one commit so the final
+  whole-branch review reads clean code.
+
+- [ ] **Step 1: Pin `canonical_clt_address`'s edge cases**
+
+Add a `#[cfg(test)] mod tests` block in `api.rs` with plain unit tests (no DB, no HTTP) for the
+helper: `"0X"` uppercase prefix accepted and lowercased; a bare 40-hex string with no prefix accepted
+and given `0x`; 39 and 41 hex digits rejected; empty string rejected; a non-ASCII hex lookalike
+rejected. Each is one `assert_eq!` on `canonical_clt_address(..)`. The review of 811a96c found these
+cases verified only by reading — a future edit to the prefix stripping would compile and pass every
+existing test.
+
+- [ ] **Step 2: Remove `idempotency-key` from the CORS allow-headers**
+
+Task 6 removed the only route that read it and Task 9 stopped the UI sending it. Delete it from the
+allow-list in `build_cors` and from its doc comment. Grep the whole repo for `idempotency-key` and
+`idempotency_key` afterwards — the only hits may be in the demo app's git history and in these plan
+documents.
+
+- [ ] **Step 3: Fix comments that cite constraints Task 3 dropped**
+
+`db_sweeper.rs` (around lines 17 and 261 at the time of writing) and `db_tron_verifier.rs` (around
+line 430) still explain behaviour in terms of `uq_mint_intents_deposit_address` /
+`uq_deposit_address`, which no longer exist. Re-read each comment against what the test actually
+asserts now and rewrite it in one or two sentences. Do not change any test logic; if a test's
+assertion itself turns out to depend on a dropped constraint, STOP and report it instead of editing.
+
+- [ ] **Step 4: Rename the overclaiming test**
+
+`indexes_come_from_the_shared_sequence_and_never_repeat` in `tests/db_derivation_index.rs` asserts
+less than its name promises. Read what it asserts and rename it to exactly that — nothing else in
+the file changes.
+
+- [ ] **Step 5: Verify and commit**
+
+CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, dead CORS header, stale comments`.
+
+---
+
 ## Rollout
 
 **Deploy A — after Task 3.** Behaviour-neutral. Then **verify reconciliation reads `ok`** via
