@@ -561,7 +561,15 @@ pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>
 }
 ```
 
-- [ ] **Step 5: Add the DepositWatcher seam**
+- [ ] **Step 5: Widen `CustodyWatcher::transfers_to` to take a lower bound**
+
+In `crates/payment-orchestrator/src/custody.rs`, change the trait method to
+`async fn transfers_to(&self, address: &str, min_timestamp_ms: Option<i64>) -> Result<Vec<ObservedTransfer>, String>;`
+and have the TronGrid implementation pass it as the `min_timestamp` query parameter when `Some`.
+Update every existing caller and test double to pass `None` — `grep -rn "transfers_to(" crates/` finds
+them, including the sweeper's. Behaviour for `None` is unchanged.
+
+- [ ] **Step 6: Add the DepositWatcher seam**
 
 In `crates/payment-orchestrator/src/custody.rs`, below `CustodyWatcher`:
 
@@ -578,7 +586,7 @@ pub trait DepositWatcher: Send + Sync {
 }
 ```
 
-- [ ] **Step 6: Implement TieredPoller behind the seam**
+- [ ] **Step 7: Implement TieredPoller behind the seam**
 
 Without this the trait is dead code and the seam is decorative. In `crates/payment-orchestrator/src/poller.rs`:
 
@@ -601,7 +609,12 @@ impl DepositWatcher for TieredPoller {
         let mut found = Vec::new();
 
         for a in &due {
-            match self.inner.transfers_to(&a.address).await {
+            // Only transfers since we last looked, minus an hour of overlap. Permanent addresses
+            // otherwise re-fetch their entire history every rotation. The overlap is free: a
+            // transfer landing between the query and the stamp is re-observed next pass, and
+            // credit_transfer is idempotent on tron_tx_id. Epoch MILLISECONDS, per ObservedTransfer.
+            let since = a.last_polled_at.map(|t| (t - chrono::Duration::hours(1)).timestamp_millis());
+            match self.inner.transfers_to(&a.address, since).await {
                 Ok(mut ts) => found.append(&mut ts),
                 // One unreadable address must not abort the pass: the others are still due, and a
                 // TronGrid blip on one address would otherwise stall every deposit behind it.
@@ -624,7 +637,7 @@ impl DepositWatcher for TieredPoller {
 Stamp even the addresses whose read failed. Otherwise a permanently unreadable address pins itself
 to the front of the rotation and starves every other address of its budget slot.
 
-- [ ] **Step 7: Verify and commit**
+- [ ] **Step 8: Verify and commit**
 
 CI. Then:
 
@@ -749,7 +762,7 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 
 **Interfaces:**
 - Consumes: `due_addresses`, `DepositWatcher` (Task 5); `uq_deposit_intents_tron_tx_id` (Task 2).
-- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
+- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, clt_address: &str, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -763,8 +776,8 @@ async fn two_transfers_to_one_address_are_two_credits() {
 
     let a = observed("tx-one", ADDR, 1_000_000);
     let b = observed("tx-two", ADDR, 2_500_000);
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &a).await.unwrap());
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &b).await.unwrap());
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &a).await.unwrap());
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &b).await.unwrap());
 
     let (rows, total): (i64, i64) = sqlx::query_as(
         "SELECT count(*), COALESCE(SUM(received_usdt),0)::BIGINT FROM deposit_intents WHERE deposit_address = $1")
@@ -781,8 +794,8 @@ async fn the_same_transfer_seen_twice_is_one_credit() {
     seed_address(&pool, "0xuser-a", ADDR, None).await;
     let t = observed("tx-one", ADDR, 1_000_000);
 
-    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &t).await.unwrap());
-    assert!(!payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &t).await.unwrap(),
+    assert!(payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap());
+    assert!(!payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &t).await.unwrap(),
         "the second sighting creates nothing");
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE deposit_address = $1")
@@ -797,7 +810,7 @@ async fn a_one_cent_deposit_is_credited_in_full() {
     let pool = pool().await;
     seed_address(&pool, "0xuser-a", ADDR, None).await;
 
-    payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
+    payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", "0xclt-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
 
     let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE tron_tx_id = 'tx-dust'")
         .fetch_one(&pool).await.unwrap();
@@ -827,13 +840,19 @@ In `crates/payment-orchestrator/src/poller.rs`:
 pub async fn credit_transfer(
     pool: &PgPool,
     user_pk: &str,
+    clt_address: &str,
     t: &ObservedTransfer,
 ) -> Result<bool, String> {
     let done = sqlx::query(
+        // client_key is NOT NULL and was the user's idempotency key when users created intents. The
+        // chain creates them now, so the tx id IS the idempotency key — and it makes the pre-existing
+        // UNIQUE (user_pk, client_key) a second guard behind uq_deposit_intents_tron_tx_id.
+        // expires_at is NOT NULL and meaningless for an observed transfer; now() reads as "already
+        // settled" rather than inventing a deadline nothing enforces.
         "INSERT INTO deposit_intents
-            (id, user_pk, clt_address, amount_usdt, amount_clt, status,
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
              deposit_address, tron_tx_id, received_usdt, expires_at)
-         VALUES ($1, $2, $2, $3, $3, 'confirmed', $4, $5, $3, now())
+         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now())
          ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
     )
     .bind(uuid::Uuid::new_v4())
@@ -841,6 +860,7 @@ pub async fn credit_transfer(
     .bind(t.amount_usdt)
     .bind(&t.to)
     .bind(&t.tx_id)
+    .bind(clt_address)
     .execute(pool)
     .await
     .map_err(|e| format!("crediting {}: {e}", t.tx_id))?;
@@ -881,7 +901,7 @@ generous overlap (an hour) before sending it: a transfer landing between the que
 would otherwise be skipped forever, and re-observing one is free because `credit_transfer` is
 idempotent on `tron_tx_id`.
 
-Resolve each transfer's `user_pk` by looking up `t.to` in `deposit_addresses`. A transfer to an
+Resolve each transfer's `user_pk` AND `clt_address` by looking up `t.to` in `deposit_addresses` (both columns live there). A transfer to an
 address with no row is a legacy per-intent address — leave those to the existing intent path and do
 not credit them here.
 
