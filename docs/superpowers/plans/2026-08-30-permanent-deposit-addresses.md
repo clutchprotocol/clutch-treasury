@@ -214,12 +214,58 @@ DROP INDEX IF EXISTS uq_mint_intents_deposit_address;
 
 Confirm both index names against `crates/payment-orchestrator/migrations/0007_derivation_index.sql` and `crates/treasury-service/migrations/0004_deposit_address.sql` before relying on them. `IF EXISTS` keeps the migration idempotent, but a wrong name would silently drop nothing — verify, do not assume.
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 3: Prove the drop is safe — the double-count test (moved here from Task 1)**
 
-CI. Then:
+This test cannot run before this task: it seeds two `mint_intents` rows at ONE address, which the
+index dropped in Step 2 forbade. It lands with the drop so the `DISTINCT` from Task 1 is proven the
+moment duplicates become representable. Add to `crates/treasury-service/tests/db_reconciliation.rs`:
+
+```rust
+/// A real, base58check-valid derived address — the same fixture value db_sweeper.rs's ADDRS uses.
+const SHARED_ADDR: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+
+/// Inserts a `credited`, unswept mint intent at `address` evidenced by `tx_id`. Names every NOT NULL
+/// column mint_intents has with no default (`beneficiary`, `amount_clt`, `credit_ref`, `created_by`)
+/// plus `approved_by`, since four_eyes requires a distinct approver past `created`. `swept_at` is
+/// omitted so it takes its NULL default — the "still unswept" state this test needs.
+async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str) {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by,
+                                    deposit_tx_id, deposit_address)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, 'credited', $2, 'orchestrator', 'tron-verifier',
+                 $3, $4)",
+    )
+    .bind(id)
+    .bind(format!("ref-{id}"))
+    .bind(tx_id)
+    .bind(address)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Per-user deposit addresses make this the NORMAL case: one user, several deposits, one address.
+/// Counting per row inflates the reserve, and an over-backed reading licenses mints that nothing
+/// backs — strictly worse than under-counting, which only halts minting.
+#[tokio::test]
+async fn one_address_on_two_unswept_rows_is_counted_once() {
+    let pool = pool().await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-a").await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-b").await;
+
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+
+    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "one address, counted once");
+}
+```
+
+- [ ] **Step 4: Verify and commit**
+
+CI. The new test must PASS here and would have FAILED on 23505 before Step 2. Then:
 
 ```bash
-git add crates/payment-orchestrator/migrations/0011_drop_intent_address_uniqueness.sql crates/treasury-service/migrations/0010_drop_deposit_address_uniqueness.sql
+git add crates/payment-orchestrator/migrations/0011_drop_intent_address_uniqueness.sql crates/treasury-service/migrations/0010_drop_deposit_address_uniqueness.sql crates/treasury-service/tests/db_reconciliation.rs
 git commit -m "feat: allow address reuse, keyed on transaction instead"
 ```
 
