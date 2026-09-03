@@ -936,12 +936,31 @@ point of the change, not collateral damage.
 
 - [ ] **Step 5: Rewrite `poll_once` around addresses**
 
-`poll_once` currently walks due intents and takes a `&dyn CustodyWatcher`. Change it to take a
-`&dyn DepositWatcher`, call `watcher.poll().await?` once, and pass each returned transfer to
-`credit_transfer`. Address selection and `last_polled_at` stamping now live inside `TieredPoller`
-(Task 5), so `poll_once` no longer knows how transfers were found — which is the entire point of
-the seam. Update `run()`'s signature and its caller in `main.rs` to construct a `TieredPoller`
-wrapping the existing `CustodyWatcher`.
+`poll_once` currently walks due intents and takes a `&dyn CustodyWatcher`. It becomes TWO loops, and
+the second one is easy to delete by mistake — do not.
+
+**(a) Per-user addresses.** Take a `&dyn DepositWatcher`, call `watcher.poll().await?` once, and pass
+each returned transfer to `credit_transfer`, resolving `user_pk` and `clt_address` from
+`deposit_addresses` by `t.to`. A transfer whose `to` has no `deposit_addresses` row is NOT an error —
+it is a legacy address, handled by (b). Address selection and `last_polled_at` stamping live inside
+`TieredPoller` (Task 5), so this loop never learns how transfers were found — the point of the seam.
+
+**(b) Legacy per-intent addresses.** Keep the existing `due_intents` loop — the SELECT over
+`deposit_intents WHERE deposit_address IS NOT NULL AND NOT payment_window_closed AND status IN (...)`
+— so stage's 28 legacy rows stay watched until their payment windows close. Nothing in
+`deposit_addresses` covers them, and silently unwatching a payable address is the exact loss this
+change exists to prevent. Keep the settle-by-intent mechanics (`set_tron_tx_id`, `set_received_usdt`,
+the `transition` to confirmed) but drop the expected-amount arithmetic: "credit everything" applies to
+legacy too, so the FIRST unseen transfer to a legacy address settles that intent at the full arrived
+amount. `Partial` is meaningless when nothing is expected; delete that arm with `evaluate_payment`.
+Pass `None` as `min_timestamp` here — a legacy address has no `last_polled_at`.
+
+Give this loop its own small cap (the legacy set is 28 rows and only shrinks) so it cannot eat the
+per-user budget. `payment_window_closed` retires rows on its own; when `due_intents` returns nothing
+for good this loop is dead code — leave a comment saying so and when it can be removed.
+
+Update `run()`'s signature and its caller in `main.rs` to construct a `TieredPoller` wrapping the
+existing `CustodyWatcher`, and pass the raw `CustodyWatcher` through as well for loop (b).
 
 Pass each address's previous `last_polled_at` to the TronGrid call as `min_timestamp` (epoch
 MILLISECONDS — `ObservedTransfer::block_timestamp` documents that unit). Addresses are permanent
