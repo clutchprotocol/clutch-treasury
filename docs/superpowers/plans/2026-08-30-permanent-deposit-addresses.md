@@ -1264,7 +1264,7 @@ CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, 
 ### Task 12: Paginate TronGrid so a full page cannot drop a deposit
 
 **Files:**
-- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only), `crates/payment-orchestrator/tests/db_addresses.rs` (one test rename)
+- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only), `crates/payment-orchestrator/tests/db_addresses.rs` (one test rename), `crates/treasury-service/tests/db_tron_verifier.rs` (one comment)
 - Test: NEW `crates/payment-orchestrator/tests/trongrid_pagination.rs` — wiremock only, NO database (`transfers_to`
   never touches Postgres, so this file must not call `pool()`); construct the watcher the way `tests/db_poller.rs`
   already does for its wiremock test (`TronGridWatcher::new(server.uri(), api_key, usdt_contract)`), and copy its
@@ -1298,6 +1298,16 @@ bitcart keys from default.toml`.
 `db_derivation_index.rs` as Task 11 was told. It asserts only that `address_for_user` draws an index AFTER one
 already burned by a legacy allocation. Rename it to
 `address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit`; nothing else in the file changes.
+
+- [ ] **Step 0c: One imprecise comment from Task 11** (same small commit as Step 0)
+
+`crates/treasury-service/tests/db_tron_verifier.rs` ~430-431 (inside `approval_event_never_backs_a_mint`) now says
+the `OTHER_ADDR` fallback intent "proves the Approval event can't leak across intents". It does not: each
+intent's TronGrid query is scoped to its own `deposit_address` before any event-type check, and only
+`DEPOSIT_ADDR`'s path is mocked, so the fallback resolves `Evidence::Transient` regardless of event type.
+Reword to: the fallback intent sits at `OTHER_ADDR` so its own query never sees this event at all —
+address-scoped isolation — while the `known`/hash assertion above is what proves an `Approval` is rejected
+by type. Comment only.
 
 - [ ] **Step 1: Write the failing test**
 
