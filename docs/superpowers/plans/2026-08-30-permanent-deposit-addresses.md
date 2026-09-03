@@ -1264,7 +1264,7 @@ CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, 
 ### Task 12: Paginate TronGrid so a full page cannot drop a deposit
 
 **Files:**
-- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`)
+- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`), `crates/payment-orchestrator/config/default.toml` (dead keys only)
 - Test: NEW `crates/payment-orchestrator/tests/trongrid_pagination.rs` — wiremock only, NO database (`transfers_to`
   never touches Postgres, so this file must not call `pool()`); construct the watcher the way `tests/db_poller.rs`
   already does for its wiremock test (`TronGridWatcher::new(server.uri(), api_key, usdt_contract)`), and copy its
@@ -1283,6 +1283,14 @@ never requested again. The funds sit at the derived address with no `deposit_int
 except for one warn line. The realistic trigger is not 200 real deposits; it is dust-spam: zero-value
 TRC-20 transfers to a victim's address are cheap on TRON and fill the page before `rows_to_transfers`
 filters them. Same cap existed under the per-intent model; permanence makes the loss permanent.
+
+- [ ] **Step 0: Drop the dead Bitcart keys from `config/default.toml`** (separate commit, one minute)
+
+`bitcart_url`, `bitcart_token`, `bitcart_store_id` and any `*invoice_currency` key are not `OrchConfig` fields
+(grep `src/configuration.rs` to confirm each) — leftovers from the Bitcart integration the TronGrid watcher
+replaced. Delete the lines. The loader ignores unknown keys, so nothing changes at runtime; the point is
+that the file stops advertising configuration that does not exist. Commit: `chore(orchestrator): drop dead
+bitcart keys from default.toml`.
 
 - [ ] **Step 1: Write the failing test**
 
