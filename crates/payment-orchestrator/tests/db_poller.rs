@@ -347,3 +347,36 @@ async fn cold_addresses_rotate_oldest_polled_first() {
 
     assert_eq!(due[0].user_pk, "0xb", "never-polled sorts ahead of just-polled");
 }
+
+/// Regression test for the three-tier bug in `due_addresses`'s ORDER BY. Under the OLD query
+/// (`(hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST`): A's `hot_until` is an
+/// hour in the past, so `hot_until > now()` evaluates to FALSE; B's `hot_until` is NULL (never hot),
+/// so the same expression evaluates to NULL. Boolean `DESC` ranks TRUE, then FALSE, then NULL —
+/// `NULLS LAST` only guarantees NULL does not beat TRUE, it does NOT merge FALSE and NULL into one
+/// tier — so A's FALSE outranks B's NULL regardless of `last_polled_at`, and A (polled a minute ago)
+/// would be selected over B (never polled). Under the FIX, `COALESCE(hot_until > now(), false)` maps
+/// both A and B to `false` on that first key, so they land in the same cold tier ordered by
+/// `last_polled_at ASC NULLS FIRST` — B's NULL sorts before A's one-minute-old timestamp, so B wins.
+#[tokio::test]
+async fn expired_hot_addresses_rejoin_the_cold_rotation_instead_of_outranking_it() {
+    let pool = pool().await;
+    // A: previously hot, now expired — hot_until an hour in the past — polled a minute ago.
+    seed_address(&pool, "0xa-expired-hot", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", Some(-1)).await;
+    sqlx::query(
+        "UPDATE deposit_addresses SET last_polled_at = now() - interval '1 minute' \
+         WHERE user_pk = '0xa-expired-hot'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // B: never hot, never polled.
+    seed_address(&pool, "0xb-never-hot", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
+
+    assert_eq!(due.len(), 1, "the per-pass budget is a hard cap");
+    assert_eq!(
+        due[0].address, "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK",
+        "a never-hot, never-polled address must not be starved by one that was hot once and expired"
+    );
+}

@@ -213,14 +213,21 @@ pub struct DueAddress {
     pub last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Hot addresses first, then the coldest. The LIMIT is the whole cost control: permanent addresses
-/// never stop being watched, so without a per-pass budget the request count grows with every user
-/// who has ever existed. With it, cost per pass is constant and the cold rotation period is simply
-/// (addresses / budget) * poll_interval — a number an operator can be told rather than discover.
+/// Hot addresses first, then ONE cold tier — everyone else, oldest-polled (and never-polled) first.
+/// `COALESCE(hot_until > now(), false)` is load-bearing: a bare `(hot_until > now()) DESC` sorts
+/// TRUE / FALSE / NULL as three tiers, so an address that was hot once and has since expired would
+/// permanently outrank one that was never hot, regardless of `last_polled_at`. The COALESCE folds
+/// "expired hot" and "never hot" into the same false/cold bucket, which is why `NULLS LAST` on that
+/// column is no longer needed.
+///
+/// The LIMIT is the whole cost control: permanent addresses never stop being watched, so without a
+/// per-pass budget the request count grows with every user who has ever existed. With it, cost per
+/// pass is constant and the cold rotation period is simply (addresses / budget) * poll_interval — a
+/// number an operator can be told rather than discover.
 pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>, String> {
     sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT user_pk, address, last_polled_at FROM deposit_addresses
-         ORDER BY (hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST
+         ORDER BY COALESCE(hot_until > now(), false) DESC, last_polled_at ASC NULLS FIRST
          LIMIT $1",
     )
     .bind(budget)
