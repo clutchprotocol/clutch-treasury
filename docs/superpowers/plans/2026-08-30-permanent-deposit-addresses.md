@@ -668,11 +668,24 @@ Add to `crates/payment-orchestrator/tests/db_deposit_api.rs`, following that fil
 async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
     // The user asks where to send, not how much they promise to send. Two calls must give the same
     // address, or money sent to the first arrives somewhere nothing watches.
-    let (pool, config) = api_fixture().await;
-    let token = jwt_for(&config, "0xuser-a");
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
+    let app = router_with(pool.clone(), config);
 
-    let first = post_deposit(&pool, &config, &token).await;
-    let second = post_deposit(&pool, &config, &token).await;
+    let post = |app: axum::Router| async move {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/deposits")
+            .header("authorization", bearer_for("0xuser-a"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"clt_address":"0xclt-a"}"#))
+            .unwrap();
+        body_json(tower::ServiceExt::oneshot(app, req).await.unwrap()).await
+    };
+
+    let first = post(app.clone()).await;
+    let second = post(app).await;
 
     assert_eq!(first["address"], second["address"]);
     assert!(first["address"].as_str().unwrap().starts_with('T'));
@@ -680,7 +693,14 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
 }
 ```
 
-`api_fixture`, `jwt_for` and a request helper already exist in that file under some names — read it and reuse them. Add `post_deposit` only if no equivalent exists.
+These helpers already exist in that file: `pool()`, `mock_treasury_with_generous_headroom()`,
+`test_config(treasury_url)`, `bearer_for(pk)`, `router_with(pool, config)`, `body_json(resp)`. Read how
+the existing tests there build and send a request — match that exactly (they may use a different
+request idiom than the sketch above; the sketch shows intent, the file shows the convention).
+
+**Delete the three existing tests in that file** — `replay_same_key_same_body_returns_original_status_and_body`,
+`same_key_different_body_returns_409`, `retry_while_processing_returns_409_with_retry_after`. Every one
+exercises the idempotency-key create flow this task removes. Deleting them is the point, not collateral.
 
 - [ ] **Step 2: Run to verify it fails**
 
