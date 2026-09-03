@@ -956,8 +956,11 @@ amount. `Partial` is meaningless when nothing is expected; delete that arm with 
 Pass `None` as `min_timestamp` here — a legacy address has no `last_polled_at`.
 
 Give this loop its own small cap (the legacy set is 28 rows and only shrinks) so it cannot eat the
-per-user budget. `payment_window_closed` retires rows on its own; when `due_intents` returns nothing
-for good this loop is dead code — leave a comment saying so and when it can be removed.
+per-user budget. **Keep `sweep_expired` and `close_stale_watch_windows` running each pass** — they are
+what retires legacy rows (`created` → `expired` → window closed `WATCH_WINDOW_HOURS` later; never
+`needs_manual`). Without them the legacy set never shrinks and loop (b) runs forever. When
+`due_intents` returns nothing for good this loop is dead code — leave a comment saying so and when it
+can be removed.
 
 Update `run()`'s signature and its caller in `main.rs` to construct a `TieredPoller` wrapping the
 existing `CustodyWatcher`, and pass the raw `CustodyWatcher` through as well for loop (b).
