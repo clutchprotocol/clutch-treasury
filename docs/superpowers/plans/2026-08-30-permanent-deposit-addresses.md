@@ -814,6 +814,16 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 
 ### Task 7: Credit each transfer on its own
 
+> **Amendment R17 (from the Task 7 review).** `credit_transfer` MUST write `derivation_index`, read from
+> `deposit_addresses` alongside `user_pk`/`clt_address`. The treasury's sweeper selects
+> `WHERE derivation_index IS NOT NULL` (`treasury-service/src/sweeper.rs`), and `treasury_bridge` forwards
+> the column verbatim — a NULL means the deposit is minted against and then never swept, silently
+> (the sweeper logs "0 unswept addresses"), while reconciliation's fan-out grows with every depositor.
+> Also: ignore zero-value transfers (`amount_usdt <= 0` → `Ok(false)`; the CHECK constraints would
+> otherwise turn TRON's routine dust-poisoning into a recurring error), and re-check `t.contract`
+> against the configured USDT contract on the credit path — defence in depth for the `DepositWatcher`
+> seam, whose future cursor-based implementation filters locally.
+
 **Files:**
 - Modify: `crates/payment-orchestrator/src/custody.rs` (delete `evaluate_payment` and `PaymentOutcome`)
 - Modify: `crates/payment-orchestrator/src/poller.rs`
@@ -822,7 +832,7 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 
 **Interfaces:**
 - Consumes: `due_addresses`, `DepositWatcher` (Task 5); `uq_deposit_intents_tron_tx_id` (Task 2).
-- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, clt_address: &str, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
+- Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, clt_address: &str, derivation_index: i64, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -932,8 +942,8 @@ pub async fn credit_transfer(
         // settled" rather than inventing a deadline nothing enforces.
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
-             deposit_address, tron_tx_id, received_usdt, expires_at)
-         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now())
+             deposit_address, tron_tx_id, received_usdt, expires_at, derivation_index)
+         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now(), $7)
          ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
     )
     .bind(uuid::Uuid::new_v4())
