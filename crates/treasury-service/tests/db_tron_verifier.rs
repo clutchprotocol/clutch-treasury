@@ -427,8 +427,8 @@ async fn approval_event_never_backs_a_mint() {
     // Both paths: the known-hash path rejects it outright as hard evidence...
     let known = seed_deposit_intent(&pool, 6_000_000, 6_000_088, "client-ref-approval", Some("tx-approval")).await;
     // ...and the fallback path must not select it at all.
-    // A second intent must live at its OWN address: uq_mint_intents_deposit_address forbids
-    // sharing, which is the point — one address, one claimant.
+    // A second intent at OTHER_ADDR, not DEPOSIT_ADDR: each intent's evidence is gathered at the
+    // address it names, so this proves the Approval event can't leak across intents.
     let fallback =
         seed_deposit_intent_at(&pool, 6_000_000, 6_000_088, "client-ref-approval-fb", None, OTHER_ADDR).await;
 

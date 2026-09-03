@@ -1,4 +1,5 @@
-//! Watching per-intent deposit addresses, which is what replaced Bitcart.
+//! Watching permanent per-user deposit addresses, plus a shrinking legacy set of per-intent ones,
+//! which is what replaced Bitcart.
 //!
 //! # Why Bitcart is gone
 //!

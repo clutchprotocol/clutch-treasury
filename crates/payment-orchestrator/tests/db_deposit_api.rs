@@ -327,8 +327,10 @@ async fn missing_auth_returns_401() {
 /// Task 8: `permanent_deposit_addresses_enabled` gates this route the same way
 /// `redemptions_enabled` gates the redemption routes (see
 /// `db_redemptions.rs::both_routes_503_while_redemptions_disabled`) — 503 before authentication
-/// even runs. A VALID bearer token proves the ordering: this must refuse before ever reaching
-/// `authenticated_pk`, not merely whenever auth also happens to be missing.
+/// even runs. Proven with TWO requests: a valid bearer token 503s (necessary, but both
+/// gate-then-auth and auth-then-gate would also produce this), and a request with NO
+/// `Authorization` header ALSO 503s rather than 401ing — the only case where the two orderings
+/// diverge, which is what actually proves the gate runs first.
 ///
 /// Uses its own pk rather than `USER_A`: `deposit_addresses` persists across every test in this
 /// file (see `the_beneficiary_is_the_authenticated_identity_not_the_body`'s comment), and the gate
@@ -342,6 +344,7 @@ async fn deposit_route_503s_while_disabled_even_with_valid_auth() {
     let app = router_with(pool.clone(), config);
 
     let res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -364,4 +367,22 @@ async fn deposit_route_503s_while_disabled_even_with_valid_auth() {
         .await
         .unwrap();
     assert_eq!(rows, 0, "a disabled route must not create a deposit_addresses row");
+
+    // THE case that actually distinguishes gate-then-auth from auth-then-gate: no Authorization
+    // header at all. If auth ran first this would be 401; the gate must still answer 503.
+    let no_auth_res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/deposits")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        no_auth_res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "must 503 even with NO Authorization header — proves the gate runs before auth, not just before a valid auth check"
+    );
 }

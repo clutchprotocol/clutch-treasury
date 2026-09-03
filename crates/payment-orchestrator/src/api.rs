@@ -33,8 +33,8 @@ async fn health() -> Json<serde_json::Value> {
 /// `"*"` allows any origin (local/dev default); otherwise a comma-separated allowlist.
 /// Same config style as clutch-hub-api's `build_cors` (`hub/server.rs`) — different crate
 /// because this service is Axum, not Actix, but the origin-parsing rule is identical.
-/// Must explicitly allow `Idempotency-Key` (deposits require it) and `Authorization` (the JWT
-/// bearer token) since the specific-origins branch can't use a header wildcard.
+/// Must explicitly allow `Authorization` (the JWT bearer token) since the specific-origins
+/// branch can't use a header wildcard.
 fn build_cors(allowed_origins: &str) -> CorsLayer {
     let layer = CorsLayer::new().allow_methods([Method::GET, Method::POST, Method::OPTIONS]);
 
@@ -52,7 +52,6 @@ fn build_cors(allowed_origins: &str) -> CorsLayer {
             .allow_headers(AllowHeaders::list([
                 HeaderName::from_static("authorization"),
                 HeaderName::from_static("content-type"),
-                HeaderName::from_static("idempotency-key"),
             ]))
     }
 }
@@ -300,4 +299,55 @@ pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) ->
         .route("/api/v1/redemptions/:id", get(get_redemption_handler))
         .layer(cors)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_clt_address;
+
+    /// Case-insensitive prefix: `0X` must be recognised exactly like `0x`, and the payload
+    /// lowercased regardless of the case it arrived in.
+    #[test]
+    fn uppercase_0x_prefix_is_accepted_and_lowercased() {
+        assert_eq!(
+            canonical_clt_address("0X0123456789ABCDEF0123456789ABCDEF01234567"),
+            Some("0x0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    /// No prefix at all is still address-shaped and must be given one, not rejected for lacking it.
+    #[test]
+    fn bare_hex_with_no_prefix_is_given_0x() {
+        assert_eq!(
+            canonical_clt_address("0123456789abcdef0123456789abcdef01234567"),
+            Some("0x0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    /// One digit short of 40: every character is valid hex, only the length is wrong.
+    #[test]
+    fn thirty_nine_hex_digits_is_rejected() {
+        assert_eq!(canonical_clt_address("0x0123456789abcdef0123456789abcdef0123456"), None);
+    }
+
+    /// One digit over 40: same fixture as above with an extra valid hex digit appended.
+    #[test]
+    fn forty_one_hex_digits_is_rejected() {
+        assert_eq!(canonical_clt_address("0x0123456789abcdef0123456789abcdef012345678"), None);
+    }
+
+    #[test]
+    fn empty_string_is_rejected() {
+        assert_eq!(canonical_clt_address(""), None);
+    }
+
+    /// Cyrillic "а" (U+0430) reads identically to Latin "a" but is not ASCII. It is also TWO UTF-8
+    /// bytes where the Latin letter is one, so a 38-ASCII-hex-char string plus this one lookalike is
+    /// 39 characters but exactly 40 bytes — enough to pass a byte-length-only check. Only the
+    /// per-character `is_ascii_hexdigit` test catches it, which is the property this pins.
+    #[test]
+    fn non_ascii_hex_lookalike_is_rejected() {
+        let lookalike = "0x0123456789abcdef0123456789abcdef012345\u{0430}";
+        assert_eq!(canonical_clt_address(lookalike), None);
+    }
 }
