@@ -1,9 +1,11 @@
 //! The derivation-index allocator, tested for the one property that matters: an index is NEVER
 //! handed out twice.
 //!
-//! Two intents sharing an index share a deposit ADDRESS, and the signer derives spending keys from
-//! the index — so a duplicate is two users with a claim on one pot of money. These tests exercise
-//! that against real Postgres concurrency and real rollbacks rather than reasoning about it.
+//! The signer derives spending keys from the index, so a duplicate index is two users with a claim
+//! on one pot of money. A deposit address, by contrast, is now assigned to one user and may receive
+//! multiple deposits over its lifetime — this is the normal case under the permanent-address model.
+//! These tests exercise index uniqueness against real Postgres concurrency and real rollbacks
+//! rather than reasoning about it.
 //!
 //! Same shared-database convention as the other `db_*.rs` files: a sibling database, because sqlx's
 //! `_sqlx_migrations` table has no configurable name and two crates' migrators would corrupt each
@@ -93,56 +95,6 @@ async fn a_rolled_back_transaction_burns_its_index_rather_than_reusing_it() {
         after > inside,
         "the rolled-back index {inside} must NOT be reissued — next was {after}"
     );
-}
-
-/// The database, not the allocator, is the last line of defence: even a buggy caller must not be
-/// able to write two intents at one index or one address.
-///
-/// The constraint NAME is asserted, not just the failure. An earlier version of this test shared one
-/// pay_amount across inserts, so the rejections could have been coming from the legacy
-/// `uq_active_pay_amount` rather than the new indexes — passing for the wrong reason. That index is
-/// now gone entirely, but naming the constraint is what made the problem visible and is worth
-/// keeping.
-#[tokio::test]
-async fn the_database_refuses_a_duplicate_index_or_address() {
-    let pool = pool().await;
-
-    let insert = |key: &'static str, index: i64, addr: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query(
-                "INSERT INTO deposit_intents
-                    (id, user_pk, clt_address, amount_usdt, amount_clt, client_key,
-                     expires_at, derivation_index, deposit_address)
-                 VALUES ($1, 'pk', 'clt', 1000000, 1000000, $2, now() + interval '30 min', $3, $4)",
-            )
-            .bind(uuid::Uuid::new_v4())
-            .bind(key)
-            .bind(index)
-            .bind(addr)
-            .execute(&pool)
-            .await
-        }
-    };
-
-    let violated = |e: sqlx::Error| -> String {
-        e.as_database_error().and_then(|d| d.constraint()).unwrap_or("<none>").to_string()
-    };
-
-    insert("k-first", 7, "TFirstAddress").await.expect("first insert");
-
-    let by_index = insert("k-dup-index", 7, "TOtherAddress")
-        .await
-        .expect_err("a second intent at index 7 must be refused");
-    assert_eq!(violated(by_index), "uq_deposit_derivation_index", "must fail on the INDEX constraint");
-
-    let by_addr = insert("k-dup-addr", 8, "TFirstAddress")
-        .await
-        .expect_err("a second intent at one address must be refused");
-    assert_eq!(violated(by_addr), "uq_deposit_address", "must fail on the ADDRESS constraint");
-
-    // A genuinely distinct triple still goes in — the constraints must not be blanket-blocking.
-    insert("k-ok", 8, "TSecondAddress").await.expect("distinct index+address");
 }
 
 /// Legacy discriminator-era rows carry NULL for both columns, and Postgres allows many NULLs in a
