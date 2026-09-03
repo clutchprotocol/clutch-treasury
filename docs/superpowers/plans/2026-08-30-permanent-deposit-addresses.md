@@ -1440,8 +1440,9 @@ Mechanics: `clutch-deploy`'s `deploy-stage.yml` auto-deploys on any `main` push 
 `docker-compose.treasury.yml`, `config/**` or `scripts/**`, using whatever images GHCR holds at that
 moment; `clutch-treasury`'s `docker-build-push.yml` builds images on `main` push but never deploys.
 So: (1) merge `clutch-treasury` → images exist; (2) merge the Task 10 compose change with
-`APP_PERMANENT_DEPOSIT_ADDRESSES_ENABLED=false` → auto-deploy → deposit route answers 503, top-ups
-OFF on stage; (3) reconciliation `ok`, breaker clear; (4) a one-line `clutch-deploy` commit flipping
+`APP_PERMANENT_DEPOSIT_ADDRESSES_ENABLED=false` → auto-deploy → the orchestrator applies migration 0012
+(`last_attempt_at`, additive) at boot, the deposit route answers 503, top-ups OFF on stage; (3) reconciliation
+`ok`, breaker clear; (4) a one-line `clutch-deploy` commit flipping
 the value to `true` → auto-deploy; (5) merge `clutch-hub-demo-app`'s `feat/permanent-deposit-address`
 → `docker-publish` → new top-up UI; (6) one small Nile deposit credited end to end, and confirm the
 treasury sweeper picks the row up (its `derivation_index` is set). Steps 4–5 back to back are "the
