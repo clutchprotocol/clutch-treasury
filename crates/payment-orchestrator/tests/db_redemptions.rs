@@ -65,6 +65,7 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         min_deposit_usdt: 1_000_000,
         max_deposit_usdt: 50_000_000,
         poll_interval_secs: 30,
+        deposit_hot_window_hours: 24,
         redemptions_enabled,
         min_redemption_clt: 1_000_000,
         max_redemption_clt: 50_000_000,

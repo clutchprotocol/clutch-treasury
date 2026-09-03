@@ -54,8 +54,25 @@ pub struct ObservedTransfer {
 
 #[async_trait]
 pub trait CustodyWatcher: Send + Sync {
-    /// Confirmed TRC-20 transfers into ONE address.
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String>;
+    /// Confirmed TRC-20 transfers into ONE address, optionally bounded below by
+    /// `min_timestamp_ms` (epoch milliseconds). `None` fetches unbounded, same as before this
+    /// parameter existed.
+    async fn transfers_to(
+        &self,
+        address: &str,
+        min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String>;
+}
+
+/// Everything credit-worthy observed since the last call.
+///
+/// Deliberately NOT address-oriented, unlike `CustodyWatcher`. A future implementation that follows
+/// the USDT contract's Transfer events from a stored cursor cannot express itself as
+/// `transfers_to(address)` — it asks for everything since a point in time and filters locally. With
+/// the seam here instead, that implementation drops in without the credit path learning about it.
+#[async_trait]
+pub trait DepositWatcher: Send + Sync {
+    async fn poll(&self) -> Result<Vec<ObservedTransfer>, String>;
 }
 
 /// What the observed transfers to an intent's address add up to.
@@ -113,9 +130,12 @@ pub struct TronGridWatcher {
     usdt_contract: String,
 }
 
-/// TronGrid caps `limit` at 200 and defaults it to 20. A per-intent address should only ever see a
-/// handful of transfers, so this is headroom rather than a real bound — but the default of 20 is
-/// small enough to truncate a pathological case, and a truncated page reads as a missing payment.
+/// TronGrid caps `limit` at 200 and defaults it to 20. Under permanent addresses an address
+/// accumulates transfers for its whole life, so this can no longer rely on a handful-per-address
+/// premise to stay headroom — what keeps a page from truncating is `min_timestamp` bounding each
+/// fetch to what has arrived since the last poll, which is exactly what `TieredPoller` passes. The
+/// default of 20 is still small enough to truncate a pathological case, and a truncated page reads
+/// as a missing payment.
 const PAGE_LIMIT: &str = "200";
 
 /// Only this TRC-20 event kind moves value. An `Approval` carries a `to` and a `value` too, so
@@ -155,9 +175,13 @@ struct Trc20Response {
 
 #[async_trait]
 impl CustodyWatcher for TronGridWatcher {
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String> {
+    async fn transfers_to(
+        &self,
+        address: &str,
+        min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String> {
         let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, address);
-        let resp = self
+        let mut req = self
             .http
             .get(&url)
             .header("TRON-PRO-API-KEY", &self.api_key)
@@ -168,10 +192,13 @@ impl CustodyWatcher for TronGridWatcher {
                 ("only_confirmed", "true"),
                 ("contract_address", self.usdt_contract.as_str()),
                 ("limit", PAGE_LIMIT),
-            ])
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+            ]);
+        if let Some(ts) = min_timestamp_ms {
+            // Lower bound only — TronGrid still returns newest-first up to `limit`. Bounding here
+            // is what keeps a permanent address's page from growing with its whole lifetime.
+            req = req.query(&[("min_timestamp", ts.to_string())]);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

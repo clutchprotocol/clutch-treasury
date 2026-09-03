@@ -10,10 +10,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::alerts::alert;
-use crate::custody::{evaluate_payment, CustodyWatcher, PaymentOutcome};
+use crate::custody::{evaluate_payment, CustodyWatcher, DepositWatcher, ObservedTransfer, PaymentOutcome};
 use crate::deposits;
 
 /// How long past expiry an address keeps being watched for a late payment.
@@ -53,7 +54,9 @@ pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
     }
 
     for (id, address, expected_amount_usdt) in due {
-        let transfers = match watcher.transfers_to(&address).await {
+        // A later task replaces this whole body with TieredPoller/due_addresses; for now the
+        // per-intent query is unchanged and simply passes the new bound as unset.
+        let transfers = match watcher.transfers_to(&address, None).await {
             Ok(t) => t,
             Err(e) => {
                 // Transient by assumption: TronGrid down, throttled, or a blip. Nothing is persisted
@@ -200,5 +203,75 @@ pub async fn run(pool: PgPool, watcher: Arc<dyn CustodyWatcher>, poll_interval_s
     loop {
         interval.tick().await;
         poll_once(&pool, watcher.as_ref()).await;
+    }
+}
+
+/// One address due for polling this pass.
+pub struct DueAddress {
+    pub user_pk: String,
+    pub address: String,
+    pub last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Hot addresses first, then the coldest. The LIMIT is the whole cost control: permanent addresses
+/// never stop being watched, so without a per-pass budget the request count grows with every user
+/// who has ever existed. With it, cost per pass is constant and the cold rotation period is simply
+/// (addresses / budget) * poll_interval — a number an operator can be told rather than discover.
+pub async fn due_addresses(pool: &PgPool, budget: i64) -> Result<Vec<DueAddress>, String> {
+    sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT user_pk, address, last_polled_at FROM deposit_addresses
+         ORDER BY (hot_until > now()) DESC NULLS LAST, last_polled_at ASC NULLS FIRST
+         LIMIT $1",
+    )
+    .bind(budget)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(user_pk, address, last_polled_at)| DueAddress { user_pk, address, last_polled_at })
+            .collect()
+    })
+    .map_err(|e| format!("selecting due addresses: {e}"))
+}
+
+/// The `DepositWatcher` this deployment runs: poll a bounded slice of addresses per pass, hot first.
+///
+/// Owns the tier state — it stamps `last_polled_at` for every address it polled, whether or not
+/// anything arrived, because an address that is never stamped is re-polled every pass forever and
+/// the cold rotation never advances.
+pub struct TieredPoller {
+    pub pool: PgPool,
+    pub inner: Arc<dyn CustodyWatcher>,
+    pub budget: i64,
+}
+
+#[async_trait]
+impl DepositWatcher for TieredPoller {
+    async fn poll(&self) -> Result<Vec<ObservedTransfer>, String> {
+        let due = due_addresses(&self.pool, self.budget).await?;
+        let mut found = Vec::new();
+
+        for a in &due {
+            // Only transfers since we last looked, minus an hour of overlap. Permanent addresses
+            // otherwise re-fetch their entire history every rotation. The overlap is free: a
+            // transfer landing between the query and the stamp is re-observed next pass, and
+            // credit_transfer is idempotent on tron_tx_id. Epoch MILLISECONDS, per ObservedTransfer.
+            let since = a.last_polled_at.map(|t| (t - chrono::Duration::hours(1)).timestamp_millis());
+            match self.inner.transfers_to(&a.address, since).await {
+                Ok(mut ts) => found.append(&mut ts),
+                // One unreadable address must not abort the pass: the others are still due, and a
+                // TronGrid blip on one address would otherwise stall every deposit behind it.
+                Err(e) => tracing::warn!("polling {}: {e}", a.address),
+            }
+        }
+
+        let polled: Vec<String> = due.iter().map(|a| a.address.clone()).collect();
+        sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE address = ANY($1)")
+            .bind(&polled)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("stamping last_polled_at: {e}"))?;
+
+        Ok(found)
     }
 }

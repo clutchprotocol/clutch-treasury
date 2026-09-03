@@ -41,6 +41,13 @@ pub struct OrchConfig {
     pub min_deposit_usdt: i64,
     pub max_deposit_usdt: i64,
     pub poll_interval_secs: u64,
+    /// How long a user's address stays on the fast poll tier after they open the deposit panel.
+    ///
+    /// Long enough that someone who opens the panel, goes to fetch USDT and comes back the next day
+    /// is still on the fast path; short enough that the hot set stays a small fraction of all
+    /// addresses, which is what makes the per-pass budget mean anything. Setting this very large
+    /// collapses tiering back into polling everything — that degrades cost, not correctness.
+    pub deposit_hot_window_hours: i64,
     /// Plan C T6 gate, default `false`. The treasury's payout rail is real now — a TRC-20
     /// transfer from a derived float via `tron-signer`'s `/internal/payout` — not the old stub
     /// that fabricated `payout_ref = "stub:<uuid>"` and sent nothing. This flag no longer waits

@@ -27,7 +27,14 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, alerts RESTART IDENTITY CASCADE").execute(&pool).await.unwrap();
+    // deposit_addresses is included here (Task 5 test helper seed_address writes to it):
+    // otherwise its rows outlive the test that created them while the sequence below is reset
+    // to 0 every time, and the next test's first insert collides with a leftover row's
+    // derivation_index — same reasoning as db_addresses.rs's own pool() helper.
+    sqlx::query("TRUNCATE deposit_intents, alerts, deposit_addresses RESTART IDENTITY CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("ALTER SEQUENCE deposit_derivation_index_seq RESTART").execute(&pool).await.unwrap();
     pool
 }
@@ -54,7 +61,11 @@ impl FakeChain {
 
 #[async_trait]
 impl CustodyWatcher for FakeChain {
-    async fn transfers_to(&self, address: &str) -> Result<Vec<ObservedTransfer>, String> {
+    async fn transfers_to(
+        &self,
+        address: &str,
+        _min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<ObservedTransfer>, String> {
         self.asked.lock().unwrap().push(address.to_string());
         if self.fail {
             return Err("scripted TronGrid outage".into());
@@ -91,6 +102,26 @@ async fn seed(pool: &PgPool, key: &str, address: &str, amount: i64, status: &str
     .await
     .unwrap();
     id
+}
+
+/// Insert a permanent deposit address row directly — the derive/issue path is covered elsewhere.
+/// `hot_hours: Some(n)` marks it hot for `n` hours from now; `None` leaves it cold.
+async fn seed_address(pool: &PgPool, user_pk: &str, address: &str, hot_hours: Option<i64>) {
+    let index = sqlx::query_scalar::<_, i64>("SELECT nextval('deposit_derivation_index_seq')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address, hot_until)
+         VALUES ($1, $2, $3, 'clt', $4)",
+    )
+    .bind(user_pk)
+    .bind(index)
+    .bind(address)
+    .bind(hot_hours.map(|h| chrono::Utc::now() + chrono::Duration::hours(h)))
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
@@ -287,4 +318,32 @@ async fn legacy_rows_without_an_address_are_skipped() {
 
     assert!(chain.asked.lock().unwrap().is_empty(), "a row with no address must not be polled");
     assert_eq!(status_of(&pool, id).await, "created");
+}
+
+#[tokio::test]
+async fn hot_addresses_are_polled_before_cold_ones_and_the_budget_is_respected() {
+    // Cost per PASS is what is bounded, not cost per address — otherwise a permanent address per
+    // user means one TronGrid request per user who ever existed, every pass.
+    let pool = pool().await;
+    seed_address(&pool, "0xcold-1", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", None).await;
+    seed_address(&pool, "0xcold-2", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+    seed_address(&pool, "0xhot", "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx", Some(24)).await;
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 2).await.unwrap();
+
+    assert_eq!(due.len(), 2, "the per-pass budget is a hard cap");
+    assert_eq!(due[0].address, "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx", "hot first");
+}
+
+#[tokio::test]
+async fn cold_addresses_rotate_oldest_polled_first() {
+    let pool = pool().await;
+    seed_address(&pool, "0xa", "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", None).await;
+    seed_address(&pool, "0xb", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
+    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE user_pk = '0xa'")
+        .execute(&pool).await.unwrap();
+
+    let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
+
+    assert_eq!(due[0].user_pk, "0xb", "never-polled sorts ahead of just-polled");
 }
