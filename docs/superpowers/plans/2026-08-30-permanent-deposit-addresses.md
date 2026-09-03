@@ -1141,7 +1141,7 @@ git commit -m "feat: show a permanent deposit address instead of asking for an a
 **Files:**
 - Modify: `../clutch-deploy/docker-compose.treasury.yml`
 - Modify: `../clutch-deploy/CLAUDE.md`, `../CLAUDE.md`
-- Modify: `crates/payment-orchestrator/config/default.toml`
+- Read only: `crates/payment-orchestrator/config/default.toml` — confirm the two entries exist (Tasks 5 and 8); this task edits NOTHING under `clutch-treasury`, so it may run alongside a treasury task.
 
 - [ ] **Step 1: Environment**
 
