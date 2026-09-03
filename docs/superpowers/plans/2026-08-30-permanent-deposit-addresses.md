@@ -1018,6 +1018,10 @@ git commit -m "feat: gate permanent deposit addresses, drop the dead amount boun
 
 - [ ] **Step 1: Remove the amount step**
 
+Branch from the demo app's CURRENT `main` first. A separate map-tile fix (`fix/map-tiles-no-api-key`,
+`src/config.js`) may have merged since this plan was written; it touches a different file, but basing
+on stale `main` invites a needless conflict on merge.
+
 Read the file first — it currently collects an amount and calls `POST /api/v1/deposits` with it.
 Replace that flow with: on mount (or on opening the panel), call the endpoint with no body, show the
 returned address plus a QR code if the component already has one, and keep the existing testnet
@@ -1063,7 +1067,9 @@ Add to the orchestrator's env block, and REMOVE `MIN_DEPOSIT_USDT` / `MAX_DEPOSI
 ```
 
 Confirm each name against the actual `OrchConfig` field names — `APP_` + the field name uppercased.
-A mismatch panics the orchestrator at boot.
+Both fields now have `config/default.toml` entries (Tasks 5 and 8), so these compose lines are
+OVERRIDES, not requirements: a misnamed one does not panic the orchestrator, it silently fails to
+override — which is quieter and therefore worth getting right the first time.
 
 - [ ] **Step 2: Correct the deposit-detection docs**
 
