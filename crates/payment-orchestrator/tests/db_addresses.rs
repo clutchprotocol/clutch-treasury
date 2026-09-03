@@ -95,3 +95,40 @@ async fn marking_hot_sets_a_future_window() {
         .fetch_one(&pool).await.unwrap();
     assert!(hot);
 }
+
+#[tokio::test]
+async fn two_simultaneous_first_calls_settle_on_one_address() {
+    // The race the ON CONFLICT + re-read design exists for. Both callers pass the initial
+    // existence check as None, both derive, both INSERT; exactly one wins and BOTH must return the
+    // winner's address. A SELECT-then-INSERT implementation returns two different addresses here,
+    // and money sent to the loser is watched by nothing.
+    //
+    // Why this is deterministic enough to be worth having: #[tokio::test] (no `flavor` arg,
+    // confirmed nowhere in this crate) runs on the current-thread runtime, and tokio::join! polls
+    // both futures on that one thread, interleaving at .await points. Both `address_for_user`
+    // calls reach their first .await — the `existing()` read — before either is polled again, so
+    // both genuinely observe None rather than one running to completion before the other starts.
+    //
+    // This does not prove the absence of every possible race — a real multi-threaded or
+    // multi-process race is not reproduced here — but it WOULD fail against a SELECT-then-INSERT
+    // implementation, which is the specific bug ON CONFLICT + re-read exists to prevent. That is
+    // the bar this test clears.
+    let pool = pool().await;
+    let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
+
+    let (a, b) = tokio::join!(
+        addresses::address_for_user(&pool, &deriver, "0xracer", "0xclt-r"),
+        addresses::address_for_user(&pool, &deriver, "0xracer", "0xclt-r"),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+
+    assert_eq!(a, b, "both callers must see the same persisted address");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE user_pk = '0xracer'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, 1, "exactly one row, whichever caller won");
+
+    let stored: String = sqlx::query_scalar("SELECT address FROM deposit_addresses WHERE user_pk = '0xracer'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(a, stored, "the returned address is the stored one, not a losing derivation");
+}
