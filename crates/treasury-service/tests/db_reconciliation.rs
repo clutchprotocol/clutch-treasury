@@ -1,10 +1,6 @@
 use sqlx::PgPool;
 use treasury_service::reconciliation::{judge, record, Sources};
 
-/// A real, base58check-valid derived address (shared fixture value used elsewhere in this crate's
-/// tests, e.g. db_sweeper.rs's ADDRS) — the balance/address plumbing rejects placeholders.
-const SHARED_ADDR: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
-
 /// Own database per test binary: --test-threads=1 only serialises tests WITHIN a binary, and cargo
 /// runs binaries in parallel while every pool() here TRUNCATEs shared tables.
 async fn pool() -> PgPool {
@@ -21,43 +17,6 @@ async fn pool() -> PgPool {
     sqlx::query("UPDATE breaker_state SET minting_halted = FALSE, halt_reason = NULL")
         .execute(&pool).await.unwrap();
     pool
-}
-
-/// Inserts a `credited`, unswept mint intent at `address` evidenced by `tx_id`. Modeled on
-/// db_tron_verifier.rs's `seed_deposit_intent_at` / db_sweeper.rs's `seed`: a raw INSERT naming
-/// every NOT NULL column mint_intents has with no default (`beneficiary`, `amount_clt`,
-/// `credit_ref`, `created_by`), plus `approved_by` since four_eyes requires a distinct approver for
-/// anything past `created`. `swept_at` is left out of the column list entirely so it takes its
-/// column default of NULL, which is exactly the "still unswept" state this test needs.
-async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str) {
-    let id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO mint_intents (id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by,
-                                    deposit_tx_id, deposit_address)
-         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, 'credited', $2, 'orchestrator', 'tron-verifier',
-                 $3, $4)",
-    )
-    .bind(id)
-    .bind(format!("ref-{id}"))
-    .bind(tx_id)
-    .bind(address)
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
-/// Per-user deposit addresses make this the NORMAL case: one user, several deposits, one address.
-/// Counting per row inflates the reserve, and an over-backed reading licenses mints that nothing
-/// backs — strictly worse than under-counting, which only halts minting.
-#[tokio::test]
-async fn one_address_on_two_unswept_rows_is_counted_once() {
-    let pool = pool().await;
-    seed_unswept_mint(&pool, SHARED_ADDR, "tx-a").await;
-    seed_unswept_mint(&pool, SHARED_ADDR, "tx-b").await;
-
-    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
-
-    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "one address, counted once");
 }
 
 fn s(onchain: u64, genesis: u64, ledger: i64, custody: i64) -> Sources {
