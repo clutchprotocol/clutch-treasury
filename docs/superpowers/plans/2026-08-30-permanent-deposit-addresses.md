@@ -817,6 +817,7 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 **Files:**
 - Modify: `crates/payment-orchestrator/src/custody.rs` (delete `evaluate_payment` and `PaymentOutcome`)
 - Modify: `crates/payment-orchestrator/src/poller.rs`
+- Modify: `crates/payment-orchestrator/src/main.rs` (build the `TieredPoller { pool, inner, budget: MAX_ADDRESSES_PER_PASS }` and hand it to `run` — Step 5 already requires this; listed here so the file is in scope)
 - Test: `crates/payment-orchestrator/tests/db_poller.rs`
 
 **Interfaces:**
