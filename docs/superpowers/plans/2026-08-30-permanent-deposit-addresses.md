@@ -29,7 +29,7 @@
 - `tests/db_reconciliation.rs` — double-count regression (Task 1)
 
 **`crates/payment-orchestrator/`**
-- `migrations/0010_deposit_addresses.sql` — new table + `deposit_tx_id` unique index (Task 2)
+- `migrations/0010_deposit_addresses.sql` — new table + `tron_tx_id` unique index (Task 2)
 - `migrations/0011_drop_intent_address_uniqueness.sql` — drops the two orchestrator indexes (Task 3)
 - `src/addresses.rs` — **new**: per-user address derivation and storage (Task 4)
 - `src/custody.rs` — `DepositWatcher` seam; `evaluate_payment` deleted (Tasks 5, 7)
@@ -121,7 +121,7 @@ git commit -m "fix: count each unswept deposit address once in the reserve"
 - Create: `crates/payment-orchestrator/migrations/0010_deposit_addresses.sql`
 
 **Interfaces:**
-- Produces: table `deposit_addresses(user_pk PK, derivation_index BIGINT UNIQUE, address TEXT UNIQUE, hot_until TIMESTAMPTZ, last_polled_at TIMESTAMPTZ, created_at)`, and a unique index on `deposit_intents.deposit_tx_id`. Tasks 4–7 depend on both.
+- Produces: table `deposit_addresses(user_pk PK, derivation_index BIGINT UNIQUE, address TEXT UNIQUE, hot_until TIMESTAMPTZ, last_polled_at TIMESTAMPTZ, created_at)`, and a unique index on `deposit_intents.tron_tx_id`. Tasks 4–7 depend on both.
 
 - [ ] **Step 1: Write the migration**
 
@@ -152,11 +152,11 @@ CREATE TABLE deposit_addresses (
 -- Identity moves from address to TRANSACTION. The treasury already enforces the same thing with
 -- uq_mint_intents_deposit_tx; this is the orchestrator's half, and it is what makes address reuse
 -- safe: two transfers to one address are two credits, and the same transfer seen twice is one.
-CREATE UNIQUE INDEX uq_deposit_intents_deposit_tx
-    ON deposit_intents (deposit_tx_id) WHERE deposit_tx_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_deposit_intents_tron_tx_id
+    ON deposit_intents (tron_tx_id) WHERE tron_tx_id IS NOT NULL;
 ```
 
-Before writing, confirm `deposit_intents.deposit_tx_id` exists and its exact name by reading
+Before writing, confirm `deposit_intents.tron_tx_id` exists and its exact name by reading
 `migrations/0001_orchestrator.sql` and `0009_received_usdt.sql`. If a partial unique index on it
 already exists, skip that half and say so in your report rather than creating a duplicate.
 
@@ -180,7 +180,7 @@ git commit -m "feat: add deposit_addresses, one permanent address per user"
 - Create: `crates/treasury-service/migrations/0010_drop_deposit_address_uniqueness.sql`
 
 **Interfaces:**
-- Consumes: Task 1's `DISTINCT` (must already be deployed), Task 2's `uq_deposit_intents_deposit_tx`.
+- Consumes: Task 1's `DISTINCT` (must already be deployed), Task 2's `uq_deposit_intents_tron_tx_id`.
 - Produces: address reuse becomes representable. Tasks 6–7 depend on it.
 
 - [ ] **Step 1: Write the orchestrator migration**
@@ -188,7 +188,7 @@ git commit -m "feat: add deposit_addresses, one permanent address per user"
 ```sql
 -- Address reuse is the point: one user, one address, many deposits over its life.
 --
--- What these indexes were protecting is not lost, it changes key. uq_deposit_intents_deposit_tx
+-- What these indexes were protecting is not lost, it changes key. uq_deposit_intents_tron_tx_id
 -- (migration 0010) makes every credit unique per TRANSACTION, which is a strictly better guarantee:
 -- under the old model two transfers to one address were ONE deposit by construction, which is
 -- quietly wrong. Under this one they are correctly two.
@@ -702,7 +702,7 @@ git commit -m "feat: the deposit endpoint hands back an address, not an invoice"
 - Test: `crates/payment-orchestrator/tests/db_poller.rs`
 
 **Interfaces:**
-- Consumes: `due_addresses`, `DepositWatcher` (Task 5); `uq_deposit_intents_deposit_tx` (Task 2).
+- Consumes: `due_addresses`, `DepositWatcher` (Task 5); `uq_deposit_intents_tron_tx_id` (Task 2).
 - Produces: `pub async fn credit_transfer(pool: &PgPool, user_pk: &str, t: &ObservedTransfer) -> Result<bool, String>` — `Ok(true)` when a new row was created.
 
 - [ ] **Step 1: Write the failing tests**
@@ -753,7 +753,7 @@ async fn a_one_cent_deposit_is_credited_in_full() {
 
     payment_orchestrator::poller::credit_transfer(&pool, "0xuser-a", &observed("tx-dust", ADDR, 10_000)).await.unwrap();
 
-    let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE deposit_tx_id = 'tx-dust'")
+    let got: i64 = sqlx::query_scalar("SELECT received_usdt FROM deposit_intents WHERE tron_tx_id = 'tx-dust'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(got, 10_000);
 }
@@ -774,7 +774,7 @@ In `crates/payment-orchestrator/src/poller.rs`:
 ///
 /// Returns `Ok(false)` when the transaction was already recorded. That is the normal case, not an
 /// error: a poll pass re-reads an address's recent history every rotation, so the same transfer is
-/// seen many times. `uq_deposit_intents_deposit_tx` is what makes re-observation free.
+/// seen many times. `uq_deposit_intents_tron_tx_id` is what makes re-observation free.
 ///
 /// The amount credited is what ARRIVED. There is no expected figure to reconcile against any more —
 /// the user was never asked for one.
@@ -786,9 +786,9 @@ pub async fn credit_transfer(
     let done = sqlx::query(
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, amount_clt, status,
-             deposit_address, deposit_tx_id, received_usdt, expires_at)
+             deposit_address, tron_tx_id, received_usdt, expires_at)
          VALUES ($1, $2, $2, $3, $3, 'confirmed', $4, $5, $3, now())
-         ON CONFLICT (deposit_tx_id) WHERE deposit_tx_id IS NOT NULL DO NOTHING",
+         ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(user_pk)
@@ -833,7 +833,7 @@ MILLISECONDS — `ObservedTransfer::block_timestamp` documents that unit). Addre
 now, so without this every cold rotation re-fetches an address's entire history. Subtract a
 generous overlap (an hour) before sending it: a transfer landing between the query and the stamp
 would otherwise be skipped forever, and re-observing one is free because `credit_transfer` is
-idempotent on `deposit_tx_id`.
+idempotent on `tron_tx_id`.
 
 Resolve each transfer's `user_pk` by looking up `t.to` in `deposit_addresses`. A transfer to an
 address with no row is a legacy per-intent address — leave those to the existing intent path and do
