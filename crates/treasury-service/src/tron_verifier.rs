@@ -67,10 +67,22 @@ struct TokenInfo {
     address: String,
 }
 
+/// Present when another page exists; TronGrid's v1 account endpoints accept this back as the
+/// `fingerprint` query parameter to fetch the next page. Same shape and reasoning as
+/// `payment_orchestrator::custody::Trc20Meta` — duplicated across the two crates rather than
+/// shared, since a shared crate for ~25 lines of pagination logic is not worth the coupling (R24).
+#[derive(Debug, Deserialize)]
+struct Trc20Meta {
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Trc20TransfersResponse {
     #[serde(default)]
     data: Vec<Trc20Transfer>,
+    #[serde(default)]
+    meta: Option<Trc20Meta>,
 }
 
 /// Response of `POST /walletsolidity/gettransactionbyid`, modeled minimally.
@@ -125,41 +137,85 @@ impl TronClient {
         Self { http: reqwest::Client::new(), base_url, api_key }
     }
 
-    async fn trc20_transfers(&self, custody_address: &str, usdt_contract: &str) -> Result<Vec<Trc20Transfer>, String> {
+    /// `min_timestamp_ms` (epoch milliseconds) bounds the read below, same purpose and shape as
+    /// `payment_orchestrator::custody::CustodyWatcher::transfers_to`'s parameter of the same name:
+    /// under permanent addresses a user's own deposit history — or a dust flood — can otherwise fill
+    /// page 1 and push the transfer this intent actually needs off the only page ever read. Callers
+    /// pass the same bound the fallback match below already computes (`evaluate`'s `earliest_ms`), so
+    /// the request and the local re-check agree.
+    ///
+    /// Follows TronGrid's `meta.fingerprint` cursor across pages, capped at `MAX_PAGES` — the exact
+    /// fix Task 12 made on the orchestrator's `custody.rs::transfers_to`, left standing here until
+    /// R24. Mirrors that loop's shape; duplicated rather than shared, see `Trc20Meta`'s doc comment.
+    async fn trc20_transfers(
+        &self,
+        custody_address: &str,
+        usdt_contract: &str,
+        min_timestamp_ms: Option<i64>,
+    ) -> Result<Vec<Trc20Transfer>, String> {
         let url = format!("{}/v1/accounts/{}/transactions/trc20", self.base_url, custody_address);
-        let resp = self
-            .http
-            .get(&url)
-            .header("TRON-PRO-API-KEY", &self.api_key)
-            .query(&[
-                ("only_confirmed", "true"),
-                ("contract_address", usdt_contract),
-                // TronGrid defaults `limit` to 20 (max 200). Leaving it unset meant a custody
-                // address with more than 20 recent USDT transfers could push a legitimate
-                // deposit off the only page we look at — the intent would then never find its
-                // evidence, stay Transient forever, and age into manual review. Verified against
-                // the live endpoint's documented parameters.
-                ("limit", TRC20_PAGE_LIMIT),
-            ])
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("trongrid trc20 list failed: {status} {text}"));
+        let page_limit = TRC20_PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX);
+        let mut all_rows: Vec<Trc20Transfer> = Vec::new();
+        let mut fingerprint: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut req = self
+                .http
+                .get(&url)
+                .header("TRON-PRO-API-KEY", &self.api_key)
+                .query(&[
+                    ("only_confirmed", "true"),
+                    ("contract_address", usdt_contract),
+                    // TronGrid defaults `limit` to 20 (max 200). Leaving it unset meant a custody
+                    // address with more than 20 recent USDT transfers could push a legitimate
+                    // deposit off the only page we look at — the intent would then never find its
+                    // evidence, stay Transient forever, and age into manual review. Verified against
+                    // the live endpoint's documented parameters.
+                    ("limit", TRC20_PAGE_LIMIT),
+                ]);
+            if let Some(ts) = min_timestamp_ms {
+                // Lower bound only — TronGrid still returns newest-first up to `limit`. Bounding
+                // here is what keeps a permanent address's page relevant to THIS intent instead of
+                // filled by its own older history (R24).
+                req = req.query(&[("min_timestamp", ts.to_string())]);
+            }
+            if let Some(fp) = &fingerprint {
+                // TronGrid's pagination cursor: carried over from the previous page's
+                // `meta.fingerprint`, which is present whenever older rows still exist.
+                req = req.query(&[("fingerprint", fp.as_str())]);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("trongrid trc20 list failed: {status} {text}"));
+            }
+            let parsed: Trc20TransfersResponse = resp.json().await.map_err(|e| e.to_string())?;
+            let page_len = parsed.data.len();
+            all_rows.extend(parsed.data);
+            // An empty string counts as no cursor too — TronGrid should never send one, but "no more
+            // pages" must not silently depend on that.
+            let next_fingerprint = parsed.meta.and_then(|m| m.fingerprint).filter(|f| !f.is_empty());
+            // Ok, not Err: an address that legitimately has exactly page_limit rows and nothing more
+            // must not fail forever just because every re-poll re-hits this same full-page-no-cursor
+            // case. TronGrid is documented to always send a fingerprint when more rows exist — this
+            // is only a warning in case that contract ever breaks.
+            if page_len >= page_limit && next_fingerprint.is_none() {
+                tracing::warn!(
+                    "trongrid trc20 list returned a full page of {page_len} transfers for \
+                     {custody_address} with no fingerprint cursor — if more rows exist they cannot be \
+                     fetched; verify TronGrid's pagination contract"
+                );
+            }
+            if page_len < page_limit || next_fingerprint.is_none() {
+                return Ok(all_rows);
+            }
+            fingerprint = next_fingerprint;
         }
-        let parsed: Trc20TransfersResponse = resp.json().await.map_err(|e| e.to_string())?;
-        // ponytail: single page only. If it comes back FULL we may be truncating, so say so
-        // rather than let a missed deposit look like "not on chain yet". Paginating via
-        // `meta.links.next` is the fix if a busy custody address ever makes this routine.
-        if parsed.data.len() >= TRC20_PAGE_LIMIT.parse::<usize>().unwrap_or(usize::MAX) {
-            tracing::warn!(
-                "trongrid trc20 list returned a full page ({TRC20_PAGE_LIMIT}) for {custody_address} — \
-                 older transfers in the window may be truncated; consider paginating"
-            );
-        }
-        Ok(parsed.data)
+        // Exhausted MAX_PAGES with TronGrid still offering a fingerprint on the last page fetched —
+        // a loud Err rather than a partial, silently truncated Ok; see MAX_PAGES's doc comment.
+        Err(format!(
+            "trongrid trc20 list for {custody_address} exceeded the {MAX_PAGES}-page cap with more pages still offered"
+        ))
     }
 
     /// Shared by `transaction_confirmed`, `transfer_succeeded` and `payout_contract_ret` — one
@@ -372,6 +428,14 @@ const DECODED_LEN_WITH_VERSION: usize = 21;
 /// TronGrid caps `limit` at 200 and defaults it to 20. Ask for the max.
 const TRC20_PAGE_LIMIT: &str = "200";
 
+/// Hard cap on pages followed per address per call — mirrors
+/// `payment_orchestrator::custody::MAX_PAGES` (10 pages x 200 rows/page = 2,000 rows for one address
+/// in one verification pass, far beyond what a real deposit history should ever produce). Past that,
+/// TronGrid is still offering a fingerprint cursor and something is wrong; a partial `Ok` at that
+/// point would be exactly the silent truncation R24 exists to close, so `trc20_transfers` returns
+/// `Err` naming the address and this cap instead.
+const MAX_PAGES: usize = 10;
+
 /// Only this TRC-20 event kind actually moves value.
 const TRC20_TRANSFER_EVENT: &str = "Transfer";
 
@@ -487,7 +551,14 @@ async fn evaluate(
         ));
     };
 
-    let transfers = match client.trc20_transfers(&deposit_address, &config.usdt_contract).await {
+    // R24: bound the read the same way the fallback match below re-checks it locally, in epoch
+    // MILLISECONDS. Under permanent addresses a user's own older history (or a dust flood) can fill
+    // TronGrid's page 1 with nothing this intent cares about; bounding the REQUEST is what keeps the
+    // page relevant, not just the local filter below.
+    let earliest_ms =
+        (intent.created_at - chrono::Duration::hours(config.deposit_match_window_hours)).timestamp_millis();
+
+    let transfers = match client.trc20_transfers(&deposit_address, &config.usdt_contract, Some(earliest_ms)).await {
         Ok(t) => t,
         Err(e) => return Evidence::Transient(format!("trongrid trc20 list: {e}")),
     };
@@ -523,16 +594,15 @@ async fn evaluate(
             // user's larger deposit. An address has exactly one intended payer, so `>=` is now
             // safe — and an overpayment with no hash verifies instead of ageing into manual review.
             //
-            // The time bound is KEPT even though derivation indices are never reused. It costs
-            // nothing and it still bounds the blast radius of an address being reused by mistake,
-            // whether by a restored-from-mnemonic signer scanning old indices or by a future bug.
-            // Removing a cheap guard because the current design makes it redundant is how the
-            // redundancy stops being there when the design shifts again.
+            // The local time check below (`earliest_ms`, computed above and now ALSO the bound on
+            // the TronGrid request itself — R24) is kept as a second, independent guard even so: it
+            // still bounds the blast radius of an address being reused by mistake, whether by a
+            // restored-from-mnemonic signer scanning old indices or by a future bug. Removing a
+            // cheap guard because another layer makes it redundant today is how the redundancy stops
+            // being there when the design shifts again.
             //
             // `only_confirmed=true` already restricts this list to confirmed transfers, so no
             // separate depth call is needed here.
-            let window = chrono::Duration::hours(config.deposit_match_window_hours);
-            let earliest_ms = (intent.created_at - window).timestamp_millis();
             let candidate = transfers.iter().find(|t| {
                 t.event_type == TRC20_TRANSFER_EVENT
                     && t.to == deposit_address

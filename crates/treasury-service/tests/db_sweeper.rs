@@ -365,6 +365,12 @@ async fn a_credited_row_missing_derivation_index_is_reported_and_left_unswept() 
     assert_eq!(missing, 1, "the pass must count the credited row with no derivation_index");
     assert!(signer.asked().is_empty(), "a row with no index must be reported, not swept");
     assert!(swept_at(&pool, id).await.is_none(), "unchanged behaviour: the row is still left unswept");
+
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'sweeper'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts, 1, "a credited row with no derivation_index must reach the alerts pipeline, not just the log");
 }
 
 fn tron(server: &MockServer) -> treasury_service::tron_verifier::TronClient {

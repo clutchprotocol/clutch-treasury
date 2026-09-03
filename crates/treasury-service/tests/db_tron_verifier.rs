@@ -11,7 +11,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// THIS intent's own derived deposit address. Deposits no longer share one custody address, so the
@@ -326,6 +326,64 @@ async fn fallback_match_backfills_deposit_tx_id_and_approves() {
         sqlx::query_as("SELECT deposit_tx_id FROM mint_intents WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
     assert_eq!(deposit_tx_id.as_deref(), Some("tx-fallback"), "fallback match must backfill the tx id it found");
 }
+
+/// R24: the exact bug Task 12 fixed on the orchestrator's `custody.rs`, left standing on the side
+/// that decides mints. A user's own deposit history, or a dust flood, can fill TronGrid's page 1
+/// with nothing this intent cares about — under permanent addresses this is the normal case, not an
+/// edge case, so the intent's real evidence sitting on page 2 must still be found and approved.
+#[tokio::test]
+async fn a_deposit_on_the_second_page_still_approves() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+
+    // Page 1: a full page of filler rows to a DIFFERENT address, plus a cursor to page 2. The
+    // fallback match's own `t.to == deposit_address` check would drop these anyway — the point is
+    // they fill the page, so the only way the assertion below can pass is if page 2 was actually
+    // requested.
+    let filler: Vec<serde_json::Value> = (0..200)
+        .map(|i| trc20_transfer_json(&format!("filler-{i}"), OTHER_ADDR, USDT, "1000000"))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{DEPOSIT_ADDR}/transactions/trc20")))
+        .and(query_param_is_missing("fingerprint"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": filler,
+            "meta": { "fingerprint": "abc" },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Page 2: the intent's real transfer.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{DEPOSIT_ADDR}/transactions/trc20")))
+        .and(query_param("fingerprint", "abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [trc20_transfer_json("tx-page-two", DEPOSIT_ADDR, USDT, "7000099")],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri());
+    let id = seed_deposit_intent(&pool, 7_000_000, 7_000_099, "client-ref-page-two", None).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 1, "the intent's evidence sitting on page 2 must still approve it");
+    assert_eq!(status_of(&pool, id).await, "approved");
+
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_deposit'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "page 2's transfer must be ledgered exactly once");
+    // Both `.expect(1)`s above are verified when `server` drops: page 2 never being requested (the
+    // pre-fix behaviour) panics there too.
+}
+
 /// Evidence must never cross between two intents' addresses.
 ///
 /// This test used to assert the opposite-shaped rule: that a LARGER transfer could not satisfy the

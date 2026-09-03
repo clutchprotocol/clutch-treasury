@@ -126,10 +126,20 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         let mut distinct_addresses = missing_index;
         distinct_addresses.sort_unstable();
         distinct_addresses.dedup();
-        tracing::warn!(
-            "sweeper: {missing_count} deposit(s) past 'approved' have no derivation_index and can \
-             never be swept: {distinct_addresses:?}"
+        // An 'approved' row here is not yet stuck — the sweep query above only ever selects
+        // ('credited', 'submitted'), so 'approved' simply isn't sweep-eligible yet regardless of
+        // this column. It is 'submitted'/'credited' rows missing the index that are truly stuck:
+        // those statuses ARE what the sweep query selects on, so a missing index is the only thing
+        // excluding them, and derivation_index never gets set after the row is created.
+        let message = format!(
+            "sweeper: {missing_count} deposit(s) have no derivation_index — an 'approved' row is not \
+             yet eligible for sweeping, but any already 'submitted' or 'credited' can never be swept \
+             without one: {distinct_addresses:?}"
         );
+        tracing::warn!("{message}");
+        // Beside the log line: a plain warn! is invisible to whatever watches the alerts table, and
+        // this condition is exactly as actionable as every other sweeper alert below.
+        alert(pool, "warn", "sweeper", &message).await;
     }
 
     for (id, address, index, age_hours) in rows {
