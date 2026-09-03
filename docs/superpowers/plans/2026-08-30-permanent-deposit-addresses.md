@@ -1265,7 +1265,12 @@ CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, 
 
 **Files:**
 - Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`)
-- Test: `crates/payment-orchestrator/tests/db_poller.rs` or the existing wiremock suite that exercises `TronGridWatcher` (read where `transfers_to` is tested today and add there)
+- Test: NEW `crates/payment-orchestrator/tests/trongrid_pagination.rs` — wiremock only, NO database (`transfers_to`
+  never touches Postgres, so this file must not call `pool()`); construct the watcher the way `tests/db_poller.rs`
+  already does for its wiremock test (`TronGridWatcher::new(server.uri(), api_key, usdt_contract)`), and copy its
+  TronGrid row JSON shape (`transaction_id`, `to`, `value` as a decimal STRING, `token_info.address`, `type`,
+  `block_timestamp`) from the same file. `Trc20Response` today is `{ #[serde(default)] data: Vec<Trc20Row> }`
+  (custody.rs ~126) — add `#[serde(default)] meta: Option<Trc20Meta>` beside it.
 
 - Consumes: `TronGridWatcher::transfers_to(address, min_timestamp_ms)` (Task 5), `TieredPoller` stamping (Task 5).
 - Produces: `transfers_to` follows TronGrid's `meta.fingerprint` cursor until a short page, bounded by a page cap.
