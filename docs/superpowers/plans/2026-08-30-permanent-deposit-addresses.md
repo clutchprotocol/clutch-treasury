@@ -1193,7 +1193,7 @@ cd ../clutch-deploy && git add docker-compose.treasury.yml CLAUDE.md && git comm
 ### Task 11: Branch cleanup before the final review
 
 **Files:**
-- Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list)
+- Modify: `crates/payment-orchestrator/src/api.rs` (unit tests for `canonical_clt_address`; CORS header list), `crates/payment-orchestrator/src/custody.rs` (line 1 summary only)
 - Modify: `crates/treasury-service/src/sweeper.rs` (warn on unswept rows without a derivation_index), `crates/treasury-service/tests/db_sweeper.rs` (stale comments + one new test), `crates/treasury-service/tests/db_tron_verifier.rs` (stale comments only)
 - Modify: `crates/payment-orchestrator/tests/db_derivation_index.rs` (one test rename)
 
@@ -1219,8 +1219,9 @@ documents.
 
 - [ ] **Step 3: Fix comments that cite constraints Task 3 dropped**
 
-`db_sweeper.rs` (around lines 17 and 261 at the time of writing) and `db_tron_verifier.rs` (around
-line 430) still explain behaviour in terms of `uq_mint_intents_deposit_address` /
+`payment-orchestrator/src/custody.rs` line 1 (`//! Watching per-intent deposit addresses ...` — the Task 7
+review rewrote the body of that module doc but this summary line was missed), `db_sweeper.rs` (around lines 17
+and 261 at the time of writing) and `db_tron_verifier.rs` (around line 430) still explain behaviour in terms of `uq_mint_intents_deposit_address` /
 `uq_deposit_address`, which no longer exist. Re-read each comment against what the test actually
 asserts now and rewrite it in one or two sentences. Do not change any test logic; if a test's
 assertion itself turns out to depend on a dropped constraint, STOP and report it instead of editing.
