@@ -1261,6 +1261,52 @@ CI. Then one commit: `chore(treasury): branch cleanup — validator unit tests, 
 
 ---
 
+### Task 12: Paginate TronGrid so a full page cannot drop a deposit
+
+**Files:**
+- Modify: `crates/payment-orchestrator/src/custody.rs` (`transfers_to`, `Trc20Response`)
+- Test: `crates/payment-orchestrator/tests/db_poller.rs` or the existing wiremock suite that exercises `TronGridWatcher` (read where `transfers_to` is tested today and add there)
+
+- Consumes: `TronGridWatcher::transfers_to(address, min_timestamp_ms)` (Task 5), `TieredPoller` stamping (Task 5).
+- Produces: `transfers_to` follows TronGrid's `meta.fingerprint` cursor until a short page, bounded by a page cap.
+
+**Why (R20).** `transfers_to` asks for `limit=200` and, on a full page, only `tracing::warn!`s and returns the
+newest 200 (custody.rs ~163). `TieredPoller` then stamps `last_polled_at = now()` for that address
+regardless, so on the next pass `min_timestamp = now - 1h` and anything older than those 200 rows is
+never requested again. The funds sit at the derived address with no `deposit_intents` row — not swept
+(the sweeper keys on rows), not in the reserve sum (`unswept_addresses` derives from rows), invisible
+except for one warn line. The realistic trigger is not 200 real deposits; it is dust-spam: zero-value
+TRC-20 transfers to a victim's address are cheap on TRON and fill the page before `rows_to_transfers`
+filters them. Same cap existed under the per-intent model; permanence makes the loss permanent.
+
+- [ ] **Step 1: Write the failing test**
+
+Two wiremock responses for the same address: the first request (no `fingerprint` query param) returns
+exactly 200 rows — dust, `value: "0"`, or any filler — plus `meta: {"fingerprint": "abc"}`; the second
+request (query `fingerprint=abc`) returns one real transfer to the address with `meta` lacking a
+fingerprint. Assert `transfers_to` returns that transfer. Against the current code the test fails: the
+second page is never requested.
+
+A second test: a response whose `meta.fingerprint` is present on every page (a misbehaving or
+adversarial upstream) must stop after the page cap with an `Err` naming the address and the cap — not
+loop forever, and not return `Ok` with a silently partial result.
+
+- [ ] **Step 2: Paginate**
+
+Add `meta: Option<Trc20Meta>` (`fingerprint: Option<String>`) to `Trc20Response`. In `transfers_to`, loop:
+send the request (with `fingerprint` when you have one), append `data`, stop when `data.len() < 200` or
+`meta.fingerprint` is absent; otherwise continue with the new fingerprint. Cap at `MAX_PAGES` (10 —
+2,000 rows per address per poll; put the reasoning in a comment: beyond that something is wrong and a
+partial `Ok` would be a silent loss, so return `Err`). `TieredPoller` already logs an `Err` per address
+and still stamps it — that is acceptable here because an `Err` is loud and the address is re-polled with
+the same one-hour overlap; document that in the comment rather than changing the stamping.
+
+- [ ] **Step 3: Verify and commit**
+
+CI. Then one commit: `fix(orchestrator): follow TronGrid's fingerprint cursor so a full page cannot drop a deposit`.
+
+---
+
 ## Rollout
 
 **Deploy A — after Task 3.** Behaviour-neutral. Then **verify reconciliation reads `ok`** via
