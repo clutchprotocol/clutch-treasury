@@ -80,16 +80,6 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<DepositIntent>
         .await
 }
 
-/// Historical lookup key: the webhook and per-invoice refetch both keyed on
-/// `invoice_id`, never on our own `id`. An invoice_id no row holds returns `None` — the
-/// caller's job (spam resistance: store nothing, call nothing for an unknown id).
-pub async fn find_by_invoice_id(pool: &PgPool, invoice_id: &str) -> Result<Option<DepositIntent>, sqlx::Error> {
-    sqlx::query_as::<_, DepositIntent>(&format!("SELECT {INTENT_COLS} FROM deposit_intents WHERE invoice_id = $1"))
-        .bind(invoice_id)
-        .fetch_optional(pool)
-        .await
-}
-
 /// Records the on-chain tx id once the custody poller matches a transfer to this intent.
 /// `WHERE tron_tx_id IS NULL` keeps the first-seen hash rather than letting a later refetch
 /// (e.g. the poller re-confirming an already-confirmed intent) overwrite it.

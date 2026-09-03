@@ -35,6 +35,12 @@ async fn health() -> Json<serde_json::Value> {
 /// because this service is Axum, not Actix, but the origin-parsing rule is identical.
 /// Must explicitly allow `Authorization` (the JWT bearer token) since the specific-origins
 /// branch can't use a header wildcard.
+///
+/// `idempotency-key` is ALSO explicitly allowed even though no route reads it any more (R25):
+/// stage's `ALLOWED_ORIGINS` takes the specific-origins branch, so the header list is enforced on
+/// preflight, and the demo app still deployed there sends `Idempotency-Key` on every deposit POST.
+/// Dropping it here would turn the deposit route's clean 503 into a browser-blocked CORS preflight
+/// failure during the rollout window. Remove it only once no deployed UI sends it.
 fn build_cors(allowed_origins: &str) -> CorsLayer {
     let layer = CorsLayer::new().allow_methods([Method::GET, Method::POST, Method::OPTIONS]);
 
@@ -52,6 +58,8 @@ fn build_cors(allowed_origins: &str) -> CorsLayer {
             .allow_headers(AllowHeaders::list([
                 HeaderName::from_static("authorization"),
                 HeaderName::from_static("content-type"),
+                // Kept for clients that still send it — see this function's doc comment.
+                HeaderName::from_static("idempotency-key"),
             ]))
     }
 }

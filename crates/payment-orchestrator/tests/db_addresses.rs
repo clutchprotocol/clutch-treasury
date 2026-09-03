@@ -66,7 +66,7 @@ async fn two_users_get_different_addresses() {
 }
 
 #[tokio::test]
-async fn address_for_user_never_reissues_an_index_already_burned_by_a_legacy_deposit() {
+async fn address_for_user_draws_indexes_after_any_already_burned_by_nextval() {
     // Legacy per-intent addresses already hold issued indexes. Reusing one would hand a new user an
     // address a previous depositor was told to pay into.
     let pool = pool().await;

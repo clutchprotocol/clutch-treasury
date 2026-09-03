@@ -1,8 +1,8 @@
 //! The user-facing off-ramp (Plan C T6): a thin proxy in front of the treasury's existing
 //! `POST /internal/redemption-intents`. This module owns Tron address validation, the bounds
 //! check, the HTTP call to the treasury, and the `(user_pk, treasury_intent_id)` mapping row —
-//! `api.rs` only extracts the request and translates the outcome into a status code, same
-//! split as `deposits.rs`/`create_and_invoice`.
+//! `api.rs` only extracts the request and translates the outcome into a status code, same split
+//! `api.rs` uses for the deposit routes (`addresses::address_for_user` owns that logic).
 //!
 //! **`redeemer_address` is never read from the request body.** It comes from the caller's
 //! authenticated JWT `pk` (same class of requirement as treasury's own `created_by` on mint

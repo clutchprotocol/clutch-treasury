@@ -61,7 +61,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, deposit_addresses RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -187,15 +187,6 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
 #[tokio::test]
 async fn the_beneficiary_is_the_authenticated_identity_not_the_body() {
     let pool = pool().await;
-    // `pool()` only truncates deposit_intents; deposit_addresses persists across every test in
-    // this file. `address_for_user` returns an EXISTING row for USER_A without ever looking at
-    // clt_address again — so without this, a run where another test claims USER_A first would
-    // make this assertion pass regardless of whether the handler still reads the body.
-    sqlx::query("DELETE FROM deposit_addresses WHERE user_pk = $1")
-        .bind(USER_A)
-        .execute(&pool)
-        .await
-        .unwrap();
     let treasury = mock_treasury_with_generous_headroom().await;
     let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config);
@@ -332,9 +323,9 @@ async fn missing_auth_returns_401() {
 /// `Authorization` header ALSO 503s rather than 401ing — the only case where the two orderings
 /// diverge, which is what actually proves the gate runs first.
 ///
-/// Uses its own pk rather than `USER_A`: `deposit_addresses` persists across every test in this
-/// file (see `the_beneficiary_is_the_authenticated_identity_not_the_body`'s comment), and the gate
-/// fires before `canonical_clt_address` ever runs, so an address-shaped token isn't needed either.
+/// Uses its own pk rather than `USER_A`, to stay independent of whatever other tests do with that
+/// identity, and the gate fires before `canonical_clt_address` ever runs, so an address-shaped
+/// token isn't needed either.
 #[tokio::test]
 async fn deposit_route_503s_while_disabled_even_with_valid_auth() {
     const USER_DISABLED: &str = "0xflag-disabled-test-user";
