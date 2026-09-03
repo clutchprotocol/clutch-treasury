@@ -1,3 +1,4 @@
+pub mod addresses;
 pub mod alerts;
 pub mod api;
 pub mod auth;
