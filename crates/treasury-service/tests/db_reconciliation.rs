@@ -1,6 +1,9 @@
 use sqlx::PgPool;
 use treasury_service::reconciliation::{judge, record, Sources};
 
+/// A real, base58check-valid derived address — the same fixture value db_sweeper.rs's ADDRS uses.
+const SHARED_ADDR: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+
 /// Own database per test binary: --test-threads=1 only serialises tests WITHIN a binary, and cargo
 /// runs binaries in parallel while every pool() here TRUNCATEs shared tables.
 async fn pool() -> PgPool {
@@ -249,4 +252,39 @@ async fn a_reversed_mint_subtracts_from_liability() {
     .execute(&pool)
     .await;
     assert!(twice.is_err(), "an intent must not be reversible twice");
+}
+
+/// Inserts a `credited`, unswept mint intent at `address` evidenced by `tx_id`. Names every NOT NULL
+/// column mint_intents has with no default (`beneficiary`, `amount_clt`, `credit_ref`, `created_by`)
+/// plus `approved_by`, since four_eyes requires a distinct approver past `created`. `swept_at` is
+/// omitted so it takes its NULL default — the "still unswept" state this test needs.
+async fn seed_unswept_mint(pool: &PgPool, address: &str, tx_id: &str) {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents (id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by,
+                                    deposit_tx_id, deposit_address)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', 1000000, 'credited', $2, 'orchestrator', 'tron-verifier',
+                 $3, $4)",
+    )
+    .bind(id)
+    .bind(format!("ref-{id}"))
+    .bind(tx_id)
+    .bind(address)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Per-user deposit addresses make this the NORMAL case: one user, several deposits, one address.
+/// Counting per row inflates the reserve, and an over-backed reading licenses mints that nothing
+/// backs — strictly worse than under-counting, which only halts minting.
+#[tokio::test]
+async fn one_address_on_two_unswept_rows_is_counted_once() {
+    let pool = pool().await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-a").await;
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-b").await;
+
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+
+    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "one address, counted once");
 }
