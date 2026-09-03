@@ -75,54 +75,6 @@ pub trait DepositWatcher: Send + Sync {
     async fn poll(&self) -> Result<Vec<ObservedTransfer>, String>;
 }
 
-/// What the observed transfers to an intent's address add up to.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PaymentOutcome {
-    /// Nothing has arrived at this address yet.
-    None,
-    /// Something arrived but it is short of the expected amount. NOT creditable — crediting the
-    /// expected amount here would mint CLT the deposit does not back.
-    Partial { received_usdt: i64 },
-    /// At least the expected amount arrived. `tx_id` is the EARLIEST contributing transfer, which
-    /// is the evidence the treasury's verifier re-checks independently.
-    Settled { tx_id: String, received_usdt: i64 },
-}
-
-/// Decide an intent's payment state from the transfers observed at its address.
-///
-/// Amounts are SUMMED over distinct transaction ids, so a payer who sends in two parts settles once
-/// both land. Duplicate ids are collapsed: the same transfer appearing twice in a response (or
-/// across a retry) must not count twice, or a single payment could satisfy twice its value.
-///
-/// Overpayment settles at the observed total, deliberately. The ledger records what arrived, not
-/// what was intended — the reconciliation cross-check compares against custody, so recording the
-/// intended figure would build in a permanent discrepancy.
-pub fn evaluate_payment(transfers: &[ObservedTransfer], expected_amount_usdt: i64) -> PaymentOutcome {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut total: i64 = 0;
-    let mut earliest: Option<&ObservedTransfer> = None;
-
-    for t in transfers {
-        if seen.contains(&t.tx_id.as_str()) {
-            continue;
-        }
-        seen.push(&t.tx_id);
-        // Saturating: a hostile or corrupt amount must not wrap into something that looks settled.
-        total = total.saturating_add(t.amount_usdt);
-        if earliest.is_none_or(|e| t.block_timestamp < e.block_timestamp) {
-            earliest = Some(t);
-        }
-    }
-
-    match earliest {
-        None => PaymentOutcome::None,
-        Some(e) if total >= expected_amount_usdt => {
-            PaymentOutcome::Settled { tx_id: e.tx_id.clone(), received_usdt: total }
-        }
-        Some(_) => PaymentOutcome::Partial { received_usdt: total },
-    }
-}
-
 pub struct TronGridWatcher {
     http: reqwest::Client,
     base_url: String,
@@ -258,68 +210,6 @@ mod tests {
 
     fn t(tx: &str, amount: i64, ts: i64) -> ObservedTransfer {
         ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: ADDR.into(), contract: USDT.into(), block_timestamp: ts }
-    }
-
-    #[test]
-    fn nothing_observed_is_none() {
-        assert_eq!(evaluate_payment(&[], 1_000_000), PaymentOutcome::None);
-    }
-
-    #[test]
-    fn exact_amount_settles() {
-        let got = evaluate_payment(&[t("a", 1_000_000, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "a".into(), received_usdt: 1_000_000 });
-    }
-
-    /// A rounded payment settles now, where the amount discriminator would have left it unmatched
-    /// and stranded. This is the practical win of address-based identity.
-    #[test]
-    fn a_rounded_payment_settles_instead_of_stranding() {
-        let got = evaluate_payment(&[t("round", 1_000_000, 10)], 1_000_000);
-        assert!(matches!(got, PaymentOutcome::Settled { .. }));
-    }
-
-    /// Overpayment records what ARRIVED, not what was intended — the reconciliation cross-check
-    /// compares the ledger against custody, so recording the intended figure builds in a permanent
-    /// discrepancy.
-    #[test]
-    fn overpayment_settles_at_the_observed_total() {
-        let got = evaluate_payment(&[t("over", 5_000_000, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "over".into(), received_usdt: 5_000_000 });
-    }
-
-    /// Underpayment must NOT settle. Crediting the expected amount here mints CLT the deposit does
-    /// not back.
-    #[test]
-    fn underpayment_is_partial_never_settled() {
-        let got = evaluate_payment(&[t("short", 999_999, 10)], 1_000_000);
-        assert_eq!(got, PaymentOutcome::Partial { received_usdt: 999_999 });
-    }
-
-    #[test]
-    fn two_part_payment_settles_once_the_sum_reaches_expected() {
-        let parts = vec![t("p1", 400_000, 10), t("p2", 600_000, 20)];
-        let got = evaluate_payment(&parts, 1_000_000);
-        assert_eq!(got, PaymentOutcome::Settled { tx_id: "p1".into(), received_usdt: 1_000_000 },
-                   "evidence must name the EARLIEST contributing transfer");
-    }
-
-    /// The same transfer seen twice — a duplicated response, or a retry — must not count twice, or
-    /// one payment could satisfy twice its value.
-    #[test]
-    fn a_duplicate_transaction_id_is_counted_once() {
-        let dupes = vec![t("same", 600_000, 10), t("same", 600_000, 10)];
-        assert_eq!(evaluate_payment(&dupes, 1_000_000), PaymentOutcome::Partial { received_usdt: 600_000 });
-    }
-
-    /// A corrupt or hostile amount must not wrap into something that looks settled.
-    #[test]
-    fn absurd_amounts_saturate_rather_than_overflow() {
-        let huge = vec![t("h1", i64::MAX, 10), t("h2", i64::MAX, 20)];
-        match evaluate_payment(&huge, 1_000_000) {
-            PaymentOutcome::Settled { received_usdt, .. } => assert_eq!(received_usdt, i64::MAX),
-            other => panic!("expected saturated Settled, got {other:?}"),
-        }
     }
 
     #[test]

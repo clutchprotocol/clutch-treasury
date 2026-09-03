@@ -1,4 +1,5 @@
-//! The detection path: poll each open intent's own deposit address and credit what has arrived.
+//! The detection path: poll every user's permanent deposit address, plus any still-open legacy
+//! per-intent address, and credit what has arrived.
 //!
 //! There is no webhook any more, so this timer is not a latency optimisation over another path — it
 //! is the only path, which is simpler to reason about than the previous arrangement where a webhook
@@ -6,6 +7,11 @@
 //!
 //! Ordering inside a pass is deliberate: match BEFORE sweeping expiry, so a payment that landed
 //! moments before the TTL is credited rather than raced into `expired` by our own timer.
+//!
+//! `poll_once` is two independent loops — permanent per-user addresses (a), then legacy per-intent
+//! addresses (b) — followed by the expiry sweep and window close. Every stage runs every pass
+//! regardless of whether an earlier one hit a snag, so one bad address or one bad row never starves
+//! the rest.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +20,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::alerts::alert;
-use crate::custody::{evaluate_payment, CustodyWatcher, DepositWatcher, ObservedTransfer, PaymentOutcome};
+use crate::custody::{CustodyWatcher, DepositWatcher, ObservedTransfer};
 use crate::deposits;
 
 /// How long past expiry an address keeps being watched for a late payment.
@@ -25,38 +31,127 @@ use crate::deposits;
 /// late-broadcast transfer is credited rather than silently stranded.
 const WATCH_WINDOW_HOURS: i64 = 24;
 
-/// Addresses polled per pass.
+/// Per-user addresses polled per pass — the budget `main.rs` hands to `TieredPoller`.
 ///
 /// One TronGrid request per address is unavoidable: Tron cannot watch an xpub as a group, so derived
-/// addresses have to be queried individually. Only OPEN intents are polled, which bounds this by
-/// in-flight deposits rather than by intents ever created — but a burst still has to degrade
-/// gracefully instead of hammering an unkeyed endpoint into throttling, which looks exactly like
-/// "nobody is paying". That failure mode has already cost a day of debugging once.
+/// addresses have to be queried individually. Permanent addresses are never "closed" the way intents
+/// were, so nothing shrinks this set on its own — see `due_addresses`, which is what turns this into
+/// a rotating budget instead of an ever-growing one. A burst still has to degrade gracefully instead
+/// of hammering an unkeyed endpoint into throttling, which looks exactly like "nobody is paying".
+/// That failure mode has already cost a day of debugging once.
 ///
-/// Hitting the cap is LOGGED, never silent: a quietly truncated pass reads as "no payments found".
-const MAX_ADDRESSES_PER_PASS: i64 = 50;
+/// `pub`: `main.rs` builds `TieredPoller`'s budget from this number rather than a second guess.
+pub const MAX_ADDRESSES_PER_PASS: i64 = 50;
 
-/// One pass: poll each open deposit address, credit or flag what arrived, then expire and close.
-pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
+/// Legacy per-intent rows polled per pass. Capped separately from `MAX_ADDRESSES_PER_PASS` so a
+/// legacy backlog can never crowd out the per-user budget — stage has 28 such rows today and the set
+/// only shrinks (new deposits go through the per-user address path exclusively). Hitting the cap is
+/// LOGGED, never silent: a quietly truncated pass reads as "no payments found".
+const MAX_LEGACY_INTENTS_PER_PASS: i64 = 50;
+
+/// Record one observed transfer as its own deposit.
+///
+/// Returns `Ok(false)` when the transaction was already recorded. That is the normal case, not an
+/// error: a poll pass re-reads an address's recent history every rotation, so the same transfer is
+/// seen many times. `uq_deposit_intents_tron_tx_id` is what makes re-observation free.
+///
+/// The amount credited is what ARRIVED. There is no expected figure to reconcile against any more —
+/// the user was never asked for one.
+pub async fn credit_transfer(
+    pool: &PgPool,
+    user_pk: &str,
+    clt_address: &str,
+    t: &ObservedTransfer,
+) -> Result<bool, String> {
+    let done = sqlx::query(
+        // client_key is NOT NULL and was the user's idempotency key when users created intents. The
+        // chain creates them now, so the tx id IS the idempotency key — and it makes the pre-existing
+        // UNIQUE (user_pk, client_key) a second guard behind uq_deposit_intents_tron_tx_id.
+        // expires_at is NOT NULL and meaningless for an observed transfer; now() reads as "already
+        // settled" rather than inventing a deadline nothing enforces. pay_amount_usdt (dropped in
+        // migration 0008) is gone, and the address/derivation-index uniqueness (dropped in migration
+        // 0011) no longer applies — nothing else this table still requires NOT NULL is missing here.
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
+             deposit_address, tron_tx_id, received_usdt, expires_at)
+         VALUES ($1, $2, $6, $3, $3, 'confirmed', $5, $4, $5, $3, now())
+         ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(user_pk)
+    .bind(t.amount_usdt)
+    .bind(&t.to)
+    .bind(&t.tx_id)
+    .bind(clt_address)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("crediting {}: {e}", t.tx_id))?;
+
+    Ok(done.rows_affected() == 1)
+}
+
+/// Who owns a permanent address, if `to` is one. `Ok(None)` means it is not a `deposit_addresses`
+/// row at all — a legacy per-intent address, which loop (b) of `poll_once` owns instead.
+async fn user_for_address(pool: &PgPool, to: &str) -> Result<Option<(String, String)>, String> {
+    sqlx::query_as::<_, (String, String)>("SELECT user_pk, clt_address FROM deposit_addresses WHERE address = $1")
+        .bind(to)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("resolving the owner of {to}: {e}"))
+}
+
+/// Loop (a): one pass over the permanent per-user addresses. `watcher.poll()` already selected which
+/// addresses were due and stamped `last_polled_at` for all of them (`TieredPoller`) — this function
+/// never learns how the transfers it is handed were found, which is the point of the seam.
+///
+/// A transfer to an address with no `deposit_addresses` row is not an error — it is a legacy
+/// per-intent address, left to loop (b). A failure crediting one transfer must not stop the rest.
+pub async fn credit_from_addresses(pool: &PgPool, watcher: &dyn DepositWatcher) -> Result<(), String> {
+    let transfers = watcher.poll().await?;
+    for t in &transfers {
+        match user_for_address(pool, &t.to).await {
+            Ok(Some((user_pk, clt_address))) => {
+                if let Err(e) = credit_transfer(pool, &user_pk, &clt_address, t).await {
+                    tracing::error!("poller: failed to credit {}: {e}", t.tx_id);
+                }
+            }
+            Ok(None) => {} // a legacy per-intent address; loop (b) owns it.
+            Err(e) => tracing::error!("poller: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// One pass: credit every transfer arriving at a permanent per-user address (a) or a still-open
+/// legacy per-intent address (b), then expire and close. Neither loop's failure blocks the other,
+/// and both are attempted — success or failure — before the expiry sweep and window close run.
+pub async fn poll_once(pool: &PgPool, watcher: &dyn DepositWatcher, legacy: &dyn CustodyWatcher) {
+    // (a) Permanent per-user addresses.
+    if let Err(e) = credit_from_addresses(pool, watcher).await {
+        tracing::error!("poller: per-user address pass failed: {e}");
+    }
+
+    // (b) Legacy per-intent addresses — discriminator-era rows, which migration 0007 could not
+    // backfill an address for, stay NULL and are skipped by due_intents; every other still-open
+    // intent is watched here until its payment window closes. When due_intents returns nothing for
+    // good, this whole block is dead code and can be deleted along with due_intents.
     let due = match due_intents(pool).await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!("poller: failed to select payable intents: {e}");
-            return;
+            Vec::new()
         }
     };
-    if due.len() as i64 == MAX_ADDRESSES_PER_PASS {
+    if due.len() as i64 == MAX_LEGACY_INTENTS_PER_PASS {
         tracing::warn!(
-            "poller: hit the {MAX_ADDRESSES_PER_PASS}-address cap this pass — oldest open intents \
-             are polled first and newer ones wait a tick. Sustained load here needs a TronGrid API \
-             key and a higher cap."
+            "poller: hit the {MAX_LEGACY_INTENTS_PER_PASS}-legacy-intent cap this pass — the legacy \
+             set should only be shrinking; if it is not, something is stopping intents from \
+             confirming or their windows from closing."
         );
     }
 
-    for (id, address, expected_amount_usdt) in due {
-        // A later task replaces this whole body with TieredPoller/due_addresses; for now the
-        // per-intent query is unchanged and simply passes the new bound as unset.
-        let transfers = match watcher.transfers_to(&address, None).await {
+    for (id, address) in due {
+        let transfers = match legacy.transfers_to(&address, None).await {
             Ok(t) => t,
             Err(e) => {
                 // Transient by assumption: TronGrid down, throttled, or a blip. Nothing is persisted
@@ -67,71 +162,34 @@ pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
             }
         };
 
-        match evaluate_payment(&transfers, expected_amount_usdt) {
-            PaymentOutcome::None => {}
+        // "Credit everything, cap nothing" applies here too: there is no expected amount to compare
+        // against any more, so the first (earliest) unseen transfer settles the intent at its own
+        // arrived amount. `Partial` — held, not credited, because it fell short of a promised figure
+        // — no longer means anything, because nothing is promised.
+        let Some(earliest) = transfers.iter().min_by_key(|t| t.block_timestamp) else {
+            continue;
+        };
+        let tx_id = &earliest.tx_id;
+        let received_usdt = earliest.amount_usdt;
 
-            // Money arrived but is short. Deliberately NOT credited: crediting the expected amount
-            // would mint CLT the deposit does not back. Held at `paying` so a second instalment can
-            // still settle it, and flagged so a human knows funds are sitting there.
-            //
-            // Under amount-matching this case was inexpressible — a short payment matched nothing
-            // and stranded with no record at all.
-            PaymentOutcome::Partial { received_usdt } => {
-                let _ = deposits::transition(pool, id, &["created", "invoiced", "expired"], "paying").await;
-                alert(
-                    pool,
-                    "warn",
-                    "poller",
-                    &format!(
-                        "deposit {id} underpaid: {received_usdt} of {expected_amount_usdt} micro-USDT \
-                         at {address} — held, not credited"
-                    ),
-                )
-                .await;
+        // Store the evidence FIRST. If this process dies here, the next pass reaches the same
+        // conclusion and stores the same hash; transitioning first could leave a `confirmed` intent
+        // with no evidence recorded, which the treasury's verifier would then have to resolve down
+        // its weaker no-hash path.
+        if let Err(e) = deposits::set_tron_tx_id(pool, id, tx_id).await {
+            tracing::error!("poller: failed to store tx id for intent {id}: {e}");
+            continue;
+        }
+        if let Err(e) = deposits::set_received_usdt(pool, id, received_usdt).await {
+            tracing::error!("poller: failed to store received amount for intent {id}: {e}");
+            continue;
+        }
+        match deposits::transition(pool, id, &["created", "invoiced", "paying", "expired"], "confirmed").await {
+            Ok(true) => {
+                tracing::info!("deposit {id} confirmed: {received_usdt} micro-USDT at {address} in {tx_id}")
             }
-
-            PaymentOutcome::Settled { tx_id, received_usdt } => {
-                // Store the evidence FIRST. If this process dies here, the next pass reaches the
-                // same conclusion and stores the same hash; transitioning first could leave a
-                // `confirmed` intent with no evidence recorded, which the treasury's verifier would
-                // then have to resolve down its weaker no-hash path.
-                if let Err(e) = deposits::set_tron_tx_id(pool, id, &tx_id).await {
-                    tracing::error!("poller: failed to store tx id for intent {id}: {e}");
-                    continue;
-                }
-                // What arrived is what gets credited, so it has to be persisted before the intent
-                // advances. Previously this figure was logged and dropped: the bridge then sent the
-                // REQUESTED amount, and an overpayment left the difference in the treasury with
-                // nothing recording that we owed it.
-                if let Err(e) = deposits::set_received_usdt(pool, id, received_usdt).await {
-                    tracing::error!("poller: failed to store received amount for intent {id}: {e}");
-                    continue;
-                }
-                match deposits::transition(pool, id, &["created", "invoiced", "paying", "expired"], "confirmed").await
-                {
-                    Ok(true) => {
-                        tracing::info!("deposit {id} confirmed: {received_usdt} micro-USDT at {address} in {tx_id}")
-                    }
-                    Ok(false) => {} // already past `confirmed`; nothing to do.
-                    Err(e) => tracing::error!("poller: failed to confirm intent {id}: {e}"),
-                }
-                if received_usdt > expected_amount_usdt {
-                    // Says "recorded", not "credited": crediting happens downstream in the bridge
-                    // and the treasury's caps can still refuse it. The old wording claimed the
-                    // excess had been credited while nothing carried the figure anywhere at all,
-                    // so the one alert that could have caught the shortfall asserted it was fine.
-                    alert(
-                        pool,
-                        "warn",
-                        "poller",
-                        &format!(
-                            "deposit {id} overpaid: {received_usdt} vs {expected_amount_usdt} micro-USDT \
-                             at {address} — recorded as received; the credit is for the full amount"
-                        ),
-                    )
-                    .await;
-                }
-            }
+            Ok(false) => {} // already past `confirmed`; nothing to do.
+            Err(e) => tracing::error!("poller: failed to confirm intent {id}: {e}"),
         }
     }
 
@@ -139,23 +197,24 @@ pub async fn poll_once(pool: &PgPool, watcher: &dyn CustodyWatcher) {
     close_stale_watch_windows(pool).await;
 }
 
-/// Intents that can still take a payment, oldest first, capped.
+/// Legacy intents that can still take a payment, oldest first, capped.
 ///
 /// `expired` is included on purpose: our expiry is a soft local timer and at par there is no FX risk
 /// in honouring a late payment. An address stops being watched when its window closes, not when the
 /// TTL lapses.
 ///
-/// `deposit_address IS NOT NULL` skips discriminator-era rows, which have no address to poll.
-async fn due_intents(pool: &PgPool) -> Result<Vec<(uuid::Uuid, String, i64)>, sqlx::Error> {
-    sqlx::query_as::<_, (uuid::Uuid, String, i64)>(
-        "SELECT id, deposit_address, amount_usdt FROM deposit_intents
+/// `deposit_address IS NOT NULL` is what makes this query "legacy": every row a permanent address
+/// (Task 5) covers stays NULL here and is credited through loop (a) instead.
+async fn due_intents(pool: &PgPool) -> Result<Vec<(uuid::Uuid, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, deposit_address FROM deposit_intents
          WHERE deposit_address IS NOT NULL
            AND NOT payment_window_closed
            AND status IN ('created', 'invoiced', 'paying', 'expired')
          ORDER BY created_at ASC
          LIMIT $1",
     )
-    .bind(MAX_ADDRESSES_PER_PASS)
+    .bind(MAX_LEGACY_INTENTS_PER_PASS)
     .fetch_all(pool)
     .await
 }
@@ -198,11 +257,16 @@ async fn close_stale_watch_windows(pool: &PgPool) {
 }
 
 /// Spawned once from `main.rs`; runs forever on `poll_interval_secs`.
-pub async fn run(pool: PgPool, watcher: Arc<dyn CustodyWatcher>, poll_interval_secs: u64) {
+pub async fn run(
+    pool: PgPool,
+    watcher: Arc<dyn DepositWatcher>,
+    legacy: Arc<dyn CustodyWatcher>,
+    poll_interval_secs: u64,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
     loop {
         interval.tick().await;
-        poll_once(&pool, watcher.as_ref()).await;
+        poll_once(&pool, watcher.as_ref(), legacy.as_ref()).await;
     }
 }
 
