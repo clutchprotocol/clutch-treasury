@@ -157,6 +157,21 @@ async fn in_flight_mint_amount(pool: &PgPool) -> Result<i64, sqlx::Error> {
     Ok(sum.unwrap_or(0))
 }
 
+/// Every address still holding an unswept deposit, each counted ONCE.
+///
+/// DISTINCT is load-bearing, not tidiness. `get_reserve_balance` sums every entry it is handed, and
+/// per-user deposit addresses mean one address legitimately appears on many unswept rows. Summing
+/// per row inflates the reserve — and an over-backed reading is the dangerous direction, because it
+/// licenses minting that nothing backs. Under-counting merely halts minting, loudly.
+pub async fn unswept_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT deposit_address FROM mint_intents
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND status IN ('approved', 'submitted', 'credited')",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn run_once(
     pool: &PgPool,
     node: &Arc<NodeClient>,
@@ -171,13 +186,7 @@ pub async fn run_once(
     // Every address that still holds an unswept deposit. Read from our OWN rows — the orchestrator's
     // database is not reachable from here, and mint_intents.deposit_address is the record of which
     // addresses this service has ever approved a deposit at.
-    let unswept: Vec<String> = sqlx::query_scalar(
-        "SELECT deposit_address FROM mint_intents
-         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND status IN ('approved', 'submitted', 'credited')",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_else(|e| {
+    let unswept: Vec<String> = unswept_addresses(pool).await.unwrap_or_else(|e| {
         // Not fatal: the sum below just covers fewer addresses, and this is a cross-check.
         tracing::warn!("reconciliation: could not list unswept deposit addresses: {e}");
         Vec::new()
