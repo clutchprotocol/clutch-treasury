@@ -1041,7 +1041,16 @@ Keep the warning that only Nile USDT (TRC-20) is creditable — that text is unc
 and remains true.
 
 Remove any copy implying an exact figure must be sent, including the "minimum" wording added
-earlier: there is no minimum any more.
+earlier: there is no minimum any more. Also remove the discriminator-era copy about an "exact
+`pay_amount_usdt`" — that mechanism is long gone and the words are simply false now.
+
+**Remove the per-intent status polling.** The panel currently POSTs, keeps the returned intent `id`,
+and polls `GET /api/v1/deposits/{id}` every 5s while a deposit is "open". After this change the POST
+returns `{"address": ...}` and no id — the user never creates an intent, so there is nothing to poll
+and no "open deposit" state to track. Delete the poll loop, the `idempotencyKeyRef`, the
+`Idempotency-Key` header, and the amount input/validation. The panel's job now ends at showing the
+address; crediting appears where balances and transaction history already do. Do not invent an id to
+keep the loop alive.
 
 - [ ] **Step 2: Verify and commit**
 
