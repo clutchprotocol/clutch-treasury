@@ -1044,13 +1044,14 @@ Also remove `deposit_ttl_minutes` — verified: after Task 6 nothing in `src/` r
 Exact deletions, verified against the tree:
 - `config/default.toml` lines `deposit_ttl_minutes = 30`, `min_deposit_usdt = 1000000`, `max_deposit_usdt = 50000000`.
 - The three fields from every `OrchConfig { .. }` literal in `tests/db_bridge.rs`, `tests/db_deposit_api.rs`,
-  `tests/db_deposits.rs` — these are the only remaining readers, and a literal naming a removed field
-Also `tests/db_redemptions.rs` — it builds an `OrchConfig` literal too (3 occurrences, verified). Do not trust this list: `grep -n 'min_deposit_usdt\|max_deposit_usdt\|deposit_ttl_minutes' crates/payment-orchestrator/tests/*.rs` and fix EVERY hit, or the crate's test suites stop compiling the moment the fields leave `OrchConfig`.
+  `tests/db_deposits.rs` — these plus `tests/db_redemptions.rs` are the remaining readers, and a literal naming a removed field
   fails to compile.
 - The three `pub` fields from `OrchConfig` itself.
 Re-grep `min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes` across `crates/` afterwards; it must
 return nothing. Do NOT touch `min_redemption_clt` / `max_redemption_clt` — those are the redemption
 bounds and stay.
+
+Do not trust that list: run `grep -nE 'min_deposit_usdt|max_deposit_usdt|deposit_ttl_minutes' crates/payment-orchestrator/tests/*.rs` and fix EVERY hit (four files at the time of writing, `db_redemptions.rs` included), or the crate's test suites stop compiling the moment the fields leave `OrchConfig`.
 
 - [ ] **Step 3: Verify and commit**
 
