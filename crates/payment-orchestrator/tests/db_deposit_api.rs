@@ -1,8 +1,9 @@
-//! The two public deposit routes, exercised through the real router (auth header parsing, JSON
+//! The public deposit routes, exercised through the real router (auth header parsing, JSON
 //! extraction, handler → `addresses::address_for_user`/`mark_hot`). Task 6 retired the
 //! amount-bearing, idempotency-keyed create flow this file used to cover — and `db_deposits.rs`,
 //! which covered its module functions directly, along with it. What remains: a POST that hands
-//! back a stable address, and an owner-checked GET on an existing intent.
+//! back a stable address, an owner-checked GET on an existing intent, and a GET that lists the
+//! caller's own recent deposits.
 //!
 //! Same shared-database convention as the other `db_*.rs` files: a sibling `_orchestrator`
 //! database (sqlx's `_sqlx_migrations` bookkeeping table has no configurable name, so two
@@ -36,6 +37,11 @@ const TEST_CUSTODY: &str = "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX";
 /// `the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount` also proves the stored
 /// value was normalised to lowercase, not just accepted.
 const USER_A: &str = "0x00000000000000000000000000000000000000A1";
+
+/// A second address-shaped user, used only by the list endpoint's isolation test. Must differ
+/// from `USER_A` so seeding both and checking which rows come back actually exercises the `WHERE
+/// user_pk` clause, not just that a query ran.
+const USER_B: &str = "0x00000000000000000000000000000000000000B2";
 
 /// Unused by the deposit route itself since Task 6 — the address handler never calls the
 /// treasury at all, headroom is checked later, at mint time (`treasury_bridge.rs`), not at
@@ -126,6 +132,41 @@ async fn seed_intent(pool: &PgPool, user_pk: &str) -> Uuid {
     .bind(id)
     .bind(user_pk)
     .bind(format!("key-{id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Seeds a `deposit_intents` row directly, like `seed_intent` above, but with explicit control
+/// over the three columns the list endpoint's own tests turn on: `amount_usdt`, `received_usdt`
+/// and `tron_tx_id`, plus `created_at` so ordering and the twenty-row cap can be exercised with
+/// rows of a known age. Every NOT-NULL column without a default is still covered; `client_key` is
+/// still derived from the fresh id so `(user_pk, client_key)` stays unique across repeated calls
+/// for the same user.
+async fn seed_deposit(
+    pool: &PgPool,
+    user_pk: &str,
+    amount_usdt: i64,
+    received_usdt: Option<i64>,
+    tron_tx_id: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, expires_at,
+             received_usdt, tron_tx_id, created_at)
+         VALUES ($1, $2, 'clt1owner', $3, $4, $5, now() + interval '30 minutes', $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(user_pk)
+    .bind(amount_usdt)
+    .bind(amount_usdt)
+    .bind(format!("key-{id}"))
+    .bind(received_usdt)
+    .bind(tron_tx_id)
+    .bind(created_at)
     .execute(pool)
     .await
     .unwrap();
@@ -373,6 +414,198 @@ async fn deposit_route_503s_while_disabled_even_with_valid_auth() {
         .unwrap();
     assert_eq!(
         no_auth_res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "must 503 even with NO Authorization header — proves the gate runs before auth, not just before a valid auth check"
+    );
+}
+
+/// The load-bearing test: seeds deposits for two different users and checks that USER_A's list
+/// contains only USER_A's own rows — and that USER_B's `tron_tx_id` appears nowhere at all in the
+/// response body, not merely absent from a field we happen to inspect. Fails if
+/// `recent_for_user`'s `WHERE user_pk = $1` clause is ever dropped.
+#[tokio::test]
+async fn the_list_returns_only_the_callers_own_deposits() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let now = chrono::Utc::now();
+    seed_deposit(&pool, USER_A, 1_000_000, None, "tx-user-a-first", now).await;
+    seed_deposit(&pool, USER_A, 2_000_000, None, "tx-user-a-second", now).await;
+    seed_deposit(&pool, USER_B, 9_000_000, None, "tx-user-b-secret", now).await;
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_json(res).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        !body.to_string().contains("tx-user-b-secret"),
+        "the other user's tron_tx_id must appear nowhere in the response body"
+    );
+
+    let rows = body["deposits"].as_array().expect("deposits must be an array");
+    assert_eq!(rows.len(), 2, "only USER_A's own two deposits, none of USER_B's");
+    let tx_ids: Vec<&str> = rows.iter().map(|r| r["tron_tx_id"].as_str().unwrap()).collect();
+    assert!(tx_ids.contains(&"tx-user-a-first"));
+    assert!(tx_ids.contains(&"tx-user-a-second"));
+}
+
+/// Seeds twenty-one rows with distinct `created_at` values and checks both ends of the ordering:
+/// the newest row must come first, and the oldest of the twenty-one must be dropped entirely, not
+/// merely pushed past a slice that still contains it.
+#[tokio::test]
+async fn the_list_is_newest_first_and_capped_at_twenty() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let base = chrono::Utc::now();
+    for i in 0i64..21 {
+        // i = 0 is the oldest row, i = 20 the newest.
+        let tx_id = format!("tx-{i:02}");
+        seed_deposit(&pool, USER_A, 1_000_000, None, &tx_id, base + chrono::Duration::seconds(i)).await;
+    }
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_json(res).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = body["deposits"].as_array().expect("deposits must be an array");
+    assert_eq!(rows.len(), 20, "must cap at twenty even though twenty-one rows exist");
+    assert_eq!(rows[0]["tron_tx_id"].as_str().unwrap(), "tx-20", "the first row must be the newest");
+    assert!(
+        rows.iter().all(|r| r["tron_tx_id"].as_str().unwrap() != "tx-00"),
+        "the oldest row must be excluded by the LIMIT, not merely sorted last"
+    );
+}
+
+/// `received_usdt` is what actually arrived; `amount_usdt` alone is only what was once asked for.
+/// The response's `amount_usdt` must report the former whenever it is set.
+#[tokio::test]
+async fn the_list_reports_what_arrived_not_what_was_asked_for() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    seed_deposit(&pool, USER_A, 20_000_000, Some(25_000_000), "tx-overpaid", chrono::Utc::now()).await;
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_json(res).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = body["deposits"].as_array().expect("deposits must be an array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["amount_usdt"].as_i64().unwrap(),
+        25_000_000,
+        "amount_usdt must report what arrived (received_usdt), not what was asked for"
+    );
+}
+
+/// A user with no deposits gets a normal 200 and an empty list — never a 404, which would read as
+/// "we don't know who you are" rather than "you have no history yet".
+#[tokio::test]
+async fn an_empty_list_is_two_hundred_not_a_miss() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_json(res).await;
+    assert_eq!(status, StatusCode::OK, "no deposits is not an error");
+    assert_eq!(body, json!({"deposits": []}), "an empty list, not a missing field or null");
+}
+
+/// `permanent_deposit_addresses_enabled` gates this route exactly like it gates the POST (see
+/// `deposit_route_503s_while_disabled_even_with_valid_auth`): 503 before authentication even runs.
+/// Proven with two requests — a valid bearer token 503s, and a request with NO `Authorization`
+/// header ALSO 503s rather than 401ing, which is the only case that actually distinguishes the
+/// gate running first from auth running first.
+#[tokio::test]
+async fn the_list_is_gated_by_the_rollout_flag() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), false);
+    let app = router_with(pool.clone(), config);
+
+    let with_valid_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        with_valid_token.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "must 503 while permanent_deposit_addresses_enabled is false, even with a valid bearer token"
+    );
+
+    let with_no_auth_header = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        with_no_auth_header.status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "must 503 even with NO Authorization header — proves the gate runs before auth, not just before a valid auth check"
     );

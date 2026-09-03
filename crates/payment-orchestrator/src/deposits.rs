@@ -48,12 +48,17 @@ pub struct DepositIntent {
     /// `None` until settled, and on rows that predate the column. Callers must fall back to
     /// `amount_usdt` for those rather than treating a missing figure as zero.
     pub received_usdt: Option<i64>,
+    /// When this row was created. `due_for_mint_request`/`due_for_status_poll` have always
+    /// ordered by this column in raw SQL without needing it back as a field; `recent_for_user`'s
+    /// history view is the first caller that has to show it, which is why it joins `INTENT_COLS`
+    /// only now.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
-    treasury_intent_id, attempts, next_attempt_at, received_usdt";
+    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at";
 
 /// Claim the next BIP32 derivation index for a deposit address.
 ///
@@ -78,6 +83,20 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<DepositIntent>
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// The caller's own deposits, newest first. Scoped by `user_pk` — the only thing standing between
+/// one user's deposit history and another's, so it is not optional and not a filter applied after
+/// the fact: the WHERE clause IS the access control here, same as everywhere else in this file
+/// that a caller-scoped row matters.
+pub async fn recent_for_user(pool: &PgPool, user_pk: &str, limit: i64) -> Result<Vec<DepositIntent>, sqlx::Error> {
+    sqlx::query_as::<_, DepositIntent>(&format!(
+        "SELECT {INTENT_COLS} FROM deposit_intents WHERE user_pk = $1 ORDER BY created_at DESC LIMIT $2"
+    ))
+    .bind(user_pk)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// Records the on-chain tx id once the custody poller matches a transfer to this intent.
