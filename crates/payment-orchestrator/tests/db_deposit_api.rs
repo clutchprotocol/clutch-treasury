@@ -139,11 +139,12 @@ async fn seed_intent(pool: &PgPool, user_pk: &str) -> Uuid {
 }
 
 /// Seeds a `deposit_intents` row directly, like `seed_intent` above, but with explicit control
-/// over the three columns the list endpoint's own tests turn on: `amount_usdt`, `received_usdt`
-/// and `tron_tx_id`, plus `created_at` so ordering and the twenty-row cap can be exercised with
-/// rows of a known age. Every NOT-NULL column without a default is still covered; `client_key` is
-/// still derived from the fresh id so `(user_pk, client_key)` stays unique across repeated calls
-/// for the same user.
+/// over the columns the list endpoint's own tests turn on: `amount_usdt`, `received_usdt`,
+/// `tron_tx_id` and `created_at` (so ordering and the twenty-row cap can be exercised with rows of
+/// a known age), plus `status` (so the expired-legacy-intent exclusion can be exercised) rather
+/// than relying on the table's own `DEFAULT 'created'`. Every NOT-NULL column without a default is
+/// still covered; `client_key` is still derived from the fresh id so `(user_pk, client_key)` stays
+/// unique across repeated calls for the same user.
 async fn seed_deposit(
     pool: &PgPool,
     user_pk: &str,
@@ -151,13 +152,14 @@ async fn seed_deposit(
     received_usdt: Option<i64>,
     tron_tx_id: &str,
     created_at: chrono::DateTime<chrono::Utc>,
+    status: &str,
 ) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO deposit_intents
             (id, user_pk, clt_address, amount_usdt, amount_clt, client_key, expires_at,
-             received_usdt, tron_tx_id, created_at)
-         VALUES ($1, $2, 'clt1owner', $3, $4, $5, now() + interval '30 minutes', $6, $7, $8)",
+             received_usdt, tron_tx_id, created_at, status)
+         VALUES ($1, $2, 'clt1owner', $3, $4, $5, now() + interval '30 minutes', $6, $7, $8, $9)",
     )
     .bind(id)
     .bind(user_pk)
@@ -167,6 +169,7 @@ async fn seed_deposit(
     .bind(received_usdt)
     .bind(tron_tx_id)
     .bind(created_at)
+    .bind(status)
     .execute(pool)
     .await
     .unwrap();
@@ -431,9 +434,9 @@ async fn the_list_returns_only_the_callers_own_deposits() {
     let app = router_with(pool.clone(), config);
 
     let now = chrono::Utc::now();
-    seed_deposit(&pool, USER_A, 1_000_000, None, "tx-user-a-first", now).await;
-    seed_deposit(&pool, USER_A, 2_000_000, None, "tx-user-a-second", now).await;
-    seed_deposit(&pool, USER_B, 9_000_000, None, "tx-user-b-secret", now).await;
+    seed_deposit(&pool, USER_A, 1_000_000, None, "tx-user-a-first", now, "created").await;
+    seed_deposit(&pool, USER_A, 2_000_000, None, "tx-user-a-second", now, "created").await;
+    seed_deposit(&pool, USER_B, 9_000_000, None, "tx-user-b-secret", now, "created").await;
 
     let res = app
         .oneshot(
@@ -476,7 +479,7 @@ async fn the_list_is_newest_first_and_capped_at_twenty() {
     for i in 0i64..21 {
         // i = 0 is the oldest row, i = 20 the newest.
         let tx_id = format!("tx-{i:02}");
-        seed_deposit(&pool, USER_A, 1_000_000, None, &tx_id, base + chrono::Duration::seconds(i)).await;
+        seed_deposit(&pool, USER_A, 1_000_000, None, &tx_id, base + chrono::Duration::seconds(i), "created").await;
     }
 
     let res = app
@@ -518,8 +521,8 @@ async fn the_list_reports_what_arrived_not_what_was_asked_for() {
     let config = test_config(treasury.uri(), true);
     let app = router_with(pool.clone(), config);
 
-    seed_deposit(&pool, USER_A, 20_000_000, Some(25_000_000), "tx-overpaid", chrono::Utc::now()).await;
-    seed_deposit(&pool, USER_A, 30_000_000, None, "tx-unsettled", chrono::Utc::now()).await;
+    seed_deposit(&pool, USER_A, 20_000_000, Some(25_000_000), "tx-overpaid", chrono::Utc::now(), "created").await;
+    seed_deposit(&pool, USER_A, 30_000_000, None, "tx-unsettled", chrono::Utc::now(), "created").await;
 
     let res = app
         .oneshot(
@@ -626,4 +629,44 @@ async fn the_list_is_gated_by_the_rollout_flag() {
         StatusCode::SERVICE_UNAVAILABLE,
         "must 503 even with NO Authorization header — proves the gate runs before auth, not just before a valid auth check"
     );
+}
+
+/// `expired` rows are pre-permanent-address legacy intents — invoices nobody ever paid, not
+/// deposits that happened — and must never come back here. Fails if `recent_for_user`'s `status <>
+/// 'expired'` clause is ever dropped, whether by an edit to the query or by moving the filter into
+/// the UI (which the design deliberately rejects: with `LIMIT 20`, a client-side filter would
+/// still spend the cap on rows the user is never shown).
+#[tokio::test]
+async fn expired_legacy_intents_are_not_listed() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    seed_deposit(&pool, USER_A, 5_000_000, None, "tx-expired-legacy", chrono::Utc::now(), "expired").await;
+    seed_deposit(&pool, USER_A, 6_000_000, None, "tx-real-deposit", chrono::Utc::now(), "created").await;
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_json(res).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        !body.to_string().contains("tx-expired-legacy"),
+        "an expired legacy intent's tron_tx_id must appear nowhere in the response body"
+    );
+
+    let rows = body["deposits"].as_array().expect("deposits must be an array");
+    assert_eq!(rows.len(), 1, "only the real deposit — the expired legacy intent must be excluded");
+    assert_eq!(rows[0]["tron_tx_id"].as_str().unwrap(), "tx-real-deposit");
 }
