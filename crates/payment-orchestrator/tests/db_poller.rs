@@ -348,6 +348,11 @@ async fn cold_addresses_rotate_oldest_attempted_first() {
     seed_address(&pool, "0xb", "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", None).await;
     sqlx::query("UPDATE deposit_addresses SET last_attempt_at = now() WHERE user_pk = '0xa'")
         .execute(&pool).await.unwrap();
+    // 0xb (expected to win) gets a last_polled_at so the two columns disagree: ordering by
+    // last_attempt_at ASC NULLS FIRST still picks 0xb (never attempted, correct); ordering by
+    // last_polled_at ASC NULLS FIRST — a revert — would pick 0xa instead, since 0xa's is NULL.
+    sqlx::query("UPDATE deposit_addresses SET last_polled_at = now() WHERE user_pk = '0xb'")
+        .execute(&pool).await.unwrap();
 
     let due = payment_orchestrator::poller::due_addresses(&pool, 1).await.unwrap();
 
@@ -474,22 +479,31 @@ async fn a_one_cent_deposit_is_credited_in_full() {
 /// where `poll_once`'s loop (a) (`credit_from_addresses`) finally wires `TieredPoller` in for real,
 /// against a real (mocked) TronGrid rather than `FakeChain`.
 ///
-/// R23: A's failure must rotate it (`last_attempt_at` set) WITHOUT moving its read watermark
-/// (`last_polled_at` stays NULL — never successfully read) — otherwise the next pass's
-/// `min_timestamp` silently skips whatever arrived at A while it was down. B's success advances
-/// both. Exactly one aggregated alert row must name A; a row per failing address would be thousands
-/// of alerts over an hour-long outage.
+/// R23: A's and C's failures must rotate them (`last_attempt_at` set) WITHOUT moving their read
+/// watermarks (`last_polled_at` stays NULL — never successfully read) — otherwise the next pass's
+/// `min_timestamp` silently skips whatever arrived at them while they were down. B's success advances
+/// both. TWO addresses fail on purpose, not one: a single failing address cannot tell an aggregated
+/// alert row apart from a per-address one, since both would produce exactly one row. Proving
+/// aggregation needs two failures landing in the SAME row — `count(*) WHERE source = 'poller'` stays
+/// 1, and that one row's message names both A and C.
 #[tokio::test]
 async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
     let pool = pool().await;
     let addr_a = "TAddrFailingA";
     let addr_b = "TAddrWorkingB";
+    let addr_c = "TAddrFailingC";
     seed_address(&pool, "0xuser-a", addr_a, None).await;
     seed_address(&pool, "0xuser-b", addr_b, None).await;
+    seed_address(&pool, "0xuser-c", addr_c, None).await;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/v1/accounts/{addr_a}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{addr_c}/transactions/trc20")))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -509,10 +523,10 @@ async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
         .await;
 
     let raw: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(server.uri(), "test-key".into(), USDT.into()));
-    let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 2 };
+    let tiered = poller::TieredPoller { pool: pool.clone(), inner: raw, budget: 3 };
 
     let result = poller::credit_from_addresses(&pool, &tiered, USDT).await;
-    assert!(result.is_ok(), "A's failure must be logged, not propagated: {result:?}");
+    assert!(result.is_ok(), "A's and C's failures must be logged, not propagated: {result:?}");
 
     let credited: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_intents WHERE tron_tx_id = 'tx-b'")
         .fetch_one(&pool)
@@ -525,7 +539,10 @@ async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(attempted, 2, "both A and B must rotate — last_attempt_at set even though A's fetch failed");
+    assert_eq!(
+        attempted, 3,
+        "A, B, and C must all rotate — last_attempt_at set even though A's and C's fetches failed"
+    );
 
     let a_watermark: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
@@ -535,6 +552,14 @@ async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
             .unwrap();
     assert!(a_watermark.is_none(), "A's failed fetch must NOT advance its read watermark");
 
+    let c_watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
+            .bind(addr_c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(c_watermark.is_none(), "C's failed fetch must NOT advance its read watermark");
+
     let b_watermark: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT last_polled_at FROM deposit_addresses WHERE address = $1")
             .bind(addr_b)
@@ -543,12 +568,22 @@ async fn a_failing_address_keeps_its_watermark_but_rotates_to_the_back() {
             .unwrap();
     assert!(b_watermark.is_some(), "B's successful fetch must advance its read watermark");
 
-    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE message LIKE '%' || $1 || '%'")
-        .bind(addr_a)
+    let alert_count: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'poller'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(alerts, 1, "exactly one aggregated alert row per pass, naming A");
+    assert_eq!(
+        alert_count, 1,
+        "two failing addresses must still produce exactly one aggregated alert row — a per-address \
+         implementation would have produced two"
+    );
+
+    let alert_message: String = sqlx::query_scalar("SELECT message FROM alerts WHERE source = 'poller'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(alert_message.contains(addr_a), "the single alert must name A");
+    assert!(alert_message.contains(addr_c), "the single alert must name C");
 }
 
 /// The property R23 exists for, isolated to a single address mid-outage. Without the fix this

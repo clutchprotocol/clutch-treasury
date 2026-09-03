@@ -294,11 +294,12 @@ async fn one_address_on_two_unswept_rows_is_counted_once() {
     assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "one address, counted once");
 }
 
-/// The design's §5 promised this test and nothing wrote it: a per-intent-era row — its own
-/// `derivation_index`, the shape every deposit had before permanent per-user addresses existed —
-/// must still be counted by `unswept_addresses` exactly like any other unswept row. The function has
-/// no dependency on the newer permanent-address shape (its WHERE clause never mentions
-/// `derivation_index`), which is the property this pins against a future regression.
+/// The design's §5 promised this test and nothing wrote it: `unswept_addresses`' predicate is
+/// independent of `derivation_index` and of how the address was issued. A non-NULL
+/// `derivation_index` is NOT the legacy shape — permanent per-user rows carry one too (since R17) —
+/// so it is not what distinguishes this row from the ones above; it is simply a per-intent-era row,
+/// seeded to pin that any unswept row's address is counted the same way, legacy or permanent, because
+/// the function's WHERE clause never mentions the column at all.
 #[tokio::test]
 async fn legacy_unswept_addresses_are_still_counted() {
     let pool = pool().await;

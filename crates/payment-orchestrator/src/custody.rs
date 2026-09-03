@@ -99,10 +99,11 @@ const PAGE_LIMIT: &str = "200";
 /// TronGrid is still offering a fingerprint cursor and something is wrong (most plausibly a
 /// misbehaving or adversarial upstream); returning a partial `Ok` at that point would be exactly
 /// the silent loss this fix exists to close, so `transfers_to` returns `Err` naming the address
-/// and this cap instead. `TieredPoller` (poller.rs) logs that `Err` and still stamps
-/// `last_polled_at` for the address regardless — deliberately unchanged here — so the address is
-/// re-polled next pass with the same one-hour overlap rather than wedged forever if the cause was
-/// transient.
+/// and this cap instead. `TieredPoller` (poller.rs) does NOT advance the address's watermark on
+/// that `Err` — only `last_attempt_at` is stamped, rotating the address to the back of the queue —
+/// so the next successful pass re-reads from the same `last_polled_at` instead of silently skipping
+/// whatever arrived while this cap kept tripping. A persistent cap `Err` on one address is therefore
+/// loud (an aggregated alert every pass) and needs a human, not a wait.
 const MAX_PAGES: usize = 10;
 
 /// Only this TRC-20 event kind moves value. An `Approval` carries a `to` and a `value` too, so
