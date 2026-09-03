@@ -301,7 +301,7 @@ use sqlx::PgPool;
 /// wallet whose addresses that file already pins, so these results are checkable against it.
 const XPUB: &str = "xpub6D1AabNHCupeiLM65ZR9UStMhJ1vCpyV4XbZdyhMZBiJXALQtmn9p42VTQckoHVn8WNqS7dqnJokZHAHcHGoaQgmv8D45oNUKx6DZMNZBCd";
 
-async fn pool() -> PgPool { /* copy the pool() helper from tests/db_deposits.rs verbatim, changing only the database-name suffix to _orc_addresses */ }
+async fn pool() -> PgPool { /* copy the pool() helper from tests/db_deposits.rs verbatim, changing only the database-name suffix to _orch_addresses (the file uses _orch_deposits) */ }
 
 #[tokio::test]
 async fn a_users_address_is_stable_across_calls() {
