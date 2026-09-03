@@ -777,7 +777,17 @@ stated in the doc comment so it is a decision rather than an accident.
 
 - [ ] **Step 4: Remove the now-unreachable intent-creation path**
 
-`deposits::create_and_invoice` and its `insert_new` are no longer called by the API. Delete them along with `ApiError::OutOfBounds` and the `same_body` idempotency helper. Leave everything that reads or advances existing intents — the poller and treasury bridge still use those.
+`deposits::create_and_invoice` and its `insert_new` are no longer called by the API. Delete them
+along with BOTH deposit-side bounds variants — `ApiError::OutOfBounds` (`deposits.rs`, raised inside
+`insert_new`) and `DepositOutcome::OutOfBounds` (`deposits.rs`, matched by the old handler at
+`api.rs:107`) — and the `same_body` idempotency helper. If `CreateOutcome` or `DepositOutcome` has no
+remaining constructor after that, delete the enum too rather than leaving an unreachable variant set.
+
+**Do NOT touch `RedemptionOutcome::OutOfBounds`** (`redemptions.rs`, matched at `api.rs:220`) — that is
+the redemption bounds check, a different flow, and it stays.
+
+Leave everything that reads or advances existing intents — `deposits::find_by_id` (used by the kept
+`get_deposit_handler`), the poller, and the treasury bridge all still use those.
 
 If any test covers only the deleted path, delete that test too; do not keep a test alive by pointing it at something else.
 
