@@ -31,6 +31,12 @@ const JWT_SECRET: &str = "test-jwt-secret";
 /// gateway, so the response must echo exactly this.
 const TEST_CUSTODY: &str = "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX";
 
+/// Address-shaped (`0x` + 40 hex) token for tests that go through the route — the beneficiary is
+/// now the JWT's own `pk`, so a successful POST requires an address-shaped one. Mixed-case so
+/// `the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount` also proves the stored
+/// value was normalised to lowercase, not just accepted.
+const USER_A: &str = "0x00000000000000000000000000000000000000A1";
+
 /// Unused by the deposit route itself since Task 6 — the address handler never calls the
 /// treasury at all, headroom is checked later, at mint time (`treasury_bridge.rs`), not at
 /// address-issuance time. Kept anyway: `test_config` still requires a `treasury_url`, and
@@ -141,9 +147,8 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/deposits")
-            .header("authorization", bearer_for("0xuser-a"))
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"clt_address":"0xclt-a"}"#))
+            .header("authorization", bearer_for(USER_A))
+            .body(Body::empty())
             .unwrap();
         body_json(app.oneshot(req).await.unwrap()).await
     };
@@ -157,7 +162,7 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
 
     let hot_until: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT hot_until FROM deposit_addresses WHERE user_pk = $1")
-            .bind("0xuser-a")
+            .bind(USER_A)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -165,6 +170,94 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
         hot_until.map_or(false, |t| t > chrono::Utc::now()),
         "the route must mark the address hot"
     );
+
+    let stored_clt_address: String =
+        sqlx::query_scalar("SELECT clt_address FROM deposit_addresses WHERE user_pk = $1")
+            .bind(USER_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_clt_address, "0x00000000000000000000000000000000000000a1",
+        "the beneficiary must be the authenticated identity, normalised to lowercase"
+    );
+}
+
+/// Regression test for the foot-gun the review flagged: a body's `clt_address` must be silently
+/// ignored, not honoured — the beneficiary is the caller's own authenticated identity. Must fail
+/// if a body extractor is ever reintroduced and wired up to `address_for_user`.
+#[tokio::test]
+async fn the_beneficiary_is_the_authenticated_identity_not_the_body() {
+    let pool = pool().await;
+    // `pool()` only truncates deposit_intents; deposit_addresses persists across every test in
+    // this file. `address_for_user` returns an EXISTING row for USER_A without ever looking at
+    // clt_address again — so without this, a run where another test claims USER_A first would
+    // make this assertion pass regardless of whether the handler still reads the body.
+    sqlx::query("DELETE FROM deposit_addresses WHERE user_pk = $1")
+        .bind(USER_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
+    let app = router_with(pool.clone(), config);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(USER_A))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"clt_address":"0x00000000000000000000000000000000000000ff"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let stored_clt_address: String =
+        sqlx::query_scalar("SELECT clt_address FROM deposit_addresses WHERE user_pk = $1")
+            .bind(USER_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_clt_address, "0x00000000000000000000000000000000000000a1",
+        "the stored beneficiary must be the authenticated identity, not whatever the body sent"
+    );
+}
+
+/// A public-key-shaped token (130 hex chars — what the JWT `pk` claim held before the demo app
+/// was fixed to send an address) must be refused, not silently normalized into an account no key
+/// can spend.
+#[tokio::test]
+async fn a_public_key_token_is_refused() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let config = test_config(treasury.uri());
+    let app = router_with(pool.clone(), config);
+
+    let pubkey = format!("04{}", "ab".repeat(64));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/deposits")
+                .header("authorization", bearer_for(&pubkey))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE user_pk = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refused token must not create a deposit_addresses row");
 }
 
 /// Owner check on `GET /api/v1/deposits/:id`: a valid JWT for a DIFFERENT user_pk than the
@@ -225,8 +318,7 @@ async fn missing_auth_returns_401() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deposits")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"clt_address":"clt1nobody"}"#))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await

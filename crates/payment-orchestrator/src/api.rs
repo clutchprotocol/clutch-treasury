@@ -57,33 +57,51 @@ fn build_cors(allowed_origins: &str) -> CorsLayer {
     }
 }
 
-#[derive(Deserialize)]
-struct CreateDepositBody {
-    clt_address: String,
+/// Mirrors clutch-node/src/node/transactions/address.rs::is_valid_address (optional 0x/0X, then
+/// exactly 40 ASCII hex digits): the node turns this string into a state key verbatim, so a
+/// malformed one mints into an account no key can spend. Returns the canonical lowercase
+/// `0x`-prefixed form — the same rule clutch-chain applies before encoding a Mint.
+fn canonical_clt_address(s: &str) -> Option<String> {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    (hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("0x{}", hex.to_ascii_lowercase()))
 }
 
 /// `POST /api/v1/deposits` — where to send USDT.
 ///
-/// No amount, and no intent. The user has one permanent address; whatever arrives at it is credited
-/// in full by the poller. This is idempotent by nature rather than by an idempotency key: a user has
-/// exactly one address, so a repeat call is the same answer.
+/// No body. The beneficiary is the caller's own authenticated identity (`user_pk`), never a
+/// client-supplied field — the demo app used to send `clt_address: publicKey`, the SAME value it
+/// used to obtain the JWT, so `user_pk` already IS the beneficiary. A separate field was a live
+/// foot-gun: under permanent addresses (`address_for_user`'s `ON CONFLICT (user_pk) DO NOTHING`)
+/// a typo or someone else's address in that field would become this user's mint destination
+/// forever, with no later request able to correct it.
 ///
-/// On a repeat call the stored `clt_address` wins: `addresses::address_for_user`'s `ON CONFLICT
-/// (user_pk) DO NOTHING` means a user who sends a different one later keeps their original
-/// destination. That is deliberate — silently re-pointing where someone's future deposits mint is
-/// worse than ignoring the change.
+/// `user_pk` must be address-shaped (`canonical_clt_address`) — a public-key-shaped token 400s
+/// here rather than being normalized into an account no key can spend from.
+///
+/// This is idempotent by nature rather than by an idempotency key: a user has exactly one
+/// address, so a repeat call is the same answer.
 ///
 /// Marking the address hot here is the whole reason the tiered poller can stay cheap — this call IS
 /// the signal that a deposit is imminent.
 async fn create_deposit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateDepositBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let user_pk = authenticated_pk(&headers, &state.config)?;
 
+    let clt_address = match canonical_clt_address(&user_pk) {
+        Some(a) => a,
+        None => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "deposits require an address-form token (0x + 40 hex); public-key tokens are not accepted"})),
+            ))
+        }
+    };
+
     let address =
-        addresses::address_for_user(&state.pool, state.deriver.as_ref(), &user_pk, &body.clt_address)
+        addresses::address_for_user(&state.pool, state.deriver.as_ref(), &user_pk, &clt_address)
             .await
             .map_err(|e| {
                 tracing::error!("deposit address for {user_pk}: {e}");
