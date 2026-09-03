@@ -1115,13 +1115,20 @@ override — which is quieter and therefore worth getting right the first time.
 
 - [ ] **Step 2: Correct the deposit-detection docs**
 
-`../clutch-deploy/CLAUDE.md`'s "Deposit detection" section says **"Every deposit intent gets its own
-freshly derived TRON address... one unique index per intent"** and that `get_reserve_balance` "sums
-unswept addresses plus the treasury". Both are now wrong: addresses are per USER, and the reserve
+`../clutch-deploy/CLAUDE.md`'s "Deposit detection" section (verified: lines ~133–134) says **"Every
+deposit intent gets its own freshly derived TRON address... one unique index per intent"**, and line
+~169 says `get_reserve_balance` "sums unswept addresses plus the treasury". Both are now wrong: addresses are per USER, and the reserve
 also sums the payout float. Rewrite that section to describe the tiered poller, the per-user
 address, and transaction-keyed identity.
 
-Do the same for the equivalent passage in `../CLAUDE.md` (not a git repo — edit in place).
+In `../CLAUDE.md` (workspace root — not a git repo, edit in place) there are TWO passages, both
+verified present:
+- the repo table row for `clutch-treasury/` (around line 15): "deposit intents on per-intent derived
+  TRON addresses" → "one permanent derived TRON address per user";
+- the data-flow diagram (around lines 28–29): "derives a TRON address per intent from the account
+  xpub → watches TronGrid for USDT paid TO it" → "derives one TRON address per user from the account
+  xpub → polls it (hot first, then a bounded cold rotation) for USDT paid TO it".
+Fix both. A grep for `per-intent` and `per intent` across that file must return nothing afterwards.
 
 - [ ] **Step 3: Commit**
 
