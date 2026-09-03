@@ -167,6 +167,55 @@ async fn get_deposit_handler(
     })))
 }
 
+/// `GET /api/v1/deposits` — the caller's own deposits, newest first, capped at twenty. A panel,
+/// not a ledger: no paging, and no status vocabulary invented here — `status` comes back exactly
+/// as stored; turning it into words a person reads is the UI's job, not this handler's.
+///
+/// Scoped by `user_pk` inside `deposits::recent_for_user`'s own WHERE clause, not filtered after
+/// the fetch — a caller can never be handed another user's row, the same guarantee
+/// `get_deposit_handler`'s owner check gives one row at a time.
+///
+/// `amount_usdt` here reports what arrived (`received_usdt`) when known, falling back to what was
+/// asked for — what a user actually wants to know is whether their money showed up.
+///
+/// 503s (same body shape as `create_deposit_handler`'s gate) while
+/// `config.permanent_deposit_addresses_enabled` is false, before auth runs — when deposits are
+/// off, every part of this page is off.
+async fn list_deposits_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if !state.config.permanent_deposit_addresses_enabled {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "deposits are temporarily unavailable"})),
+        ));
+    }
+    let user_pk = authenticated_pk(&headers, &state.config)?;
+
+    let intents = deposits::recent_for_user(&state.pool, &user_pk, 20)
+        .await
+        .map_err(|e| {
+            tracing::error!("recent_for_user for {user_pk}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let deposits: Vec<_> = intents
+        .into_iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "status": d.status,
+                "amount_usdt": d.received_usdt.unwrap_or(d.amount_usdt),
+                "tron_tx_id": d.tron_tx_id,
+                "created_at": d.created_at,
+            })
+        })
+        .collect();
+
+    Ok((StatusCode::OK, Json(json!({ "deposits": deposits }))))
+}
+
 /// Deliberately has NO `redeemer_address` field — see `redemptions.rs` module docs. The
 /// redeemer is always the caller's authenticated `user_pk`; there is nothing in this struct
 /// a client could set to name someone else's balance.
@@ -301,7 +350,7 @@ pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) ->
     let state = AppState { pool, config, deriver };
     Router::new()
         .route("/health", get(health))
-        .route("/api/v1/deposits", post(create_deposit_handler))
+        .route("/api/v1/deposits", post(create_deposit_handler).get(list_deposits_handler))
         .route("/api/v1/deposits/:id", get(get_deposit_handler))
         .route("/api/v1/redemptions", post(create_redemption_handler))
         .route("/api/v1/redemptions/:id", get(get_redemption_handler))
