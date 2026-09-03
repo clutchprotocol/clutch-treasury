@@ -22,8 +22,7 @@ pub async fn address_for_user(
         return Ok(addr);
     }
 
-    let index: i64 = sqlx::query_scalar("SELECT nextval('deposit_derivation_index_seq')")
-        .fetch_one(pool)
+    let index = crate::deposits::allocate_derivation_index(pool)
         .await
         .map_err(|e| format!("allocating a derivation index: {e}"))?;
 

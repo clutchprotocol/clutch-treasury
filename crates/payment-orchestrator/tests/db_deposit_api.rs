@@ -154,6 +154,17 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
     assert_eq!(first["address"], second["address"]);
     assert!(first["address"].as_str().unwrap().starts_with('T'));
     assert!(first.get("amount_usdt").is_none(), "no amount is asked for or echoed");
+
+    let hot_until: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT hot_until FROM deposit_addresses WHERE user_pk = $1")
+            .bind("0xuser-a")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        hot_until.map_or(false, |t| t > chrono::Utc::now()),
+        "the route must mark the address hot"
+    );
 }
 
 /// Owner check on `GET /api/v1/deposits/:id`: a valid JWT for a DIFFERENT user_pk than the
