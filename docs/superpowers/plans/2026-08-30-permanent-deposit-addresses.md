@@ -666,8 +666,10 @@ git commit -m "feat: tiered address selection behind a DepositWatcher seam"
 > `POST /api/v1/deposits` takes no body (any body an old client still sends is ignored — no `Json`
 > extractor). The beneficiary is the authenticated identity: `user_pk` must satisfy the node's address
 > rule (`clutch-node/src/node/transactions/address.rs::is_valid_address` — strip optional `0x`/`0X`,
-> 40 ASCII hex digits) or the route answers 400; `clt_address` stored on `deposit_addresses` is
-> `clutch_chain::tx::normalize_address(user_pk)`. Route-level test fixtures therefore use real-shaped
+> 40 ASCII hex digits) or the route answers 400; `clt_address` stored on `deposit_addresses` is the
+> canonical lowercase `0x`-prefixed form, computed by a private helper in `api.rs` (`clutch-chain`'s
+> `normalize_address` is private and the orchestrator does not depend on that crate — do not add the
+> dependency for two lines). Route-level test fixtures therefore use real-shaped
 > addresses, not `"0xuser-a"`. Everything below that says `{"clt_address": ...}` is superseded.
 
 **Files:**
