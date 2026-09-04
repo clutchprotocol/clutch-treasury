@@ -712,3 +712,60 @@ async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_st
     assert!(body["payout_ref"].is_null(), "no payout yet means no receipt");
     assert_eq!(body["status_live"], true);
 }
+
+/// A public-key-shaped token must be refused here for a harsher reason than on the deposit route.
+/// The treasury matches the burn's on-chain sender against `redeemer_address` before it will pay,
+/// so a redemption created under a public key can never be honoured: the user burns their CLT, the
+/// match fails, and `confirm_burn` marks the intent failed and never pays out. A 400 now is the
+/// difference between an error message and somebody's money.
+#[tokio::test]
+async fn a_public_key_token_cannot_create_a_redemption() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let pubkey = format!("04{}", "ab".repeat(64));
+    let res = app
+        .oneshot(post_redemption_request(&bearer_for(&pubkey), VALID_TRON_ADDRESS, 2_000_000))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "a token that can never match must not create a redemption");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM redemption_map WHERE user_pk = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "and nothing may be recorded for it");
+}
+
+/// A checksummed (mixed-case) address is the same account as its lowercase form, and it is stored
+/// lowercase so the treasury's sender match has one canonical thing to compare against.
+#[tokio::test]
+async fn a_mixed_case_address_token_is_stored_lowercased() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-mixed", 2_000_000)))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let mixed = "0xAAAA000000000000000000000000000000000ABC";
+    let res = app
+        .oneshot(post_redemption_request(&bearer_for(mixed), VALID_TRON_ADDRESS, 2_000_000))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let stored: String = sqlx::query_scalar("SELECT user_pk FROM redemption_map ORDER BY created_at DESC LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, mixed.to_ascii_lowercase(), "stored canonical, not as typed");
+}

@@ -247,6 +247,18 @@ async fn create_redemption_handler(
         ));
     }
     let user_pk = authenticated_pk(&headers, &state.config)?;
+    // Address-shaped, lowercased, exactly as the deposit route insists — and here the stakes are
+    // worse. The treasury matches the burn's on-chain sender against this string before it will pay,
+    // so a public-key-form token creates a redemption that CANNOT be honoured: the user burns their
+    // CLT, the match fails, and the intent is marked failed and never paid. Refusing the token now
+    // costs a 400; accepting it costs someone their money.
+    let Some(user_pk) = canonical_clt_address(&user_pk) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(json!({"error": "token subject must be an address (0x + 40 hex), not a public key"})),
+        ));
+    };
 
     let outcome = redemptions::create_redemption(
         &state.pool,
