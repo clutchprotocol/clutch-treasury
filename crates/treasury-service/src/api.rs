@@ -212,11 +212,19 @@ async fn create_redemption_intent_handler(
     if role != Role::Initiator {
         return Err(StatusCode::FORBIDDEN);
     }
+    // Quoted here, once, and stored on the intent. The user burns `amount_clt` and receives this.
+    // A redemption too small to cover the fee is refused now, while refusing is still free — after
+    // the intent exists there is a ref for someone to burn against, and that burn is final.
+    let Some(payout_amount_usdt) = intents::net_payout(body.amount_clt, state.config.redemption_fee_usdt)
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let intent = intents::create_redemption_intent(
         &state.pool,
         &body.redeemer_address,
         &body.payout_address,
         body.amount_clt,
+        payout_amount_usdt,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -435,6 +443,12 @@ fn redemption_intent_json(intent: &intents::RedemptionIntent) -> serde_json::Val
         "redeemer_address": intent.redeemer_address,
         "payout_address": intent.payout_address,
         "amount_clt": intent.amount_clt,
+        // What the user actually receives, and what it cost them to redeem. Both travel with
+        // every read of the intent because the caller quoting a user MUST be able to show the net
+        // before they burn — a fee discovered afterwards is a fee taken without consent, and the
+        // burn cannot be undone.
+        "payout_amount_usdt": intent.payout_amount_usdt,
+        "fee_usdt": intent.amount_clt - intent.payout_amount_usdt,
         "status": intent.status,
         "redemption_ref": intent.redemption_ref,
         "burn_tx_hash": intent.burn_tx_hash,

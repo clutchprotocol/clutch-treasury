@@ -150,12 +150,28 @@ pub async fn approve_mint_intent(
     Ok(updated)
 }
 
+/// What a redemption of `amount_clt` actually pays out, after `fee_usdt`.
+///
+/// `None` when the amount does not cover the fee — including when it exactly equals it, because a
+/// redemption that pays nothing is not a redemption, it is a burn with extra steps. The caller
+/// turns that into a refusal BEFORE an intent exists, so no user can burn against a quote of zero.
+///
+/// Quoted once, at creation, and stored. Recomputing at payout time would let a fee change between
+/// the quote and the payment, and the burn in between cannot be undone.
+pub fn net_payout(amount_clt: i64, fee_usdt: i64) -> Option<i64> {
+    // Red step: no fee applied yet.
+    let _ = fee_usdt;
+    Some(amount_clt)
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct RedemptionIntent {
     pub id: Uuid,
     pub redeemer_address: String,
     pub payout_address: String,
     pub amount_clt: i64,
+    /// The USDT leg. Equal to `amount_clt` when no fee is configured.
+    pub payout_amount_usdt: i64,
     pub status: String,
     pub redemption_ref: String,
     pub burn_tx_hash: Option<String>,
@@ -170,7 +186,7 @@ pub struct RedemptionIntent {
 /// one redemption intent before this.
 pub async fn find_redemption_by_id(pool: &PgPool, id: Uuid) -> Result<Option<RedemptionIntent>, sqlx::Error> {
     sqlx::query_as::<_, RedemptionIntent>(
-        "SELECT id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash, payout_ref
+        "SELECT id, redeemer_address, payout_address, amount_clt, payout_amount_usdt, status, redemption_ref, burn_tx_hash, payout_ref
          FROM redemption_intents WHERE id = $1",
     )
     .bind(id)
@@ -183,18 +199,62 @@ pub async fn create_redemption_intent(
     redeemer_address: &str,
     payout_address: &str,
     amount_clt: i64,
+    payout_amount_usdt: i64,
 ) -> Result<RedemptionIntent, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query_as::<_, RedemptionIntent>(
-        "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, redemption_ref)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash, payout_ref",
+        "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, payout_amount_usdt, redemption_ref)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, redeemer_address, payout_address, amount_clt, payout_amount_usdt, status, redemption_ref, burn_tx_hash, payout_ref",
     )
     .bind(id)
     .bind(redeemer_address)
     .bind(payout_address)
     .bind(amount_clt)
+    .bind(payout_amount_usdt)
     .bind(intent_ref(&id.to_string()))
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::net_payout;
+
+    const TEN_USD: i64 = 10_000_000;
+    const FEE: i64 = 500_000; // $0.50
+
+    #[test]
+    fn the_fee_comes_off_the_payout_not_the_burn() {
+        assert_eq!(net_payout(TEN_USD, FEE), Some(9_500_000));
+    }
+
+    /// The difference is what stays in the reserve. Reconciliation reads a reserve above liability
+    /// as fine, so the surplus needs no special handling anywhere — but only if the payout really
+    /// is smaller than the burn.
+    #[test]
+    fn the_burn_always_exceeds_the_payout_when_a_fee_is_set() {
+        let net = net_payout(TEN_USD, FEE).unwrap();
+        assert!(net < TEN_USD, "a fee that leaves nothing in reserve is not a fee");
+        assert_eq!(TEN_USD - net, FEE);
+    }
+
+    /// Exactly covering the fee pays zero, which is a burn with extra steps rather than a
+    /// redemption. Refused at the quote, before any intent exists for a user to burn against.
+    #[test]
+    fn an_amount_equal_to_the_fee_is_refused() {
+        assert_eq!(net_payout(FEE, FEE), None);
+    }
+
+    #[test]
+    fn an_amount_below_the_fee_is_refused() {
+        assert_eq!(net_payout(FEE - 1, FEE), None);
+    }
+
+    /// The default. Adding the mechanism must not change what an unconfigured deployment pays.
+    #[test]
+    fn a_zero_fee_pays_par() {
+        assert_eq!(net_payout(TEN_USD, 0), Some(TEN_USD));
+        assert_eq!(net_payout(1, 0), Some(1));
+    }
 }

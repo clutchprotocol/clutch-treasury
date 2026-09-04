@@ -129,6 +129,7 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         sweep_threshold_usdt: 100_000_000,
         sweep_max_age_hours: 168,
         sweep_min_usdt: 0,
+        redemption_fee_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
     }
