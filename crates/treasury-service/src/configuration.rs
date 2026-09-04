@@ -14,6 +14,12 @@ fn default_sweep_min_usdt() -> i64 {
     1_000_000
 }
 
+/// No fee. Adding the mechanism must not start charging anyone by itself — the number is a
+/// business decision, and a deployment that upgrades without choosing one keeps paying par.
+fn default_redemption_fee_usdt() -> i64 {
+    0
+}
+
 fn default_metrics_addr() -> String {
     "0.0.0.0:9101".to_string()
 }
@@ -85,6 +91,20 @@ pub struct AppConfig {
     /// this line.
     #[serde(default = "default_sweep_min_usdt")]
     pub sweep_min_usdt: i64,
+    /// Taken off the USDT leg of a redemption, in micro-USDT. The user burns the full CLT and
+    /// receives this much less.
+    ///
+    /// It is charged here rather than on the chain because `Burn` destroys exactly what it is
+    /// handed and knows nothing about the payout — and because the reserve is where the fee needs
+    /// to end up. Burning 10 and paying 9.5 leaves 0.5 of reserve behind with no liability against
+    /// it, which reconciliation already treats as fine: it fails on reserve BELOW liability, never
+    /// above.
+    ///
+    /// Keep `payment-orchestrator`'s `min_redemption_clt` above this. The treasury refuses an
+    /// amount that does not cover the fee, but that refusal reaches the user as a bare gateway
+    /// error; the orchestrator's own bound is what turns it into a sensible message.
+    #[serde(default = "default_redemption_fee_usdt")]
+    pub redemption_fee_usdt: i64,
     pub signer_url: String,
     pub signer_token: String,
 }

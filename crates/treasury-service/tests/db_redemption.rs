@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use sqlx::PgPool;
 use treasury_service::intents::create_redemption_intent;
@@ -37,7 +37,7 @@ async fn pool() -> PgPool {
 #[tokio::test]
 async fn matching_burn_confirms_and_ledgers_once() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000001", "TTronAddr111", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000001", "TTronAddr111", 2_000_000, 2_000_000).await.unwrap();
 
     for _ in 0..2 {
         confirm_burn(&pool, &intent.redemption_ref, "0xaaaa000000000000000000000000000000000001", 2_000_000, "0xburn1").await.unwrap();
@@ -54,7 +54,7 @@ async fn matching_burn_confirms_and_ledgers_once() {
 #[tokio::test]
 async fn mismatched_burn_fails_intent_never_pays() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000002", "TTronAddr222", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000002", "TTronAddr222", 2_000_000, 2_000_000).await.unwrap();
 
     // Right ref, wrong amount — someone burned the wrong sum against our ref.
     confirm_burn(&pool, &intent.redemption_ref, "0xaaaa000000000000000000000000000000000002", 1_999_999, "0xburn2").await.unwrap();
@@ -165,12 +165,16 @@ async fn a_float_dry_reply_carries_its_numbers() {
 struct CountingSigner {
     reply: PayoutReply,
     calls: AtomicUsize,
+    /// The amount of the most recent call. The whole point of a fee is that this is NOT the
+    /// intent's `amount_clt`, so a test asserting only the call count would miss it entirely.
+    last_amount: AtomicI64,
 }
 
 #[async_trait::async_trait]
 impl PayoutSigner for CountingSigner {
-    async fn pay(&self, _intent_id: Uuid, _to: &str, _amount_usdt: i64) -> PayoutReply {
+    async fn pay(&self, _intent_id: Uuid, _to: &str, amount_usdt: i64) -> PayoutReply {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.last_amount.store(amount_usdt, Ordering::SeqCst);
         match &self.reply {
             PayoutReply::Paid { tx_id } => PayoutReply::Paid { tx_id: tx_id.clone() },
             PayoutReply::Ambiguous(m) => PayoutReply::Ambiguous(m.clone()),
@@ -186,16 +190,23 @@ impl PayoutSigner for CountingSigner {
     }
 }
 
-/// A redemption sitting at payout_pending with its burn already confirmed.
+/// A redemption sitting at payout_pending with its burn already confirmed, paying par.
 async fn pending_redemption(pool: &PgPool, amount_clt: i64) -> Uuid {
+    pending_redemption_paying(pool, amount_clt, amount_clt).await
+}
+
+/// The same, with the two legs deliberately different — a burn of `amount_clt` against a quoted
+/// payout of `payout_amount_usdt`, which is what a configured fee produces.
+async fn pending_redemption_paying(pool: &PgPool, amount_clt: i64, payout_amount_usdt: i64) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash)
-         VALUES ($1, '0xabc', 'TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK', $2, 'payout_pending', $3, '0xburn')",
+        "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, payout_amount_usdt, status, redemption_ref, burn_tx_hash)
+         VALUES ($1, '0xabc', 'TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK', $2, $4, 'payout_pending', $3, '0xburn')",
     )
     .bind(id)
     .bind(amount_clt)
     .bind(format!("{:064x}", id.as_u128()))
+    .bind(payout_amount_usdt)
     .execute(pool)
     .await
     .unwrap();
@@ -237,6 +248,7 @@ fn config() -> treasury_service::configuration::AppConfig {
         sweep_threshold_usdt: 100_000_000,
         sweep_max_age_hours: 168,
         sweep_min_usdt: 0,
+        redemption_fee_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
     }
@@ -251,6 +263,7 @@ async fn an_ambiguous_payout_is_never_retried() {
     let signer = CountingSigner {
         reply: PayoutReply::Ambiguous("timeout".into()),
         calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
     };
     let cfg = config();
 
@@ -279,6 +292,7 @@ async fn a_refusal_returns_the_intent_for_retry() {
             need_usdt: 10_000_000,
         },
         calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
     };
     let cfg = config();
 
@@ -296,6 +310,7 @@ async fn a_paid_payout_records_the_tx_and_waits_for_confirmation() {
     let signer = CountingSigner {
         reply: PayoutReply::Paid { tx_id: "abc123".into() },
         calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
     };
 
     payout::drain_once(&pool, &config(), &signer).await.unwrap();
@@ -320,7 +335,7 @@ async fn payouts_stop_at_the_daily_cap() {
     cfg.daily_payout_cap_clt = 15_000_000;
     pending_redemption(&pool, 10_000_000).await;
     pending_redemption(&pool, 10_000_000).await;
-    let signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "t".into() }, calls: AtomicUsize::new(0) };
+    let signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "t".into() }, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
 
     payout::drain_once(&pool, &cfg, &signer).await.unwrap();
 
@@ -337,7 +352,7 @@ async fn an_over_cap_intent_is_skipped_and_does_not_block_smaller_ones() {
     cfg.daily_payout_cap_clt = 5_000_000;
     let stuck = pending_redemption(&pool, 10_000_000).await; // first in line, unpayable alone
     let payable = pending_redemption(&pool, 1_000_000).await;
-    let signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "t".into() }, calls: AtomicUsize::new(0) };
+    let signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "t".into() }, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
 
     payout::drain_once(&pool, &cfg, &signer).await.unwrap();
     payout::drain_once(&pool, &cfg, &signer).await.unwrap(); // second pass: must not re-alert
@@ -364,7 +379,7 @@ async fn an_ambiguous_payout_counts_against_the_daily_cap() {
     cfg.daily_payout_cap_clt = 15_000_000;
     pending_redemption(&pool, 10_000_000).await;
     pending_redemption(&pool, 10_000_000).await;
-    let signer = CountingSigner { reply: PayoutReply::Ambiguous("timeout".into()), calls: AtomicUsize::new(0) };
+    let signer = CountingSigner { reply: PayoutReply::Ambiguous("timeout".into()), calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
 
     payout::drain_once(&pool, &cfg, &signer).await.unwrap();
 
@@ -380,7 +395,7 @@ async fn the_daily_cap_window_ignores_a_stale_claim_even_after_it_is_touched_aga
     cfg.daily_payout_cap_clt = 10_000_000;
 
     let old = pending_redemption(&pool, 10_000_000).await;
-    let old_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "old-tx".into() }, calls: AtomicUsize::new(0) };
+    let old_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "old-tx".into() }, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
     payout::drain_once(&pool, &cfg, &old_signer).await.unwrap();
 
     sqlx::query(
@@ -393,7 +408,7 @@ async fn the_daily_cap_window_ignores_a_stale_claim_even_after_it_is_touched_aga
     .unwrap();
 
     pending_redemption(&pool, 10_000_000).await;
-    let new_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "new-tx".into() }, calls: AtomicUsize::new(0) };
+    let new_signer = CountingSigner { reply: PayoutReply::Paid { tx_id: "new-tx".into() }, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
     payout::drain_once(&pool, &cfg, &new_signer).await.unwrap();
 
     assert_eq!(new_signer.calls.load(Ordering::SeqCst), 1,
@@ -425,6 +440,7 @@ async fn a_payout_ref_write_failure_alerts_with_the_tx_id_and_keeps_the_pass_goi
     let signer = CountingSigner {
         reply: PayoutReply::Paid { tx_id: "constrained-tx".into() },
         calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
     };
 
     // Self-healing in case a previous run of this test panicked before reaching its own DROP
@@ -580,6 +596,7 @@ async fn a_repeatedly_refused_payout_alerts_once_not_every_pass() {
             need_usdt: 10_000_000,
         },
         calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
     };
     let cfg = config();
 
@@ -600,7 +617,7 @@ async fn a_repeatedly_refused_payout_alerts_once_not_every_pass() {
 async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
     let pool = pool().await;
     let lower = "0xaaaa0000000000000000000000000000000000cd";
-    let intent = create_redemption_intent(&pool, lower, "TTronAddrCase", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, lower, "TTronAddrCase", 2_000_000, 2_000_000).await.unwrap();
 
     // Same account, checksummed the way a wallet might present it.
     let mixed = "0xAAAA0000000000000000000000000000000000CD";
@@ -624,12 +641,12 @@ async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
 #[tokio::test]
 async fn a_float_being_topped_up_with_trx_does_not_page_anyone() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa0000000000000000000000000000000000ef", "TTronAddrTrx", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa0000000000000000000000000000000000ef", "TTronAddrTrx", 2_000_000, 2_000_000).await.unwrap();
     treasury_service::watcher::confirm_burn(
         &pool, &intent.redemption_ref, "0xaaaa0000000000000000000000000000000000ef", 2_000_000, "0xburntrx",
     ).await.unwrap();
 
-    let signer = CountingSigner { reply: PayoutReply::NeedsTrx, calls: AtomicUsize::new(0) };
+    let signer = CountingSigner { reply: PayoutReply::NeedsTrx, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) };
     payout::drain_once(&pool, &config(), &signer).await.unwrap();
 
     let (status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
@@ -640,4 +657,51 @@ async fn a_float_being_topped_up_with_trx_does_not_page_anyone() {
         "SELECT count(*) FROM alerts WHERE severity = 'p1' AND source = 'payout'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(p1s, 0, "a routine TRX top-up must not page a human");
+}
+
+/// A fee only exists if the payout worker actually pays the quoted net. Paying `amount_clt` would
+/// hand back the full burn and leave nothing in reserve — the fee would be recorded everywhere and
+/// charged nowhere.
+#[tokio::test]
+async fn the_payout_pays_the_quoted_net_not_the_burn() {
+    let pool = pool().await;
+    let id = pending_redemption_paying(&pool, 10_000_000, 9_500_000).await;
+    let signer = CountingSigner {
+        reply: PayoutReply::Paid { tx_id: "feetx".into() },
+        calls: AtomicUsize::new(0),
+        last_amount: AtomicI64::new(0),
+    };
+
+    payout::drain_once(&pool, &config(), &signer).await.unwrap();
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        signer.last_amount.load(Ordering::SeqCst),
+        9_500_000,
+        "the signer must be asked for the net, never the burn amount"
+    );
+    let _ = id;
+}
+
+/// The reconciliation half of the same fee. `custody_withdrawal` is what tells the ledger how much
+/// USDT left the float; `burn_redeemed` separately drops liability by the full burn. Recording the
+/// gross here would understate the reserve by the fee on every redemption, and a reserve reported
+/// below liability is the one condition that halts minting.
+#[tokio::test]
+async fn the_ledger_records_the_usdt_that_actually_left() {
+    let pool = pool().await;
+    let id = pending_redemption_paying(&pool, 10_000_000, 9_500_000).await;
+    sqlx::query("UPDATE redemption_intents SET status = 'payout_submitted', payout_ref = 'feetx' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+
+    let server = MockServer::start().await;
+    mount_confirmed_tx(&server, "feetx").await;
+    let client = TronClient::new(server.uri(), String::new());
+
+    payout::confirm_payouts_once(&pool, &client).await.unwrap();
+
+    let (amount_usdt,): (i64,) = sqlx::query_as(
+        "SELECT amount_usdt FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(amount_usdt, 9_500_000, "the ledger must record the net, or the reserve reads low by the fee");
 }

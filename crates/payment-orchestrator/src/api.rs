@@ -271,9 +271,18 @@ async fn create_redemption_handler(
 
     let mut resp_headers = HeaderMap::new();
     let (status, payload) = match outcome {
-        RedemptionOutcome::Created { id, redemption_ref, amount_clt, status } => (
+        RedemptionOutcome::Created { id, redemption_ref, amount_clt, payout_amount_usdt, fee_usdt, status } => (
             StatusCode::CREATED,
-            json!({"id": id, "redemption_ref": redemption_ref, "amount_clt": amount_clt, "status": status}),
+            // `amount_clt` is what to burn; `payout_amount_usdt` is what arrives. A client showing
+            // only the first would be quoting a number the user does not receive.
+            json!({
+                "id": id,
+                "redemption_ref": redemption_ref,
+                "amount_clt": amount_clt,
+                "payout_amount_usdt": payout_amount_usdt,
+                "fee_usdt": fee_usdt,
+                "status": status,
+            }),
         ),
         // 503, not 400: this isn't a malformed request, it's a feature not turned on yet — the
         // treasury's payout rail itself is real, but redemptions_enabled stays false until its

@@ -51,7 +51,18 @@ pub fn is_valid_tron_address(address: &str) -> bool {
 
 #[derive(Debug)]
 pub enum RedemptionOutcome {
-    Created { id: Uuid, redemption_ref: String, amount_clt: i64, status: String },
+    Created {
+        id: Uuid,
+        redemption_ref: String,
+        /// What the caller must burn.
+        amount_clt: i64,
+        /// What they will be paid, after the treasury's redemption fee. Equal to `amount_clt`
+        /// when no fee is configured. Carried separately because the caller has to see it BEFORE
+        /// they burn — afterwards there is nothing they can do about it.
+        payout_amount_usdt: i64,
+        fee_usdt: i64,
+        status: String,
+    },
     InvalidAddress,
     OutOfBounds { min: i64, max: i64 },
     Disabled,
@@ -141,6 +152,14 @@ pub async fn create_redemption(
         None => return RedemptionOutcome::Failed(format!("treasury response had no redemption_ref: {body}")),
     };
     let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    // Falls back to par rather than failing the request. A treasury too old to send these fields
+    // is one that charges no fee, so par is its true answer — and refusing here would break
+    // redemptions outright during the window where the two services deploy at different times.
+    let payout_amount_usdt = body
+        .get("payout_amount_usdt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(amount_clt);
+    let fee_usdt = amount_clt - payout_amount_usdt;
 
     let id = Uuid::new_v4();
     let insert = sqlx::query(
@@ -159,7 +178,14 @@ pub async fn create_redemption(
     .await;
 
     match insert {
-        Ok(_) => RedemptionOutcome::Created { id, redemption_ref, amount_clt, status },
+        Ok(_) => RedemptionOutcome::Created {
+            id,
+            redemption_ref,
+            amount_clt,
+            payout_amount_usdt,
+            fee_usdt,
+            status,
+        },
         Err(e) => RedemptionOutcome::Failed(format!("failed to store redemption mapping: {e}")),
     }
 }
