@@ -1,4 +1,7 @@
 http_addr = "0.0.0.0:8090"
+# Prometheus scrape target. Its own port, and published nowhere in compose: the metrics
+# listener is reachable only from inside the docker network.
+metrics_addr = "0.0.0.0:9101"
 database_url = "postgres://postgres:postgres@localhost:5433/treasury"
 node_ws_url = "ws://localhost:8081/ws"
 chain_id = 2077

@@ -1,6 +1,7 @@
 use treasury_service::api;
 use treasury_service::configuration::AppConfig;
 use treasury_service::payout;
+use treasury_service::metrics;
 use treasury_service::tron_verifier::TronClient;
 
 /// How long to wait before retrying a FAILED reconciliation run. Deliberately far shorter than
@@ -215,6 +216,8 @@ async fn main() {
     }
 
     let app = api::router(pool.clone(), config.clone());
+    metrics::serve(pool.clone(), config.metrics_addr.clone());
+
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("treasury-service listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");
