@@ -1,6 +1,6 @@
 # Redemption payout rail — design
 
-Status: approved design, not yet implemented
+Status: implemented (merged 2026-08-30); redemptions stay disabled until the section 5 rollout checklist has run
 Date: 2026-08-30
 Scope: `clutch-treasury` (treasury-service, tron-signer), `clutch-deploy` (ops), workspace `CLAUDE.md`
 
