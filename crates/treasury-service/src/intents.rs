@@ -159,6 +159,9 @@ pub struct RedemptionIntent {
     pub status: String,
     pub redemption_ref: String,
     pub burn_tx_hash: Option<String>,
+    /// The Tron transaction that paid the redeemer, once one has been broadcast. `None`
+    /// until then, and still `None` on a redemption that never gets paid.
+    pub payout_ref: Option<String>,
 }
 
 /// Plan C T6's status read. Without it the orchestrator's `GET /api/v1/redemptions/:id` could only
@@ -167,7 +170,7 @@ pub struct RedemptionIntent {
 /// one redemption intent before this.
 pub async fn find_redemption_by_id(pool: &PgPool, id: Uuid) -> Result<Option<RedemptionIntent>, sqlx::Error> {
     sqlx::query_as::<_, RedemptionIntent>(
-        "SELECT id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash
+        "SELECT id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash, payout_ref
          FROM redemption_intents WHERE id = $1",
     )
     .bind(id)
@@ -185,7 +188,7 @@ pub async fn create_redemption_intent(
     sqlx::query_as::<_, RedemptionIntent>(
         "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, redemption_ref)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash",
+         RETURNING id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash, payout_ref",
     )
     .bind(id)
     .bind(redeemer_address)
