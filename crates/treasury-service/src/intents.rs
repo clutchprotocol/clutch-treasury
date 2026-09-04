@@ -159,9 +159,11 @@ pub async fn approve_mint_intent(
 /// Quoted once, at creation, and stored. Recomputing at payout time would let a fee change between
 /// the quote and the payment, and the burn in between cannot be undone.
 pub fn net_payout(amount_clt: i64, fee_usdt: i64) -> Option<i64> {
-    // Red step: no fee applied yet.
-    let _ = fee_usdt;
-    Some(amount_clt)
+    let net = amount_clt.checked_sub(fee_usdt)?;
+    if net <= 0 {
+        return None;
+    }
+    Some(net)
 }
 
 #[derive(Debug, sqlx::FromRow)]
