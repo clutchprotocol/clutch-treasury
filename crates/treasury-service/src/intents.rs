@@ -188,7 +188,7 @@ pub async fn create_redemption_intent(
     sqlx::query_as::<_, RedemptionIntent>(
         "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, redemption_ref)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash",
+         RETURNING id, redeemer_address, payout_address, amount_clt, status, redemption_ref, burn_tx_hash, payout_ref",
     )
     .bind(id)
     .bind(redeemer_address)
