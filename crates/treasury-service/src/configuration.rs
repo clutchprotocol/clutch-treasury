@@ -8,6 +8,12 @@ fn default_max_node_lag_blocks() -> u64 {
     50
 }
 
+/// $1, in micro-USDT. A starting point, NOT a measurement: the real number is what one sweep
+/// costs in TRX at your energy prices, and it moves. Raise it once you have observed the cost.
+fn default_sweep_min_usdt() -> i64 {
+    1_000_000
+}
+
 fn default_metrics_addr() -> String {
     "0.0.0.0:9101".to_string()
 }
@@ -70,6 +76,15 @@ pub struct AppConfig {
     /// ...or once it is this old, whatever the balance. Without this a sub-threshold balance sits
     /// forever and the reserve fragments across addresses nobody revisits.
     pub sweep_max_age_hours: i64,
+    /// The floor under that age valve: never sweep less than this (micro-USDT), however old.
+    ///
+    /// Without a floor the age rule also sweeps dust, and a TRC-20 transfer costs TRX for energy —
+    /// so moving $0.10 can burn several dollars of it. That is a real loss. Leaving the dust alone
+    /// is not: an unswept deposit address is still counted in the reserve, and since addresses are
+    /// permanent per user, the balance sweeps by itself once that user's next deposit lifts it over
+    /// this line.
+    #[serde(default = "default_sweep_min_usdt")]
+    pub sweep_min_usdt: i64,
     pub signer_url: String,
     pub signer_token: String,
 }
