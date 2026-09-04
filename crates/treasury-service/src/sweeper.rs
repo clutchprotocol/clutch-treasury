@@ -32,14 +32,26 @@ use crate::tron_verifier::TronClient;
 /// sub-threshold balance sits at its address indefinitely and the reserve fragments permanently
 /// across addresses nobody revisits — the reserve SUM stays correct, but the funds become unusable
 /// in practice and the fragmentation only grows.
+///
+/// `min_usdt` is the floor under that valve. Left unbounded the valve eventually sweeps dust too,
+/// and a transfer costing more TRX than the USDT it recovers is a loss taken on purpose. Leaving
+/// dust alone costs nothing by comparison: an unswept address is already counted in the reserve,
+/// and because deposit addresses are permanent per user, the balance sweeps by itself once that
+/// user's next deposit lifts it over the line.
 pub fn should_sweep(
     balance_usdt: i64,
     threshold_usdt: i64,
     age_hours: i64,
     max_age_hours: i64,
-    _min_usdt: i64,
+    min_usdt: i64,
 ) -> bool {
     if balance_usdt <= 0 {
+        return false;
+    }
+    // Gates BOTH arms below, not just the age one. Spending more than the balance is wrong
+    // whichever rule asked for the sweep, so a floor misconfigured above the threshold still
+    // wins instead of being bypassed by the threshold arm.
+    if balance_usdt < min_usdt {
         return false;
     }
     balance_usdt >= threshold_usdt || age_hours >= max_age_hours
