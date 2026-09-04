@@ -166,7 +166,13 @@ async fn in_flight_mint_amount(pool: &PgPool) -> Result<i64, sqlx::Error> {
 pub async fn unswept_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT DISTINCT deposit_address FROM mint_intents
-         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND status IN ('approved', 'submitted', 'credited')",
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL
+           AND status IN ('approved', 'submitted', 'credited', 'needs_manual')",
+        // `needs_manual` counts on purpose: it is a verified deposit waiting on a human
+        // (over the per-transaction cap), its custody_deposit event is already in the
+        // ledger, and its USDT is still at the address. Leaving it out would read the
+        // reserve short and halt minting over money that is present.
+
     )
     .fetch_all(pool)
     .await

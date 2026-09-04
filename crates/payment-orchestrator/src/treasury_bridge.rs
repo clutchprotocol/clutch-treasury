@@ -149,6 +149,10 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
 /// - `credited` → deposit `credited`.
 /// - `rejected`/`failed` → deposit `needs_manual` + a P1 alert naming the fact that funds are
 ///   unminted in custody and that re-minting needs a brand-new treasury intent.
+/// - `needs_manual` → deposit `needs_manual` + a P1 that says the opposite about recovery:
+///   the treasury intent is over the per-transaction mint cap and is approvable again once a
+///   human raises the cap, so this bridge keeps polling and credits the deposit when the
+///   treasury does.
 /// - anything else (`created`/`approved`/`submitted`) → still in flight, nothing to do yet.
 async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &DepositIntent) {
     let Some(treasury_id) = intent.treasury_intent_id else {
@@ -190,9 +194,30 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
 
     match body.get("status").and_then(|v| v.as_str()) {
         Some("credited") => {
-            let _ = deposits::transition(pool, intent.id, &["mint_requested"], "credited").await;
+            // From `needs_manual` too: a deposit parked over the cap is credited once a human
+            // raises the cap and approves the treasury intent again.
+            let _ = deposits::transition(pool, intent.id, &["mint_requested", "needs_manual"], "credited")
+                .await;
+        }
+        Some("needs_manual") => {
+            let applied = deposits::transition(pool, intent.id, &["mint_requested"], "needs_manual").await;
+            if matches!(applied, Ok(true)) {
+                alert(
+                    pool,
+                    "p1",
+                    "treasury_bridge",
+                    &format!(
+                        "deposit {} treasury mint intent {treasury_id} needs manual review: it is over the per-transaction mint cap. The user's USDT is at their deposit address, unswept and still counted in the reserve; no CLT has been minted. To release it, raise the cap (set-mint-caps) and approve intent {treasury_id} again (mint-intent-approve). This bridge keeps polling and credits the deposit when the treasury does.",
+                        intent.id
+                    ),
+                )
+                .await;
+            }
         }
         Some(s @ ("rejected" | "failed")) => {
+            // Terminal on the treasury side: keep the row pollable so a later resolution is
+            // noticed, but one look a day is plenty for a state only a human changes.
+            let _ = deposits::defer_poll(pool, intent.id, 24).await;
             let applied = deposits::transition(pool, intent.id, &["mint_requested"], "needs_manual").await;
             if matches!(applied, Ok(true)) {
                 alert(
