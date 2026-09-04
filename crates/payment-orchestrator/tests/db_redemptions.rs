@@ -143,6 +143,28 @@ fn redemption_intent_response(id: uuid::Uuid, redemption_ref: &str, amount_clt: 
         "redeemer_address": "whatever-the-request-carried",
         "payout_address": VALID_TRON_ADDRESS,
         "amount_clt": amount_clt,
+        "payout_amount_usdt": amount_clt,
+        "fee_usdt": 0,
+        "status": "created",
+        "redemption_ref": redemption_ref,
+        "burn_tx_hash": serde_json::Value::Null,
+    })
+}
+
+/// The same, quoting a fee: the caller burns `amount_clt` and is paid `payout_amount_usdt`.
+fn redemption_intent_response_with_fee(
+    id: uuid::Uuid,
+    redemption_ref: &str,
+    amount_clt: i64,
+    payout_amount_usdt: i64,
+) -> Value {
+    json!({
+        "id": id,
+        "redeemer_address": "whatever-the-request-carried",
+        "payout_address": VALID_TRON_ADDRESS,
+        "amount_clt": amount_clt,
+        "payout_amount_usdt": payout_amount_usdt,
+        "fee_usdt": amount_clt - payout_amount_usdt,
         "status": "created",
         "redemption_ref": redemption_ref,
         "burn_tx_hash": serde_json::Value::Null,
@@ -808,4 +830,35 @@ async fn a_mixed_case_address_token_is_stored_lowercased() {
         .await
         .unwrap();
     assert_eq!(stored, mixed.to_ascii_lowercase(), "stored canonical, not as typed");
+}
+
+/// A fee the user only discovers after burning is a fee taken without consent, and the burn
+/// cannot be undone. The treasury quotes the net; this route is the only thing the user actually
+/// talks to, so it has to pass that quote on rather than echo the amount they asked to redeem.
+#[tokio::test]
+async fn the_create_response_tells_the_caller_what_they_will_actually_receive() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(
+            redemption_intent_response_with_fee(treasury_id, "ref-fee", 2_000_000, 1_500_000),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let app = router_with(pool.clone(), test_config(server.uri(), true));
+    let res = app
+        .oneshot(post_redemption_request(&bearer_for(ALICE_ADDR), VALID_TRON_ADDRESS, 2_000_000))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = body_json_of(res).await;
+    assert_eq!(body["amount_clt"], 2_000_000, "the burn is still the full amount");
+    assert_eq!(body["payout_amount_usdt"], 1_500_000, "the caller must see the net before burning");
+    assert_eq!(body["fee_usdt"], 500_000, "and what it cost them");
 }
