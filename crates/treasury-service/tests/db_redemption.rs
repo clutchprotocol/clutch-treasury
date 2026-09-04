@@ -590,3 +590,28 @@ async fn a_repeatedly_refused_payout_alerts_once_not_every_pass() {
         .fetch_one(&pool).await.unwrap();
     assert_eq!(alerts, 1, "a dry float must alert once, not once per pass");
 }
+
+/// The burn sender and the recorded redeemer are the same account when they differ only in case —
+/// a checksummed address is not a different person. This comparison runs AFTER the CLT is already
+/// destroyed and a mismatch means the intent is failed and never paid, so treating a case
+/// difference as a mismatch would burn someone's money and refuse them the payout.
+#[tokio::test]
+async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
+    let pool = pool().await;
+    let lower = "0xaaaa0000000000000000000000000000000000cd";
+    let intent = create_redemption_intent(&pool, lower, "TTronAddrCase", 2_000_000).await.unwrap();
+
+    // Same account, checksummed the way a wallet might present it.
+    let mixed = "0xAAAA0000000000000000000000000000000000CD";
+    treasury_service::watcher::confirm_burn(&pool, &intent.redemption_ref, mixed, 2_000_000, "0xburncase")
+        .await
+        .unwrap();
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(intent.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(status, "failed", "a case difference must never refuse a payout on a burned redemption");
+    assert_eq!(status, "payout_pending", "it is the same account, so the burn is confirmed");
+}

@@ -30,6 +30,46 @@ const JWT_SECRET: &str = "test-jwt-secret";
 /// invented, so the corruption test below starts from a fixture that's actually valid.
 const VALID_TRON_ADDRESS: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
+/// `alice`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const ALICE_ADDR: &str = "0x616c696365000000000000000000000000000001";
+/// `bob`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const BOB_ADDR: &str = "0x626f620000000000000000000000000000000002";
+/// `carol`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const CAROL_ADDR: &str = "0x6361726f6c000000000000000000000000000003";
+/// `dave`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const DAVE_ADDR: &str = "0x6461766500000000000000000000000000000004";
+/// `down`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const DOWN_ADDR: &str = "0x646f776e00000000000000000000000000000005";
+/// `eve`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const EVE_ADDR: &str = "0x6576650000000000000000000000000000000006";
+/// `frank`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const FRANK_ADDR: &str = "0x6672616e6b000000000000000000000000000007";
+/// `intruder`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const INTRUDER_ADDR: &str = "0x696e747275646572000000000000000000000008";
+/// `live`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const LIVE_ADDR: &str = "0x6c69766500000000000000000000000000000009";
+/// `nobody`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const NOBODY_ADDR: &str = "0x6e6f626f6479000000000000000000000000000a";
+/// `owner`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const OWNER_ADDR: &str = "0x6f776e657200000000000000000000000000000b";
+/// `paid`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const PAID_ADDR: &str = "0x706169640000000000000000000000000000000c";
+/// `unpaid`, address-shaped: the redemption route requires a canonical address as the JWT subject,
+/// because the treasury matches it against the burn's on-chain sender before it will pay.
+const UNPAID_ADDR: &str = "0x756e70616964000000000000000000000000000d";
+
 async fn pool() -> PgPool {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run via docker-compose.test.yml)");
     let (prefix, dbname) = base_url.rsplit_once('/').expect("DATABASE_URL must contain a database name");
@@ -138,7 +178,7 @@ async fn redeemer_address_comes_from_jwt_never_from_request_body() {
     Mock::given(method("POST"))
         .and(path("/internal/redemption-intents"))
         .and(body_json(json!({
-            "redeemer_address": "0xalice",
+            "redeemer_address": ALICE_ADDR,
             "payout_address": VALID_TRON_ADDRESS,
             "amount_clt": 2_000_000,
         })))
@@ -157,7 +197,7 @@ async fn redeemer_address_comes_from_jwt_never_from_request_body() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/redemptions")
-        .header("authorization", bearer_for("0xalice"))
+        .header("authorization", bearer_for(ALICE_ADDR))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -181,7 +221,7 @@ async fn redeemer_address_comes_from_jwt_never_from_request_body() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(user_pk, "0xalice", "the stored owner must be the JWT's pk, never anything from the body");
+    assert_eq!(user_pk, ALICE_ADDR, "the stored owner must be the JWT's pk, never anything from the body");
 }
 
 /// A second caller cannot redeem AS someone else either — same property, different angle: even
@@ -196,7 +236,7 @@ async fn different_caller_cannot_name_a_different_redeemer() {
     Mock::given(method("POST"))
         .and(path("/internal/redemption-intents"))
         .and(body_json(json!({
-            "redeemer_address": "0xbob",
+            "redeemer_address": BOB_ADDR,
             "payout_address": VALID_TRON_ADDRESS,
             "amount_clt": 3_000_000,
         })))
@@ -211,7 +251,7 @@ async fn different_caller_cannot_name_a_different_redeemer() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/redemptions")
-        .header("authorization", bearer_for("0xbob"))
+        .header("authorization", bearer_for(BOB_ADDR))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -246,7 +286,7 @@ async fn one_character_corrupted_address_is_rejected_despite_passing_shape() {
     assert!(corrupted.starts_with('T'), "test bug: corruption changed the leading character");
     assert_ne!(corrupted, VALID_TRON_ADDRESS, "test bug: corruption didn't change anything");
 
-    let res = app.oneshot(post_redemption_request(&bearer_for("0xcarol"), &corrupted, 2_000_000)).await.unwrap();
+    let res = app.oneshot(post_redemption_request(&bearer_for(CAROL_ADDR), &corrupted, 2_000_000)).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST, "checksum-failing address must be rejected even though it passes a shape check");
 }
 
@@ -259,7 +299,7 @@ async fn garbage_address_is_rejected() {
     let config = test_config(server.uri(), true);
     let app = router_with(pool, config);
 
-    let res = app.oneshot(post_redemption_request(&bearer_for("0xcarol"), "not-a-tron-address", 2_000_000)).await.unwrap();
+    let res = app.oneshot(post_redemption_request(&bearer_for(CAROL_ADDR), "not-a-tron-address", 2_000_000)).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -274,13 +314,13 @@ async fn out_of_bounds_amount_is_rejected() {
 
     let too_small = app
         .clone()
-        .oneshot(post_redemption_request(&bearer_for("0xdave"), VALID_TRON_ADDRESS, 1))
+        .oneshot(post_redemption_request(&bearer_for(DAVE_ADDR), VALID_TRON_ADDRESS, 1))
         .await
         .unwrap();
     assert_eq!(too_small.status(), StatusCode::BAD_REQUEST, "below min_redemption_clt must be rejected");
 
     let too_large = app
-        .oneshot(post_redemption_request(&bearer_for("0xdave"), VALID_TRON_ADDRESS, 999_000_000))
+        .oneshot(post_redemption_request(&bearer_for(DAVE_ADDR), VALID_TRON_ADDRESS, 999_000_000))
         .await
         .unwrap();
     assert_eq!(too_large.status(), StatusCode::BAD_REQUEST, "above max_redemption_clt must be rejected");
@@ -305,7 +345,7 @@ async fn get_redemption_rejects_non_owner() {
 
     let create_res = app
         .clone()
-        .oneshot(post_redemption_request(&bearer_for("0xowner"), VALID_TRON_ADDRESS, 2_000_000))
+        .oneshot(post_redemption_request(&bearer_for(OWNER_ADDR), VALID_TRON_ADDRESS, 2_000_000))
         .await
         .unwrap();
     assert_eq!(create_res.status(), StatusCode::CREATED);
@@ -319,7 +359,7 @@ async fn get_redemption_rejects_non_owner() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xowner"))
+                .header("authorization", bearer_for(OWNER_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -335,7 +375,7 @@ async fn get_redemption_rejects_non_owner() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xintruder"))
+                .header("authorization", bearer_for(INTRUDER_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -365,7 +405,7 @@ async fn get_redemption_reports_live_treasury_status_not_the_creation_snapshot()
         .and(path(format!("/internal/redemption-intents/{treasury_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": treasury_id,
-            "redeemer_address": "0xlive",
+            "redeemer_address": LIVE_ADDR,
             "payout_address": VALID_TRON_ADDRESS,
             "amount_clt": 2_000_000,
             "status": "paid",
@@ -380,7 +420,7 @@ async fn get_redemption_reports_live_treasury_status_not_the_creation_snapshot()
 
     let created = body_json_of(
         app.clone()
-            .oneshot(post_redemption_request(&bearer_for("0xlive"), VALID_TRON_ADDRESS, 2_000_000))
+            .oneshot(post_redemption_request(&bearer_for(LIVE_ADDR), VALID_TRON_ADDRESS, 2_000_000))
             .await
             .unwrap(),
     )
@@ -401,7 +441,7 @@ async fn get_redemption_reports_live_treasury_status_not_the_creation_snapshot()
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xlive"))
+                .header("authorization", bearer_for(LIVE_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -434,7 +474,7 @@ async fn get_redemption_falls_back_to_stored_status_and_flags_it_when_treasury_i
 
     let created = body_json_of(
         app.clone()
-            .oneshot(post_redemption_request(&bearer_for("0xdown"), VALID_TRON_ADDRESS, 2_000_000))
+            .oneshot(post_redemption_request(&bearer_for(DOWN_ADDR), VALID_TRON_ADDRESS, 2_000_000))
             .await
             .unwrap(),
     )
@@ -446,7 +486,7 @@ async fn get_redemption_falls_back_to_stored_status_and_flags_it_when_treasury_i
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xdown"))
+                .header("authorization", bearer_for(DOWN_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -472,7 +512,7 @@ async fn get_redemption_for_unknown_id_is_404() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{}", uuid::Uuid::new_v4()))
-                .header("authorization", bearer_for("0xnobody"))
+                .header("authorization", bearer_for(NOBODY_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -501,7 +541,7 @@ async fn both_routes_503_while_redemptions_disabled() {
     // validation or the treasury call.
     let post_res = app
         .clone()
-        .oneshot(post_redemption_request(&bearer_for("0xeve"), VALID_TRON_ADDRESS, 2_000_000))
+        .oneshot(post_redemption_request(&bearer_for(EVE_ADDR), VALID_TRON_ADDRESS, 2_000_000))
         .await
         .unwrap();
     assert_eq!(post_res.status(), StatusCode::SERVICE_UNAVAILABLE, "POST must 503 while redemptions_enabled is false");
@@ -526,7 +566,7 @@ async fn both_routes_503_while_redemptions_disabled() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{seeded_id}"))
-                .header("authorization", bearer_for("0xeve"))
+                .header("authorization", bearer_for(EVE_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -595,7 +635,7 @@ async fn treasury_rejection_surfaces_as_bad_gateway_not_500() {
     let config = test_config(server.uri(), true);
     let app = router_with(pool, config);
 
-    let res = app.oneshot(post_redemption_request(&bearer_for("0xfrank"), VALID_TRON_ADDRESS, 2_000_000)).await.unwrap();
+    let res = app.oneshot(post_redemption_request(&bearer_for(FRANK_ADDR), VALID_TRON_ADDRESS, 2_000_000)).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
@@ -617,7 +657,7 @@ async fn get_redemption_forwards_the_payout_transaction_once_there_is_one() {
         .and(path(format!("/internal/redemption-intents/{treasury_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": treasury_id,
-            "redeemer_address": "0xpaid",
+            "redeemer_address": PAID_ADDR,
             "payout_address": VALID_TRON_ADDRESS,
             "amount_clt": 2_000_000,
             "status": "paid",
@@ -632,7 +672,7 @@ async fn get_redemption_forwards_the_payout_transaction_once_there_is_one() {
     let app = router_with(pool.clone(), config);
     let created = body_json_of(
         app.clone()
-            .oneshot(post_redemption_request(&bearer_for("0xpaid"), VALID_TRON_ADDRESS, 2_000_000))
+            .oneshot(post_redemption_request(&bearer_for(PAID_ADDR), VALID_TRON_ADDRESS, 2_000_000))
             .await
             .unwrap(),
     )
@@ -644,7 +684,7 @@ async fn get_redemption_forwards_the_payout_transaction_once_there_is_one() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xpaid"))
+                .header("authorization", bearer_for(PAID_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -674,7 +714,7 @@ async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_st
         .and(path(format!("/internal/redemption-intents/{treasury_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": treasury_id,
-            "redeemer_address": "0xunpaid",
+            "redeemer_address": UNPAID_ADDR,
             "payout_address": VALID_TRON_ADDRESS,
             "amount_clt": 2_000_000,
             "status": "payout_pending",
@@ -688,7 +728,7 @@ async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_st
     let app = router_with(pool.clone(), config);
     let created = body_json_of(
         app.clone()
-            .oneshot(post_redemption_request(&bearer_for("0xunpaid"), VALID_TRON_ADDRESS, 2_000_000))
+            .oneshot(post_redemption_request(&bearer_for(UNPAID_ADDR), VALID_TRON_ADDRESS, 2_000_000))
             .await
             .unwrap(),
     )
@@ -700,7 +740,7 @@ async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_st
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/redemptions/{id}"))
-                .header("authorization", bearer_for("0xunpaid"))
+                .header("authorization", bearer_for(UNPAID_ADDR))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -711,4 +751,61 @@ async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_st
     assert_eq!(body["status"], "payout_pending", "a missing receipt must not cost us the status");
     assert!(body["payout_ref"].is_null(), "no payout yet means no receipt");
     assert_eq!(body["status_live"], true);
+}
+
+/// A public-key-shaped token must be refused here for a harsher reason than on the deposit route.
+/// The treasury matches the burn's on-chain sender against `redeemer_address` before it will pay,
+/// so a redemption created under a public key can never be honoured: the user burns their CLT, the
+/// match fails, and `confirm_burn` marks the intent failed and never pays out. A 400 now is the
+/// difference between an error message and somebody's money.
+#[tokio::test]
+async fn a_public_key_token_cannot_create_a_redemption() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let pubkey = format!("04{}", "ab".repeat(64));
+    let res = app
+        .oneshot(post_redemption_request(&bearer_for(&pubkey), VALID_TRON_ADDRESS, 2_000_000))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "a token that can never match must not create a redemption");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM redemption_map WHERE user_pk = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "and nothing may be recorded for it");
+}
+
+/// A checksummed (mixed-case) address is the same account as its lowercase form, and it is stored
+/// lowercase so the treasury's sender match has one canonical thing to compare against.
+#[tokio::test]
+async fn a_mixed_case_address_token_is_stored_lowercased() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-mixed", 2_000_000)))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+
+    let mixed = "0xAAAA000000000000000000000000000000000ABC";
+    let res = app
+        .oneshot(post_redemption_request(&bearer_for(mixed), VALID_TRON_ADDRESS, 2_000_000))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let stored: String = sqlx::query_scalar("SELECT user_pk FROM redemption_map ORDER BY created_at DESC LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, mixed.to_ascii_lowercase(), "stored canonical, not as typed");
 }

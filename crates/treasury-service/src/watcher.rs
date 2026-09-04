@@ -83,7 +83,12 @@ pub async fn confirm_burn(
         return Ok(()); // Unknown ref or already past `created` — not this function's concern.
     };
 
-    if redeemer_address != sender || expected_amount != amount_clt {
+    // Case-insensitively, deliberately. This comparison decides whether an ALREADY-BURNED
+    // redemption is honoured, and the burn cannot be undone — so a difference that is not a
+    // difference in identity must never be the thing that refuses a payout. The workspace rule
+    // is that these addresses are compared case-insensitively (see the demo app's normAddr);
+    // an exact compare here made a checksummed address indistinguishable from a wrong one.
+    if !redeemer_address.eq_ignore_ascii_case(sender) || expected_amount != amount_clt {
         let r = format!(
             "redemption {intent_id}: burn on ref '{redemption_ref}' mismatched \
              (expected sender={redeemer_address} amount={expected_amount}, \
