@@ -27,15 +27,7 @@ struct OutboxRow {
     beneficiary: String,
     amount_clt: i64,
     credit_ref: String,
-}
-
-/// ponytail: Plan C's deposit-backed intents (`client_ref IS NOT NULL`) don't exist yet —
-/// that column lands with the orchestrator's migration 0002, not this task. Until then no
-/// intent can be deposit-backed, so this always returns false. When the column lands, swap
-/// this for a real read (`row.client_ref.is_some()`) — the caller below is already wired to
-/// park instead of fail on `true`, so that's the only edit needed.
-fn is_deposit_backed(_intent_id: Uuid) -> bool {
-    false
+    client_ref: Option<String>,
 }
 
 /// Picks due `pending` outbox rows, re-checks breakers (approval alone is never
@@ -55,8 +47,8 @@ pub async fn drain_once(
     config: &AppConfig,
 ) -> Result<u32, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    let rows: Vec<OutboxRow> = sqlx::query_as::<_, (i64, Uuid, i32, String, i64, String)>(
-        "SELECT o.id, o.intent_id, o.attempts, i.beneficiary, i.amount_clt, i.credit_ref
+    let rows: Vec<OutboxRow> = sqlx::query_as::<_, (i64, Uuid, i32, String, i64, String, Option<String>)>(
+        "SELECT o.id, o.intent_id, o.attempts, i.beneficiary, i.amount_clt, i.credit_ref, i.client_ref
          FROM chain_outbox o
          JOIN mint_intents i ON i.id = o.intent_id
          WHERE o.status = 'pending' AND o.next_attempt_at <= now()
@@ -67,13 +59,14 @@ pub async fn drain_once(
     .await
     .map_err(|e| e.to_string())?
     .into_iter()
-    .map(|(outbox_id, intent_id, attempts, beneficiary, amount_clt, credit_ref)| OutboxRow {
+    .map(|(outbox_id, intent_id, attempts, beneficiary, amount_clt, credit_ref, client_ref)| OutboxRow {
         outbox_id,
         intent_id,
         attempts,
         beneficiary,
         amount_clt,
         credit_ref,
+        client_ref,
     })
     .collect();
     tx.commit().await.map_err(|e| e.to_string())?;
@@ -129,9 +122,13 @@ pub async fn drain_once(
         // stale, or the daily cap can fill. `_excluding` because this intent is already
         // `approved` and therefore already inside the daily-cap sum the plain check_mint reads.
         if let Err(denial) = breakers::check_mint_excluding(pool, config, row.amount_clt, row.intent_id).await {
-            if is_deposit_backed(row.intent_id) {
-                // The deposit is real and verified; only the cap window is tight right now.
-                // Park for retry without counting toward permanent failure — attempts untouched.
+            // `client_ref` is set only by the orchestrator, for an intent backed by a verified
+            // on-chain deposit. That USDT is real and already at a derived address, so a cap
+            // window being tight right now is not a reason to give up on it: park for retry with
+            // attempts untouched. Failing it would strand the deposit — a `failed` row leaves the
+            // reserve sum and the sweeper ignores it — which is exactly what happened to a 1,000
+            // USDT deposit on 2026-09-03 while this read was still a placeholder `false`.
+            if row.client_ref.is_some() {
                 park_row(pool, row.outbox_id, &denial.reason).await?;
             } else {
                 fail_or_backoff(pool, row.outbox_id, row.intent_id, row.attempts, &denial.reason).await?;

@@ -131,3 +131,51 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         signer_token: "s".into(),
     }
 }
+
+/// A deposit-backed intent (`client_ref` set — only the orchestrator sets it, and only for a
+/// verified on-chain deposit) that the breaker denies at submission time must PARK, not burn an
+/// attempt. The USDT is real and already sitting at a derived address, so failing the intent after
+/// ten tight-cap passes strands it: a `failed` row leaves the reserve sum and the sweeper skips it.
+/// A hand-created intent has no such backing and takes the ordinary fail-or-backoff path. Both are
+/// denied by the same cap in the same pass, so the only difference between them is `client_ref`.
+#[tokio::test]
+async fn a_deposit_backed_intent_denied_by_the_breaker_parks_instead_of_failing() {
+    let pool = pool().await;
+    let deposit_tx = "aa".repeat(32);
+    let backed = create_mint_intent(
+        &pool, "0x4444444444444444444444444444444444444444", 1_000_000, "orchestrator",
+        Some("deposit-ref-1"), Some(deposit_tx.as_str()), Some(1_000_000),
+        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()), Some(7),
+    ).await.unwrap();
+    let manual = create_mint_intent(
+        &pool, "0x5555555555555555555555555555555555555555", 1_000_000, "alice", None, None, None, None, None,
+    ).await.unwrap();
+    approve_mint_intent(&pool, backed.id, "bob").await.unwrap();
+    approve_mint_intent(&pool, manual.id, "bob").await.unwrap();
+
+    // The cap tightens AFTER approval — the real shape of the problem: approval passed, then the
+    // window closed before the outbox reached the row. No peers, so the sync check is skipped and
+    // the node is never contacted; the denial happens before any submission.
+    let mut cfg = test_config();
+    cfg.per_tx_mint_cap_clt = 1_000;
+    let node = clutch_chain::node_client::NodeClient::new("ws://unused".into());
+    let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&cfg.mint_authority_secret).unwrap();
+    let processed = treasury_service::outbox::drain_once(&pool, &node, &[], &signer, &cfg).await.unwrap();
+    assert_eq!(processed, 0, "nothing may be submitted while denied");
+
+    let (status, attempts, parked_for): (String, i32, f64) = sqlx::query_as(
+        "SELECT status, attempts, EXTRACT(EPOCH FROM (next_attempt_at - now()))::float8
+         FROM chain_outbox WHERE intent_id = $1",
+    ).bind(backed.id).fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), attempts), ("pending", 0), "deposit-backed: parked, no attempt consumed");
+    assert!(parked_for > 3000.0, "parked about an hour out, got {parked_for}s");
+
+    let (status, attempts): (String, i32) = sqlx::query_as(
+        "SELECT status, attempts FROM chain_outbox WHERE intent_id = $1",
+    ).bind(manual.id).fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), attempts), ("pending", 1), "hand-created: ordinary backoff, one attempt burned");
+
+    let (intent_status,): (String,) = sqlx::query_as("SELECT status FROM mint_intents WHERE id = $1")
+        .bind(backed.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(intent_status, "approved", "a parked deposit stays approved, and inside the reserve sum");
+}
