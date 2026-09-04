@@ -100,6 +100,7 @@ async fn approve_route_rejects_initiators_own_token() {
 fn test_config() -> treasury_service::configuration::AppConfig {
     treasury_service::configuration::AppConfig {
         http_addr: "0.0.0.0:0".into(),
+        metrics_addr: "0.0.0.0:9101".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
         node_ws_url: "ws://unused".into(),
         node_peer_ws_urls: String::new(),
