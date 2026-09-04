@@ -1,12 +1,16 @@
 //! The signer's HTTP surface.
 //!
-//! Three routes. The sweep route's shape IS its security argument: it accepts an INDEX and nothing
+//! Four routes. The sweep route's shape IS its security argument: it accepts an INDEX and nothing
 //! else, so no field a caller sets can redirect funds.
 //!
 //! The payout route cannot make that claim and does not pretend to — it takes a destination and an
 //! amount because a redemption has no other way to express them. Its bound is different: the source
 //! is always the payout float, so the most a hostile caller moves is the float balance, and the
 //! per-tx cap bounds a single request. Here the bearer token is load-bearing, not defence in depth.
+//!
+//! The fund-float route goes further than sweep: it takes NO parameters at all. Source, destination
+//! and token are fixed and both addresses are derived from the mnemonic, so the only thing it can
+//! be asked for is the one correction it exists to make.
 
 use std::sync::Arc;
 
@@ -20,7 +24,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    payout_response, validate_payout_cap, PayoutOutcome, SweepClient, SweepConfig, SweepOutcome,
+    fund_float_response, payout_response, validate_payout_cap, FundFloatOutcome, PayoutOutcome, SweepClient,
+    SweepConfig, SweepOutcome,
 };
 
 #[derive(Clone)]
@@ -155,6 +160,37 @@ async fn payout(
     }
 }
 
+/// No request struct, deliberately: there is nothing to deserialize.
+///
+/// A `to`, an `amount` or a `contract` here would each turn "move the fee account's misplaced USDT
+/// to where it belongs" into "move what you are told" — and unlike payout, there is no redemption
+/// that needs to express them. The route is POST because it moves money, not because it carries a
+/// body; a body sent anyway is ignored rather than read.
+async fn fund_float(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    match s.sweeper.fund_float(&s.signer).await {
+        Ok(outcome) => {
+            match &outcome {
+                FundFloatOutcome::Funded { tx_id, amount_usdt } => {
+                    tracing::info!(%tx_id, amount_usdt, "moved the fee account's USDT to the payout float")
+                }
+                FundFloatOutcome::NothingToMove => tracing::info!("fee account holds no USDT; nothing to move"),
+                FundFloatOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => {
+                    tracing::warn!(%fee_address, have_sun, need_sun, "fee account cannot pay for its own transfer")
+                }
+                FundFloatOutcome::Refused(reason) => tracing::warn!(%reason, "fund-float refused pre-broadcast"),
+            }
+            Ok(Json(fund_float_response(&outcome)))
+        }
+        // Only reachable at or after the broadcast call, so the operator must treat it as "may have
+        // moved" and read the chain — every provable non-broadcast is a `Refused` above.
+        Err(e) => {
+            tracing::error!("fund-float failed, possibly after broadcasting: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -185,6 +221,7 @@ async fn main() {
         .route("/internal/xpub", get(xpub))
         .route("/internal/sweep", post(sweep))
         .route("/internal/payout", post(payout))
+        .route("/internal/fund-float", post(fund_float))
         .with_state(state);
 
     let addr = std::env::var("APP_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8093".into());

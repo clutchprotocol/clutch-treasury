@@ -24,6 +24,18 @@
 //! including an overpayment, and including a second transfer that arrived after crediting. Sweeping
 //! the full balance means no dust is left stranded at an address nothing will ever look at again,
 //! and it removes a whole class of "how much exactly" arithmetic from the spending path.
+//!
+//! # Moving misplaced USDT off the fee account
+//!
+//! `fund_float` is the most constrained operation in this file: it takes nothing at all. The source
+//! (`1/0`), the destination (`2/0`) and the token are all fixed, and the amount is whatever the fee
+//! account happens to hold — so the only thing a caller who reached this service can ask for is the
+//! one correction the operation exists to make. Sweep at least lets a caller pick an index and
+//! payout a recipient; here there is no input to redirect, so there is nothing to exfiltrate.
+//!
+//! Both addresses are DERIVED, not read from config: a config value can be changed by whoever can
+//! restart the container, a derivation path cannot be changed without the mnemonic. See
+//! docs/superpowers/specs/2026-09-04-fund-float-endpoint-design.md.
 
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 use serde::Deserialize;
@@ -126,6 +138,29 @@ pub enum PayoutOutcome {
     Refused(String),
 }
 
+/// What one fund-float attempt did. Same reason the other two exist: whoever reads the reply must
+/// be able to tell "nothing was broadcast" from "something was", and here that reader is an
+/// operator running a workflow by hand rather than a service that can re-check the chain.
+#[derive(Debug, PartialEq)]
+pub enum FundFloatOutcome {
+    /// Broadcast accepted; `tx_id` is the on-chain transfer and `amount_usdt` is everything the fee
+    /// account held.
+    Funded { tx_id: String, amount_usdt: i64 },
+    /// The fee account holds no USDT — which is its normal state, USDT there being misplaced by
+    /// definition. Not an error: this operation is a correction, and a correction already applied
+    /// must be a no-op rather than a failure.
+    NothingToMove,
+    /// The fee account cannot pay the TRX for its own transfer. Unlike a deposit address or the
+    /// payout float, there is no funding path out of this: the fee account IS what funds those, so
+    /// only an operator topping it up resolves it.
+    FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
+    /// Provably nothing was broadcast: a derivation failed, or a TronGrid read never returned — all
+    /// before anything existed to sign. Follows `PayoutOutcome::Refused`'s rule exactly, including
+    /// where the line is drawn: never used at or after `sign_and_broadcast`, because a failure
+    /// there may have followed a real broadcast.
+    Refused(String),
+}
+
 /// The wire form of a payout outcome.
 ///
 /// Separate from the handler so the status strings are testable without an HTTP rig. These
@@ -148,6 +183,28 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
         }
         PayoutOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
+    }
+}
+
+/// The wire form of a fund-float outcome.
+///
+/// Beside `payout_response` and separate from the handler for the same reason. The reader here is
+/// not another service but the clutch-deploy workflow's run log, which is the only record that a
+/// human will have of whether the transfer happened — so `funded` must always carry its `tx_id`,
+/// and `fee_account_dry` the address to top up.
+pub fn fund_float_response(outcome: &FundFloatOutcome) -> serde_json::Value {
+    match outcome {
+        FundFloatOutcome::Funded { tx_id, amount_usdt } => {
+            serde_json::json!({"status": "funded", "tx_id": tx_id, "amount_usdt": amount_usdt})
+        }
+        FundFloatOutcome::NothingToMove => serde_json::json!({"status": "nothing_to_move"}),
+        FundFloatOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => serde_json::json!({
+            "status": "fee_account_dry",
+            "fee_address": fee_address,
+            "have_sun": have_sun,
+            "need_sun": need_sun,
+        }),
+        FundFloatOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
     }
 }
 
@@ -539,6 +596,116 @@ impl SweepClient {
         let tx_id = self.sign_and_broadcast(&payout_key, tx).await?;
         Ok(PayoutOutcome::Paid { tx_id })
     }
+
+    /// Move everything the fee account holds in USDT to the payout float.
+    ///
+    /// Takes no parameters — not even an index. Source and destination are derived here from this
+    /// service's own mnemonic (`1/0` and `2/0`), the token is config, and the amount is the whole
+    /// balance, so a caller who reached this service can do exactly one thing: move treasury USDT
+    /// from one treasury-controlled address to another.
+    ///
+    /// USDT in the fee account is misplaced by definition — that account exists to pay TRX energy
+    /// and nothing ever intends to send it tokens — and while it sits there it is counted in no
+    /// reserve bucket at all. "Move all of it to where it belongs" is the entire operation, which
+    /// is why there is no amount either. Note the consequence, which is expected and not a bug:
+    /// float USDT IS counted, so this raises the reserve against unchanged liability and
+    /// reconciliation reads over-backed until the numbers are re-baselined.
+    pub async fn fund_float(&self, signer: &Signer) -> Result<FundFloatOutcome, String> {
+        // Everything from here down to the call to `sign_and_broadcast` is provably pre-broadcast —
+        // a derivation or a read-only TronGrid call, never a transaction — so a failure in that
+        // stretch is `Refused`, not `Err`. Same line, drawn in the same place, as `payout`.
+        let from = match signer.fee_address() {
+            Ok(a) => a,
+            Err(e) => return Ok(FundFloatOutcome::Refused(format!("could not derive the fee account address: {e}"))),
+        };
+
+        let amount = match self.usdt_balance(&from).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(FundFloatOutcome::Refused(format!("could not read the fee account's USDT balance: {e}")))
+            }
+        };
+        if amount == 0 {
+            return Ok(FundFloatOutcome::NothingToMove);
+        }
+
+        // Deliberately AFTER the balance read, exactly as sweep and payout order theirs: a fee
+        // account with nothing to move answers NothingToMove without a second TronGrid call, so
+        // re-running this endpoint costs one read and never any chain activity.
+        let trx = match self.trx_balance_sun(&from).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(FundFloatOutcome::Refused(format!("could not read the fee account's TRX balance: {e}")))
+            }
+        };
+        if trx < MIN_TRX_SUN_FOR_TRANSFER {
+            // No two-pass funding path here, unlike sweep and payout: the fee account is what funds
+            // those, so there is nothing to fund IT from. FEE_ACCOUNT_RESERVE_SUN does not apply
+            // either — that reserve exists so an account SENDING TRX keeps enough to pay for the
+            // sending; here the fee account only has to cover its own transfer.
+            return Ok(FundFloatOutcome::FeeAccountDry {
+                fee_address: from,
+                have_sun: trx,
+                need_sun: MIN_TRX_SUN_FOR_TRANSFER,
+            });
+        }
+
+        let to = match signer.payout_address() {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(FundFloatOutcome::Refused(format!("could not derive the payout float address: {e}")))
+            }
+        };
+        // Propagated rather than defaulted, for the reason payout_body spells out: an empty
+        // parameter builds and signs a transfer of nothing to nobody that looks like a real one.
+        let parameter = match transfer_parameter(&to, amount) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(FundFloatOutcome::Refused(format!("could not encode the transfer to the payout float: {e}")))
+            }
+        };
+        // Built inline, as sweep does, so both ends of the transfer are visible at the point of
+        // use: the fee account pays, the derived float receives, and neither came from a caller.
+        let built: serde_json::Value = match self
+            .post(
+                "/wallet/triggersmartcontract",
+                serde_json::json!({
+                    "owner_address": from,
+                    "contract_address": self.cfg.usdt_contract,
+                    "function_selector": "transfer(address,uint256)",
+                    "parameter": parameter,
+                    "fee_limit": self.cfg.fee_limit,
+                    "call_value": 0,
+                    "visible": true,
+                }),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Ok(FundFloatOutcome::Refused(format!("could not build the transfer via TronGrid: {e}"))),
+        };
+        let tx = match built.get("transaction").cloned() {
+            Some(t) => t,
+            None => {
+                return Ok(FundFloatOutcome::Refused(format!(
+                    "trongrid returned no transaction to sign: {}",
+                    describe_rejection(&built)
+                )))
+            }
+        };
+        let fee_key = match signer.fee_signing_key() {
+            Ok(k) => k,
+            Err(e) => {
+                return Ok(FundFloatOutcome::Refused(format!("could not derive the fee account signing key: {e}")))
+            }
+        };
+
+        // Past this point a failure may follow a real broadcast attempt — genuinely ambiguous,
+        // never Refused. This is the only `?` left in the function.
+        let tx_id = self.sign_and_broadcast(&fee_key, tx).await?;
+        tracing::info!("moved {amount} micro-USDT from the fee account {from} to the payout float {to} in {tx_id}");
+        Ok(FundFloatOutcome::Funded { tx_id, amount_usdt: amount })
+    }
 }
 
 #[cfg(test)]
@@ -826,5 +993,214 @@ mod broadcast_tests {
         let d = describe_rejection(&res);
         assert!(d.contains("SIGERROR"), "{d}");
         assert!(d.contains("validate signature error"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod fund_float_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const USDT: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+
+    /// Every TronGrid call the client made, in order, with the body it sent.
+    ///
+    /// Three of the properties this operation has to hold — "nothing was broadcast", "the WHOLE
+    /// balance moved", "USDT is read before TRX" — are about what left the process, and none of
+    /// them can be seen in a return value. wiremock is a dev-dependency of the sibling crates and
+    /// deliberately not of the one that holds the mnemonic; axum and tokio are already dependencies
+    /// here, so a stand-in TronGrid costs a few lines and nothing in Cargo.toml.
+    type Calls = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    #[derive(Clone)]
+    struct Fake {
+        usdt: i64,
+        trx_sun: i64,
+        calls: Calls,
+    }
+
+    /// `sign_and_broadcast` recomputes the txID from `raw_data_hex` and refuses a mismatch, so the
+    /// fixture has to hash honestly rather than return an id of its own choosing.
+    fn fixture_tx_id() -> String {
+        hex::encode(Sha256::digest(hex::decode("0a02").unwrap()))
+    }
+
+    async fn usdt_balance(State(s): State<Fake>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        s.calls.lock().unwrap().push(("usdt_balance".into(), body));
+        Json(serde_json::json!({"constant_result": [format!("{:0>64x}", s.usdt)]}))
+    }
+
+    async fn trx_balance(State(s): State<Fake>, Path(address): Path<String>) -> Json<serde_json::Value> {
+        s.calls.lock().unwrap().push(("trx_balance".into(), serde_json::json!(address)));
+        Json(serde_json::json!({"data": [{"balance": s.trx_sun}]}))
+    }
+
+    async fn build_transfer(State(s): State<Fake>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        s.calls.lock().unwrap().push(("build_transfer".into(), body));
+        Json(serde_json::json!({"transaction": {
+            "txID": fixture_tx_id(),
+            "raw_data": {"contract": []},
+            "raw_data_hex": "0a02",
+            "visible": true,
+        }}))
+    }
+
+    async fn broadcast(State(s): State<Fake>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        s.calls.lock().unwrap().push(("broadcast".into(), body));
+        Json(serde_json::json!({"result": true}))
+    }
+
+    async fn fake_trongrid(usdt: i64, trx_sun: i64) -> (String, Calls) {
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/wallet/triggerconstantcontract", post(usdt_balance))
+            .route("/v1/accounts/:address", get(trx_balance))
+            .route("/wallet/triggersmartcontract", post(build_transfer))
+            .route("/wallet/broadcasttransaction", post(broadcast))
+            .with_state(Fake { usdt, trx_sun, calls: calls.clone() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, calls)
+    }
+
+    /// The whole TronGrid conversation, in the order it happened.
+    fn sequence(calls: &Calls) -> String {
+        calls.lock().unwrap().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(",")
+    }
+
+    fn body_of(calls: &Calls, name: &str) -> serde_json::Value {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no {name} call was made"))
+            .1
+            .clone()
+    }
+
+    fn config(trongrid_url: String) -> SweepConfig {
+        SweepConfig {
+            trongrid_url,
+            trongrid_api_key: String::new(),
+            treasury_address: "TQwgeRaDt4FSJSsncmFNcbMNTfFpjvjwFX".into(),
+            usdt_contract: USDT.into(),
+            fee_limit: 150_000_000,
+            per_tx_payout_cap_usdt: 25_000_000,
+        }
+    }
+
+    fn fixture_signer() -> Signer {
+        Signer::from_mnemonic(MNEMONIC, "").unwrap()
+    }
+
+    /// The whole point of the endpoint: everything the fee account holds, to the address the signer
+    /// derives for `2/0`. Asserted against `payout_address()` and never a literal, so a change to
+    /// the derivation cannot pass this silently — it would otherwise send the treasury's USDT to an
+    /// address no operator has ever funded or looked at.
+    #[tokio::test]
+    async fn the_whole_fee_account_balance_moves_to_the_derived_payout_float() {
+        let balance = 1_000_000_000; // the 1,000 USDT actually sitting on the fee account
+        let (url, calls) = fake_trongrid(balance, MIN_TRX_SUN_FOR_TRANSFER).await;
+        let signer = fixture_signer();
+
+        let outcome = SweepClient::new(config(url)).fund_float(&signer).await.unwrap();
+
+        assert_eq!(outcome, FundFloatOutcome::Funded { tx_id: fixture_tx_id(), amount_usdt: balance });
+        let built = body_of(&calls, "build_transfer");
+        assert_eq!(built["owner_address"], signer.fee_address().unwrap(), "the fee account pays");
+        assert_eq!(built["contract_address"], USDT, "the token is config, never a parameter");
+        assert_eq!(
+            built["parameter"],
+            transfer_parameter(&signer.payout_address().unwrap(), balance).unwrap(),
+            "the whole balance, to the derived 2/0 float"
+        );
+    }
+
+    /// A correction already applied must be a no-op — and it must cost exactly one read, because an
+    /// endpoint an operator can re-run at will should do no chain work for an account with nothing
+    /// on it.
+    #[tokio::test]
+    async fn an_empty_fee_account_moves_nothing_and_broadcasts_nothing() {
+        let (url, calls) = fake_trongrid(0, 100 * MIN_TRX_SUN_FOR_TRANSFER).await;
+
+        let outcome = SweepClient::new(config(url)).fund_float(&fixture_signer()).await.unwrap();
+
+        assert_eq!(outcome, FundFloatOutcome::NothingToMove);
+        assert_eq!(sequence(&calls), "usdt_balance", "nothing beyond the balance read may happen");
+    }
+
+    /// The fee account is the one address here that cannot be funded — it IS what funds the others
+    /// — so being short of TRX is an operator's problem and not a retry's, and nothing may be
+    /// built, signed or broadcast on the way to saying so.
+    #[tokio::test]
+    async fn a_fee_account_short_of_trx_reports_dry_and_broadcasts_nothing() {
+        let (url, calls) = fake_trongrid(1_000_000, MIN_TRX_SUN_FOR_TRANSFER - 1).await;
+        let signer = fixture_signer();
+
+        let outcome = SweepClient::new(config(url)).fund_float(&signer).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            FundFloatOutcome::FeeAccountDry {
+                fee_address: signer.fee_address().unwrap(),
+                have_sun: MIN_TRX_SUN_FOR_TRANSFER - 1,
+                need_sun: MIN_TRX_SUN_FOR_TRANSFER,
+            }
+        );
+        assert_eq!(sequence(&calls), "usdt_balance,trx_balance", "no transfer may be built or broadcast");
+    }
+
+    /// Ordering, not just outcomes. Reversed, an empty fee account would still be probed for TRX,
+    /// and the service would do chain work for a move that was never owed — the same reason `sweep`
+    /// reads the token balance before the TRX balance.
+    #[tokio::test]
+    async fn the_usdt_balance_is_read_before_the_trx_balance() {
+        let (url, calls) = fake_trongrid(500_000, MIN_TRX_SUN_FOR_TRANSFER).await;
+
+        SweepClient::new(config(url)).fund_float(&fixture_signer()).await.unwrap();
+
+        assert_eq!(sequence(&calls), "usdt_balance,trx_balance,build_transfer,broadcast");
+    }
+
+    /// A TronGrid read that never returned is provably a non-broadcast. Reporting it as a 500 would
+    /// tell an operator money may have moved when it provably has not, and the only way back from
+    /// that is reading the chain by hand.
+    #[tokio::test]
+    async fn a_dead_trongrid_is_refused_rather_than_ambiguous() {
+        // A dead port, as the payout tests use: nothing can have been broadcast to it.
+        let client = SweepClient::new(config("http://127.0.0.1:1".into()));
+        let outcome = client.fund_float(&fixture_signer()).await.unwrap();
+        assert!(matches!(outcome, FundFloatOutcome::Refused(_)), "got {outcome:?}");
+    }
+
+    /// The four literals the clutch-deploy workflow's run log will carry. A typo does not fail
+    /// loudly — it produces a record of a money movement that nobody can interpret afterwards.
+    #[test]
+    fn every_fund_float_status_string_is_pinned() {
+        let funded = fund_float_response(&FundFloatOutcome::Funded { tx_id: "t".into(), amount_usdt: 7 });
+        assert_eq!(funded["status"], "funded");
+        assert_eq!(funded["tx_id"], "t", "a funded reply must point at the transfer on chain");
+        assert_eq!(funded["amount_usdt"], 7);
+
+        assert_eq!(fund_float_response(&FundFloatOutcome::NothingToMove)["status"], "nothing_to_move");
+
+        let dry =
+            fund_float_response(&FundFloatOutcome::FeeAccountDry { fee_address: "a".into(), have_sun: 1, need_sun: 2 });
+        assert_eq!(dry["status"], "fee_account_dry");
+        assert_eq!(dry["fee_address"], "a", "the operator has to be told which address to top up");
+        assert_eq!(dry["have_sun"], 1);
+        assert_eq!(dry["need_sun"], 2);
+
+        assert_eq!(fund_float_response(&FundFloatOutcome::Refused("x".into()))["status"], "refused");
+        assert_eq!(fund_float_response(&FundFloatOutcome::Refused("x".into()))["reason"], "x");
     }
 }
