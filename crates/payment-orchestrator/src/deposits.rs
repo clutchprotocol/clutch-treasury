@@ -232,9 +232,24 @@ pub async fn due_for_mint_request(pool: &PgPool) -> Result<Vec<DepositIntent>, s
 pub async fn due_for_status_poll(pool: &PgPool) -> Result<Vec<DepositIntent>, sqlx::Error> {
     sqlx::query_as::<_, DepositIntent>(&format!(
         "SELECT {INTENT_COLS} FROM deposit_intents
-         WHERE status = 'mint_requested' AND treasury_intent_id IS NOT NULL AND next_attempt_at <= now()
+         WHERE status IN ('mint_requested', 'needs_manual') AND treasury_intent_id IS NOT NULL
+           AND next_attempt_at <= now()
          ORDER BY created_at"
     ))
     .fetch_all(pool)
     .await
+}
+
+/// Pushes a deposit's next treasury status poll out by `hours`. Used once the treasury intent is
+/// terminal (`rejected`/`failed`): the row stays pollable so a later resolution is noticed, but one
+/// look a day is plenty for a state that only a human changes.
+pub async fn defer_poll(pool: &PgPool, id: Uuid, hours: i32) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE deposit_intents SET next_attempt_at = now() + ($2 * interval '1 hour') WHERE id = $1",
+    )
+    .bind(id)
+    .bind(hours)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }

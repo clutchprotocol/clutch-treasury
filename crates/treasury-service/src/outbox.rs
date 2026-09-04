@@ -122,13 +122,17 @@ pub async fn drain_once(
         // stale, or the daily cap can fill. `_excluding` because this intent is already
         // `approved` and therefore already inside the daily-cap sum the plain check_mint reads.
         if let Err(denial) = breakers::check_mint_excluding(pool, config, row.amount_clt, row.intent_id).await {
-            // `client_ref` is set only by the orchestrator, for an intent backed by a verified
-            // on-chain deposit. That USDT is real and already at a derived address, so a cap
-            // window being tight right now is not a reason to give up on it: park for retry with
-            // attempts untouched. Failing it would strand the deposit — a `failed` row leaves the
-            // reserve sum and the sweeper ignores it — which is exactly what happened to a 1,000
-            // USDT deposit on 2026-09-03 while this read was still a placeholder `false`.
-            if row.client_ref.is_some() {
+            if denial.over_per_tx_cap {
+                // No retry can pass this one while the cap stands. Retrying is theatre and
+                // failing is worse - see `needs_manual` below.
+                needs_manual(pool, &row, &denial.reason).await?;
+            } else if row.client_ref.is_some() {
+                // `client_ref` is set only by the orchestrator, for an intent backed by a
+                // verified on-chain deposit. That USDT is real and already at a derived
+                // address, so a daily cap or backing window being tight right now is not a
+                // reason to give up on it: park for retry with attempts untouched. Failing
+                // it would strand the deposit - a `failed` row leaves the reserve sum and
+                // the sweeper ignores it.
                 park_row(pool, row.outbox_id, &denial.reason).await?;
             } else {
                 fail_or_backoff(pool, row.outbox_id, row.intent_id, row.attempts, &denial.reason).await?;
@@ -216,6 +220,53 @@ async fn mark_submitted_no_hash(pool: &PgPool, outbox_id: i64, intent_id: Uuid) 
 
 /// Deposit-backed denial: the cap window slides, so park without touching `attempts` —
 /// this must never count toward the 10-attempt permanent-failure ceiling.
+/// The per-transaction cap is a property of the amount, not of the moment: no retry can pass it,
+/// so retrying is theatre and failing is worse. A `failed` deposit-backed row leaves the reserve
+/// sum and the sweeper skips it, which is exactly what stranded 1,000 USDT on 2026-09-03 while the
+/// intent burned through ten attempts. `needs_manual` says the true thing: the money is real and
+/// still counted, a human has to act (raise the cap, then approve the intent again), and nothing
+/// is retried meanwhile. The outbox row is closed; a re-approval reopens it
+/// (`intents::approve_mint_intent`). Leaving `approved` also takes the amount back out of the
+/// daily-cap sum, which it was hogging from every other intent while it retried.
+async fn needs_manual(pool: &PgPool, row: &OutboxRow, reason: &str) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE chain_outbox SET status = 'failed', last_error = $2 WHERE id = $1")
+        .bind(row.outbox_id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE mint_intents SET status = 'needs_manual', updated_at = now()
+         WHERE id = $1 AND status = 'approved'",
+    )
+    .bind(row.intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    let funds = if row.client_ref.is_some() {
+        "The backing USDT is at the user's deposit address, unswept and still counted in the \
+         reserve; no CLT has been minted."
+    } else {
+        "Hand-created intent; nothing has moved."
+    };
+    alert(
+        pool,
+        "p1",
+        "outbox",
+        &format!(
+            "mint intent {} needs manual review: {reason}. {funds} To release it: raise the \
+             per-transaction cap (set-mint-caps), then approve the intent again \
+             (mint-intent-approve). It will not be retried until then.",
+            row.intent_id
+        ),
+    )
+    .await;
+    Ok(())
+}
+
 async fn park_row(pool: &PgPool, outbox_id: i64, reason: &str) -> Result<(), String> {
     sqlx::query(
         "UPDATE chain_outbox SET next_attempt_at = now() + interval '1 hour', last_error = $2 WHERE id = $1",

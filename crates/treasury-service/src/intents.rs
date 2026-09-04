@@ -108,8 +108,14 @@ pub async fn approve_mint_intent(
     .map_err(|e| e.to_string())?
     .ok_or("intent not found")?;
 
-    if intent.status != "created" {
-        return Err(format!("intent is '{}', only 'created' can be approved", intent.status));
+    // `needs_manual` is approvable again on purpose: it is where an intent lands when it
+    // was over the per-transaction cap, and the way out is a human raising the cap and
+    // approving it again. Every other status is either already past approval or terminal.
+    if intent.status != "created" && intent.status != "needs_manual" {
+        return Err(format!(
+            "intent is '{}', only 'created' or 'needs_manual' can be approved",
+            intent.status
+        ));
     }
     // The DB CHECK also enforces this; checking here gives a readable error.
     if intent.created_by == approved_by {
@@ -126,7 +132,15 @@ pub async fn approve_mint_intent(
     .await
     .map_err(|e| e.to_string())?;
 
-    sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
+    // A re-approval from `needs_manual` finds its old outbox row closed as `failed`;
+    // reopen it rather than fail the UNIQUE(intent_id) insert. Attempts reset: the earlier
+    // ones were spent against a cap that has since been raised, and carrying them would
+    // fail the row early.
+    sqlx::query(
+        "INSERT INTO chain_outbox (intent_id) VALUES ($1)
+         ON CONFLICT (intent_id) DO UPDATE
+         SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL",
+    )
         .bind(id)
         .execute(&mut *tx)
         .await

@@ -7,6 +7,10 @@ use crate::ledger::{self, alert};
 #[derive(Debug)]
 pub struct Denial {
     pub reason: String,
+    /// The per-transaction cap is a property of the amount, not of the moment: no retry
+    /// can pass it while the cap stands. Callers route these to `needs_manual` rather
+    /// than retrying.
+    pub over_per_tx_cap: bool,
 }
 
 /// Approval-time gate: the intent is still `created`, so it is not yet counted in the
@@ -49,7 +53,7 @@ async fn check_mint_inner(
     amount_clt: i64,
     exclude_intent: Option<Uuid>,
 ) -> Result<(), Denial> {
-    let deny = |reason: String| Denial { reason };
+    let deny = |reason: String| Denial { reason, over_per_tx_cap: false };
 
     let (halted, halt_reason): (bool, Option<String>) =
         sqlx::query_as("SELECT minting_halted, halt_reason FROM breaker_state")
@@ -68,7 +72,7 @@ async fn check_mint_inner(
             amount_clt, config.per_tx_mint_cap_clt
         );
         alert(pool, "warn", "breakers", &r).await;
-        return Err(deny(r));
+        return Err(Denial { reason: r, over_per_tx_cap: true });
     }
 
     let day_total = match exclude_intent {

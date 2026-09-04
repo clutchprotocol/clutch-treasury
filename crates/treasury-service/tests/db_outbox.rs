@@ -153,11 +153,14 @@ async fn a_deposit_backed_intent_denied_by_the_breaker_parks_instead_of_failing(
     approve_mint_intent(&pool, backed.id, "bob").await.unwrap();
     approve_mint_intent(&pool, manual.id, "bob").await.unwrap();
 
-    // The cap tightens AFTER approval — the real shape of the problem: approval passed, then the
-    // window closed before the outbox reached the row. No peers, so the sync check is skipped and
-    // the node is never contacted; the denial happens before any submission.
+    // The DAILY cap tightens after approval — the real shape of the problem: approval passed, then
+    // the window closed before the outbox reached the row. Deliberately not the per-transaction cap:
+    // that one is a property of the amount and no retry can pass it, so it routes to needs_manual
+    // (see an_over_cap_intent_goes_to_needs_manual_instead_of_retrying). This is the transient kind,
+    // where parking and retrying is the right answer. No peers, so the sync check is skipped and the
+    // node is never contacted; the denial happens before any submission.
     let mut cfg = test_config();
-    cfg.per_tx_mint_cap_clt = 1_000;
+    cfg.daily_mint_cap_clt = 1_500_000;
     let node = clutch_chain::node_client::NodeClient::new("ws://unused".into());
     let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&cfg.mint_authority_secret).unwrap();
     let processed = treasury_service::outbox::drain_once(&pool, &node, &[], &signer, &cfg).await.unwrap();
@@ -178,4 +181,123 @@ async fn a_deposit_backed_intent_denied_by_the_breaker_parks_instead_of_failing(
     let (intent_status,): (String,) = sqlx::query_as("SELECT status FROM mint_intents WHERE id = $1")
         .bind(backed.id).fetch_one(&pool).await.unwrap();
     assert_eq!(intent_status, "approved", "a parked deposit stays approved, and inside the reserve sum");
+}
+
+/// Over the per-transaction cap, no retry can ever pass: the cap is a property of the amount, not
+/// of the moment. Such an intent must go straight to `needs_manual` rather than burn ten attempts
+/// and end `failed` — a `failed` deposit-backed row leaves the reserve sum and the sweeper skips
+/// it, which is how a real 1,000 USDT deposit was stranded on 2026-09-03.
+#[tokio::test]
+async fn an_over_cap_intent_goes_to_needs_manual_instead_of_retrying() {
+    let pool = pool().await;
+    let mut cfg = test_config();
+    cfg.per_tx_mint_cap_clt = 1_000;
+
+    let intent = create_mint_intent(
+        &pool,
+        "0x4444444444444444444444444444444444444444",
+        1_000_000,
+        "orchestrator",
+        Some("over-cap-ref"),
+        Some(&"bb".repeat(32)),
+        Some(1_000_000),
+        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()),
+        Some(9),
+    )
+    .await
+    .unwrap();
+    approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
+
+    let node = clutch_chain::node_client::NodeClient::new("ws://unused".into());
+    let signer =
+        clutch_chain::signer::EnvKeySigner::from_secret_hex(&cfg.mint_authority_secret).unwrap();
+    let processed = treasury_service::outbox::drain_once(&pool, &node, &[], &signer, &cfg)
+        .await
+        .unwrap();
+    assert_eq!(processed, 0);
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM mint_intents WHERE id = $1")
+        .bind(intent.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "needs_manual", "over the per-tx cap is not a retryable condition");
+
+    let (ob_status, attempts): (String, i32) =
+        sqlx::query_as("SELECT status, attempts FROM chain_outbox WHERE intent_id = $1")
+            .bind(intent.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((ob_status.as_str(), attempts), ("failed", 0), "closed, not retried");
+
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM alerts WHERE severity = 'p1' AND source = 'outbox'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "a human has to be told");
+
+    // Still inside the reserve sum: the USDT is at the address and nothing has swept it.
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+    assert!(
+        addrs.contains(&"TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".to_string()),
+        "a needs_manual deposit's money is still there and must still be counted"
+    );
+
+    // And it no longer hogs the daily-cap budget it was consuming while `approved`.
+    let (day_total,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount_clt), 0)::BIGINT FROM mint_intents
+         WHERE status IN ('approved','submitted','credited')
+           AND created_at > now() - interval '24 hours'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(day_total, 0, "a parked intent must not spend other intents' daily budget");
+}
+
+/// The way out: a human raises the cap and approves again. The intent must be approvable from
+/// `needs_manual`, and its closed outbox row must reopen with a clean slate rather than collide
+/// with the UNIQUE(intent_id) insert or resume at nine spent attempts.
+#[tokio::test]
+async fn raising_the_cap_and_re_approving_releases_a_needs_manual_intent() {
+    let pool = pool().await;
+    let mut cfg = test_config();
+    cfg.per_tx_mint_cap_clt = 1_000;
+
+    let intent = create_mint_intent(
+        &pool,
+        "0x4444444444444444444444444444444444444444",
+        1_000_000,
+        "orchestrator",
+        Some("released-ref"),
+        Some(&"cc".repeat(32)),
+        Some(1_000_000),
+        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()),
+        Some(11),
+    )
+    .await
+    .unwrap();
+    approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
+
+    let node = clutch_chain::node_client::NodeClient::new("ws://unused".into());
+    let signer =
+        clutch_chain::signer::EnvKeySigner::from_secret_hex(&cfg.mint_authority_secret).unwrap();
+    treasury_service::outbox::drain_once(&pool, &node, &[], &signer, &cfg).await.unwrap();
+
+    // The operator raises the cap and approves the same intent again.
+    let released = approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
+    assert_eq!(released.status, "approved");
+
+    let (ob_status, attempts, err): (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, attempts, last_error FROM chain_outbox WHERE intent_id = $1",
+    )
+    .bind(intent.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((ob_status.as_str(), attempts), ("pending", 0), "reopened with a clean slate");
+    assert!(err.is_none(), "the old cap denial must not linger as this row's error");
 }

@@ -627,3 +627,54 @@ async fn the_received_amount_is_written_once() {
     let row = deposits::find_by_id(&pool, deposit_id).await.unwrap().unwrap();
     assert_eq!(row.received_usdt, Some(5_000_000), "the second write must not overwrite the first");
 }
+
+/// The treasury parks an over-cap intent at `needs_manual` instead of failing it. The deposit must
+/// mirror that state and page a human — and, unlike `rejected`/`failed`, the message must say the
+/// intent is recoverable (raise the cap, approve again) rather than telling the operator to build a
+/// brand-new one. The bridge keeps polling, so the later credit lands on its own.
+#[tokio::test]
+async fn treasury_needs_manual_mirrors_to_the_deposit_and_still_credits_after_release() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = Uuid::new_v4();
+    let deposit_id = seed_confirmed_deposit(&pool, 1_000_000, 1_000_888, Some("tron-tx-overcap")).await;
+
+    Mock::given(method("POST"))
+        .and(path("/internal/mint-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mint_intent_response(treasury_id, "created")))
+        .mount(&server)
+        .await;
+    let get_mock = Mock::given(method("GET"))
+        .and(path(format!("/internal/mint-intents/{treasury_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mint_intent_response(treasury_id, "needs_manual")))
+        .mount_as_scoped(&server)
+        .await;
+
+    let config = test_config(server.uri());
+    treasury_bridge::run_once(&pool, &config).await; // create
+    treasury_bridge::run_once(&pool, &config).await; // poll -> needs_manual
+
+    assert_eq!(status_of(&pool, deposit_id).await, "needs_manual");
+    let (n, msg): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(message) FROM alerts WHERE severity = 'p1' AND source = 'treasury_bridge'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    let msg = msg.unwrap();
+    assert!(msg.contains("per-transaction mint cap"), "must name the actual cause: {msg}");
+    assert!(msg.contains("mint-intent-approve"), "must name the way out: {msg}");
+
+    // A human raises the cap and approves; the treasury credits. The bridge must still be polling
+    // this deposit and must accept the transition out of needs_manual.
+    drop(get_mock);
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/mint-intents/{treasury_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mint_intent_response(treasury_id, "credited")))
+        .mount(&server)
+        .await;
+    treasury_bridge::run_once(&pool, &config).await;
+
+    assert_eq!(status_of(&pool, deposit_id).await, "credited", "the release must land without a human touching the deposit");
+}

@@ -110,7 +110,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
          WHERE deposit_address IS NOT NULL
            AND derivation_index IS NULL
            AND swept_at IS NULL
-           AND status IN ('approved', 'submitted', 'credited')",
+           AND status IN ('approved', 'submitted', 'credited', 'needs_manual')",
     )
     .fetch_all(pool)
     .await
