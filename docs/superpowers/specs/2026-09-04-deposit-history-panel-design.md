@@ -1,6 +1,6 @@
 # Deposit history in the top-up panel — design
 
-Status: approved design, not yet implemented
+Status: implemented — live on stage 2026-09-04
 Date: 2026-09-04
 Scope: `clutch-treasury` (payment-orchestrator), `clutch-hub-demo-app` (DepositPanel)
 

@@ -1,6 +1,6 @@
 # Permanent per-user deposit addresses — design
 
-Status: approved design, not yet implemented
+Status: implemented — Deploy A and Deploy B live on stage as of 2026-09-04
 Date: 2026-08-30
 Scope: `clutch-treasury` (payment-orchestrator, treasury-service), `clutch-hub-demo-app` (UI), `clutch-deploy` (ops)
 
