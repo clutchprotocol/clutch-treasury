@@ -598,3 +598,117 @@ async fn treasury_rejection_surfaces_as_bad_gateway_not_500() {
     let res = app.oneshot(post_redemption_request(&bearer_for("0xfrank"), VALID_TRON_ADDRESS, 2_000_000)).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// A redeemer who burned CLT should be able to see the transaction that paid them, not just the
+/// word `paid`. `payout_ref` is the treasury's receipt and this route is the only way a user ever
+/// sees it — nothing else in the app can read the treasury's internal API.
+#[tokio::test]
+async fn get_redemption_forwards_the_payout_transaction_once_there_is_one() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-paid", 2_000_000)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/redemption-intents/{treasury_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": treasury_id,
+            "redeemer_address": "0xpaid",
+            "payout_address": VALID_TRON_ADDRESS,
+            "amount_clt": 2_000_000,
+            "status": "paid",
+            "redemption_ref": "ref-paid",
+            "burn_tx_hash": "0xburned",
+            "payout_ref": "9f1c0b7a5e",
+        })))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+    let created = body_json_of(
+        app.clone()
+            .oneshot(post_redemption_request(&bearer_for("0xpaid"), VALID_TRON_ADDRESS, 2_000_000))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+
+    let body = body_json_of(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/redemptions/{id}"))
+                .header("authorization", bearer_for("0xpaid"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["status"], "paid");
+    assert_eq!(body["payout_ref"], "9f1c0b7a5e", "the receipt must reach the redeemer");
+}
+
+/// The far commoner case: a redemption the treasury has not paid yet carries no receipt, and the
+/// field being absent from the treasury's own JSON must not discard the status that came with it.
+#[tokio::test]
+async fn a_redemption_with_no_payout_yet_reports_a_null_receipt_and_keeps_its_status() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = uuid::Uuid::new_v4();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(redemption_intent_response(treasury_id, "ref-unpaid", 2_000_000)))
+        .mount(&server)
+        .await;
+    // No payout_ref key at all, exactly as the treasury serialises an unpaid redemption.
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/redemption-intents/{treasury_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": treasury_id,
+            "redeemer_address": "0xunpaid",
+            "payout_address": VALID_TRON_ADDRESS,
+            "amount_clt": 2_000_000,
+            "status": "payout_pending",
+            "redemption_ref": "ref-unpaid",
+            "burn_tx_hash": "0xburned",
+        })))
+        .mount(&server)
+        .await;
+
+    let config = test_config(server.uri(), true);
+    let app = router_with(pool.clone(), config);
+    let created = body_json_of(
+        app.clone()
+            .oneshot(post_redemption_request(&bearer_for("0xunpaid"), VALID_TRON_ADDRESS, 2_000_000))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+
+    let body = body_json_of(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/redemptions/{id}"))
+                .header("authorization", bearer_for("0xunpaid"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["status"], "payout_pending", "a missing receipt must not cost us the status");
+    assert!(body["payout_ref"].is_null(), "no payout yet means no receipt");
+    assert_eq!(body["status_live"], true);
+}

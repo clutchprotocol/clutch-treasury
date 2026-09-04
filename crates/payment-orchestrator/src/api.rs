@@ -332,8 +332,11 @@ async fn get_redemption_handler(
         "redemption_ref": mapping.redemption_ref,
         "payout_tron_address": mapping.payout_tron_address,
         "amount_clt": mapping.amount_clt,
-        "status": live.as_deref().unwrap_or(&mapping.status),
+        "status": live.as_ref().map(|l| l.status.as_str()).unwrap_or(&mapping.status),
         "status_live": live.is_some(),
+        // The Tron transaction that paid them, once there is one. Null until then, and null
+        // whenever the treasury could not be reached — the same caveat `status_live` carries.
+        "payout_ref": live.as_ref().and_then(|l| l.payout_ref.clone()),
     })))
 }
 

@@ -171,7 +171,18 @@ pub async fn create_redemption(
 /// stored creation-time status) is a better answer for the user than a 5xx: this read moves no
 /// money. The caller surfaces which one it used so nobody mistakes "we couldn't ask" for "nothing
 /// has happened yet".
-pub async fn fetch_treasury_status(config: &OrchConfig, treasury_intent_id: Uuid) -> Option<String> {
+/// What the treasury currently says about a redemption: its status, and the Tron transaction
+/// that paid it if one has been broadcast. Both travel together because they are read in one
+/// call and a caller showing `paid` without the receipt is the case this exists to fix.
+pub struct TreasuryRedemption {
+    pub status: String,
+    pub payout_ref: Option<String>,
+}
+
+pub async fn fetch_treasury_status(
+    config: &OrchConfig,
+    treasury_intent_id: Uuid,
+) -> Option<TreasuryRedemption> {
     let resp = reqwest::Client::new()
         .get(format!("{}/internal/redemption-intents/{treasury_intent_id}", config.treasury_url))
         .bearer_auth(&config.treasury_readonly_token)
@@ -183,7 +194,11 @@ pub async fn fetch_treasury_status(config: &OrchConfig, treasury_intent_id: Uuid
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("status").and_then(|v| v.as_str()).map(str::to_string)
+    let status = body.get("status").and_then(|v| v.as_str())?.to_string();
+    // Absent on every redemption that has not been paid yet, which is most of them — so a
+    // missing field is normal here and must not discard the status we did get.
+    let payout_ref = body.get("payout_ref").and_then(|v| v.as_str()).map(str::to_string);
+    Some(TreasuryRedemption { status, payout_ref })
 }
 
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<RedemptionMapRow>, sqlx::Error> {

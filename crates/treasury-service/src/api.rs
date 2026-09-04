@@ -438,6 +438,9 @@ fn redemption_intent_json(intent: &intents::RedemptionIntent) -> serde_json::Val
         "status": intent.status,
         "redemption_ref": intent.redemption_ref,
         "burn_tx_hash": intent.burn_tx_hash,
+        // The receipt. A redeemer who burned CLT should be able to see the transaction that
+        // paid them, not just the word `paid` — the orchestrator forwards this to them.
+        "payout_ref": intent.payout_ref,
     })
 }
 
