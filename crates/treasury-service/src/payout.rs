@@ -176,8 +176,11 @@ pub async fn drain_once(
         return Ok(0);
     }
 
-    let rows: Vec<(Uuid, String, i64)> = sqlx::query_as(
-        "SELECT id, payout_address, amount_clt FROM redemption_intents
+    // Both amounts. `amount_clt` is the burn — it is what the caps are measured in, and what the
+    // user gave up. `payout_amount_usdt` is the quote stored at creation, and it is the only
+    // number that may reach the signer.
+    let rows: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, payout_address, amount_clt, payout_amount_usdt FROM redemption_intents
          WHERE status = 'payout_pending' ORDER BY created_at",
     )
     .fetch_all(pool)
@@ -187,7 +190,7 @@ pub async fn drain_once(
     let mut day_total = daily_payout_total(pool).await.map_err(|e| e.to_string())?;
     let mut processed = 0u32;
 
-    for (intent_id, payout_address, amount_clt) in rows {
+    for (intent_id, payout_address, amount_clt, payout_amount_usdt) in rows {
         // Unpayable under the current cap, permanently — nothing in this codebase caps a
         // redemption's size at creation. Checked BEFORE the cumulative test below: without this,
         // `ORDER BY created_at` would let one such intent `break` the pass forever and wedge every
@@ -242,8 +245,11 @@ pub async fn drain_once(
             None => continue,
         };
 
-        // 1:1 CLT<->USDT base units at par — spread/fee modelling is an orchestrator concern.
-        match signer.pay(intent_id, &payout_address, amount_clt).await {
+        // The quote stored at creation, never `amount_clt` and never recomputed from config here.
+        // The two are equal only when no fee is set. The caps above deliberately stay measured in
+        // `amount_clt`: the gross is the larger number, so capping on it can only ever let less
+        // money out than the cap allows, which is the safe direction to be wrong in.
+        match signer.pay(intent_id, &payout_address, payout_amount_usdt).await {
             PayoutReply::Paid { tx_id } => {
                 // Charge the budget now, before the write below can fail: the float has already
                 // paid out either way, same as the Ambiguous arm's identical reasoning. Charging
@@ -326,8 +332,8 @@ pub async fn drain_once(
                 alert(pool, "p1", "payout", &format!(
                     "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted \
                      and NOT retried — retrying could pay this burn twice. Claimed at {claimed_at}: \
-                     check the payout float ({float}) for an outbound USDT transfer of {amount_clt} \
-                     (CLT base units, 1:1 par) to {payout_address} around that time. Found it? Set \
+                     check the payout float ({float}) for an outbound USDT transfer of {payout_amount_usdt} \
+                     (micro-USDT: the quoted net, below the {amount_clt} burned when a fee is set) to {payout_address} around that time. Found it? Set \
                      payout_ref to that tx hash — confirm_payouts_once will pick it up from there. \
                      Found nothing? Return the intent to payout_pending by hand.",
                     float = config.payout_float_address
@@ -358,8 +364,12 @@ pub async fn drain_once(
 /// and the loop continues rather than using `?` — one intent's DB error must not head-of-line
 /// block confirmation for every intent after it in this pass.
 pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<u32, String> {
+    // The NET, because what this writes to the ledger is how much USDT left the float.
+    // `burn_redeemed` has already dropped liability by the full burn; recording the gross here
+    // too would understate the reserve by the fee on every redemption, and a reserve reported
+    // below liability is the one condition that halts minting.
     let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(
-        "SELECT id, amount_clt, payout_ref FROM redemption_intents
+        "SELECT id, payout_amount_usdt, payout_ref FROM redemption_intents
          WHERE status = 'payout_submitted' AND payout_ref IS NOT NULL ORDER BY updated_at",
     )
     .fetch_all(pool)
@@ -367,11 +377,11 @@ pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<
     .map_err(|e| e.to_string())?;
 
     let mut confirmed = 0u32;
-    for (intent_id, amount_clt, payout_ref) in rows {
+    for (intent_id, payout_amount_usdt, payout_ref) in rows {
         match client.transaction_confirmed(&payout_ref).await {
             Ok(true) => match client.transfer_succeeded(&payout_ref).await {
                 Ok(true) => {
-                    if let Err(e) = pay_intent(pool, intent_id, amount_clt, &payout_ref).await {
+                    if let Err(e) = pay_intent(pool, intent_id, payout_amount_usdt, &payout_ref).await {
                         // The transfer is proven successful on chain; only our own bookkeeping
                         // failed. Safe to retry — pay_intent's UPDATE and its ON CONFLICT DO
                         // NOTHING insert are both idempotent, and this row still matches the
@@ -450,14 +460,14 @@ async fn daily_payout_total(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// the `treasury_events` row and flipping intent status together (rather than calling
 /// `ledger::append_event`, which only takes a bare `&PgPool` and can't join this
 /// transaction).
-async fn pay_intent(pool: &PgPool, intent_id: Uuid, amount_clt: i64, payout_ref: &str) -> Result<(), String> {
+async fn pay_intent(pool: &PgPool, intent_id: Uuid, amount_usdt: i64, payout_ref: &str) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO treasury_events (kind, amount_clt, amount_usdt, intent_id, chain_tx_hash, description)
          VALUES ('custody_withdrawal', 0, $1, $2, NULL, 'redemption payout')
          ON CONFLICT (intent_id, kind) WHERE intent_id IS NOT NULL DO NOTHING",
     )
-    .bind(amount_clt)
+    .bind(amount_usdt)
     .bind(intent_id)
     .execute(&mut *tx)
     .await
