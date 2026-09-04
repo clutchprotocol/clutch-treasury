@@ -37,7 +37,7 @@ async fn pool() -> PgPool {
 #[tokio::test]
 async fn matching_burn_confirms_and_ledgers_once() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000001", "TTronAddr111", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000001", "TTronAddr111", 2_000_000, 2_000_000).await.unwrap();
 
     for _ in 0..2 {
         confirm_burn(&pool, &intent.redemption_ref, "0xaaaa000000000000000000000000000000000001", 2_000_000, "0xburn1").await.unwrap();
@@ -54,7 +54,7 @@ async fn matching_burn_confirms_and_ledgers_once() {
 #[tokio::test]
 async fn mismatched_burn_fails_intent_never_pays() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000002", "TTronAddr222", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa000000000000000000000000000000000002", "TTronAddr222", 2_000_000, 2_000_000).await.unwrap();
 
     // Right ref, wrong amount — someone burned the wrong sum against our ref.
     confirm_burn(&pool, &intent.redemption_ref, "0xaaaa000000000000000000000000000000000002", 1_999_999, "0xburn2").await.unwrap();
@@ -617,7 +617,7 @@ async fn a_repeatedly_refused_payout_alerts_once_not_every_pass() {
 async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
     let pool = pool().await;
     let lower = "0xaaaa0000000000000000000000000000000000cd";
-    let intent = create_redemption_intent(&pool, lower, "TTronAddrCase", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, lower, "TTronAddrCase", 2_000_000, 2_000_000).await.unwrap();
 
     // Same account, checksummed the way a wallet might present it.
     let mixed = "0xAAAA0000000000000000000000000000000000CD";
@@ -641,7 +641,7 @@ async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
 #[tokio::test]
 async fn a_float_being_topped_up_with_trx_does_not_page_anyone() {
     let pool = pool().await;
-    let intent = create_redemption_intent(&pool, "0xaaaa0000000000000000000000000000000000ef", "TTronAddrTrx", 2_000_000).await.unwrap();
+    let intent = create_redemption_intent(&pool, "0xaaaa0000000000000000000000000000000000ef", "TTronAddrTrx", 2_000_000, 2_000_000).await.unwrap();
     treasury_service::watcher::confirm_burn(
         &pool, &intent.redemption_ref, "0xaaaa0000000000000000000000000000000000ef", 2_000_000, "0xburntrx",
     ).await.unwrap();
