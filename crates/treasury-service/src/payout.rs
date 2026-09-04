@@ -297,9 +297,22 @@ pub async fn drain_once(
                     )).await;
                     continue;
                 }
-                // Deduped: a dry float re-claims and re-refuses this same intent every pass, and
-                // an alert per pass buries the ambiguous-payout P1s a human actually needs to see.
-                if payout_refused_alerted().lock().unwrap().insert(intent_id) {
+                // NeedsTrx is not a refusal and must not page anyone. The float pays energy for
+                // its own transfer, so an empty one gets topped up from the fee account and the
+                // NEXT pass sends the USDT — the same two-pass shape the sweeper has, where the
+                // equivalent outcome (`Funded`) is a log line and nothing more. The first real
+                // redemption on stage raised a P1 this way and then paid normally one pass later,
+                // which is exactly how an alert stops meaning anything.
+                //
+                // The other three in this arm do deserve one: a dry float and an exceeded cap both
+                // need an operator, and a Refused is a real refusal.
+                if matches!(reply, PayoutReply::NeedsTrx) {
+                    tracing::info!(
+                        "redemption {intent_id}: float topped up with TRX, payout goes out on the next pass"
+                    );
+                } else if payout_refused_alerted().lock().unwrap().insert(intent_id) {
+                    // Deduped: a dry float re-claims and re-refuses this same intent every pass, and
+                    // an alert per pass buries the ambiguous-payout P1s a human actually needs to see.
                     alert(pool, "p1", "payout",
                         &format!("redemption {intent_id}: payout refused ({reply:?}), returned to payout_pending")).await;
                 }
