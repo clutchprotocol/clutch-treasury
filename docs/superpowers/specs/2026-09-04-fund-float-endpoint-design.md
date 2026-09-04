@@ -78,14 +78,23 @@ returns `NothingToMove` without moving a single sun, so calling this repeatedly 
 
 Funding from custody would be reserve-neutral: custody down, float up, both counted.
 
-**Funding from the fee account is not.** Fee-account USDT is in no bucket; float USDT is counted.
-Moving 1,000 USDT this way therefore *raises* the reserve by 1,000 against unchanged liability, and
-reconciliation will read over-backed rather than `ok`.
+**Funding from the fee account raises the reserve.** Fee-account USDT is in no bucket; float USDT
+is counted. `custody_reported` -- custody plus unswept deposits plus the float, read from chain --
+therefore goes up by the amount moved, while nothing in the ledger changes.
 
-That is the correct answer, not a problem to suppress: the treasury really does hold that USDT, and
-counting it is more accurate than leaving it invisible. Over-backing is the safe direction — it
-does not halt minting — and `over_backed_drift` escalates only if it persists. Expect it, and do
-not "fix" it by excluding the float.
+Reconciliation uses that figure in exactly one comparison:
+
+```rust
+} else if s.custody_reported < s.ledger_liability {
+    ("mismatch", detail) // reserve below liability
+```
+
+So a larger reserve only makes a mismatch **less** likely. The run should stay `ok`.
+
+It does **not** produce `over_backed_drift`. That status is `treasury_minted < ledger_liability` --
+on-chain supply against the ledger -- and means the ledger counts CLT issued that does not exist on
+chain, i.e. someone is owed money they do not hold. It has nothing to do with how much USDT backs
+the liability, and it should not be dismissed as an expected side effect of funding the float.
 
 ## Operator surface
 
