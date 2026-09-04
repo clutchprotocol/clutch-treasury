@@ -615,3 +615,28 @@ async fn a_burn_from_a_differently_cased_sender_is_still_honoured() {
     assert_ne!(status, "failed", "a case difference must never refuse a payout on a burned redemption");
     assert_eq!(status, "payout_pending", "it is the same account, so the burn is confirmed");
 }
+
+/// The float pays energy for its own transfer, so an empty one is topped up from the fee account
+/// and the NEXT pass sends the USDT. That is routine and self-resolving — the sweeper's equivalent
+/// outcome is a log line — so it must not raise a P1. The first real redemption on stage did page
+/// this way and then paid normally a pass later, which is how an alert stops meaning anything.
+#[tokio::test]
+async fn a_float_being_topped_up_with_trx_does_not_page_anyone() {
+    let pool = pool().await;
+    let intent = create_redemption_intent(&pool, "0xaaaa0000000000000000000000000000000000ef", "TTronAddrTrx", 2_000_000).await.unwrap();
+    treasury_service::watcher::confirm_burn(
+        &pool, &intent.redemption_ref, "0xaaaa0000000000000000000000000000000000ef", 2_000_000, "0xburntrx",
+    ).await.unwrap();
+
+    let signer = CountingSigner { reply: PayoutReply::NeedsTrx, calls: AtomicUsize::new(0) };
+    payout::drain_once(&pool, &config(), &signer).await.unwrap();
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM redemption_intents WHERE id = $1")
+        .bind(intent.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "payout_pending", "it goes back for the next pass, unclaimed");
+
+    let p1s: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM alerts WHERE severity = 'p1' AND source = 'payout'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(p1s, 0, "a routine TRX top-up must not page a human");
+}
