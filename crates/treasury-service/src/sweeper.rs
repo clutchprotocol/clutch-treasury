@@ -32,7 +32,13 @@ use crate::tron_verifier::TronClient;
 /// sub-threshold balance sits at its address indefinitely and the reserve fragments permanently
 /// across addresses nobody revisits — the reserve SUM stays correct, but the funds become unusable
 /// in practice and the fragmentation only grows.
-pub fn should_sweep(balance_usdt: i64, threshold_usdt: i64, age_hours: i64, max_age_hours: i64) -> bool {
+pub fn should_sweep(
+    balance_usdt: i64,
+    threshold_usdt: i64,
+    age_hours: i64,
+    max_age_hours: i64,
+    _min_usdt: i64,
+) -> bool {
     if balance_usdt <= 0 {
         return false;
     }
@@ -153,7 +159,13 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
             }
         };
 
-        if !should_sweep(balance, config.sweep_threshold_usdt, age_hours as i64, config.sweep_max_age_hours) {
+        if !should_sweep(
+            balance,
+            config.sweep_threshold_usdt,
+            age_hours as i64,
+            config.sweep_max_age_hours,
+            config.sweep_min_usdt,
+        ) {
             continue;
         }
 
@@ -236,37 +248,62 @@ mod tests {
 
     const THRESHOLD: i64 = 100_000_000; // $100
     const MAX_AGE: i64 = 168; // a week
+    const MIN: i64 = 1_000_000; // $1 — the dust floor under the age valve
+    const NO_MIN: i64 = 0; // the old behaviour: no floor at all
 
     #[test]
     fn sweeps_once_the_balance_reaches_the_threshold() {
-        assert!(should_sweep(THRESHOLD, THRESHOLD, 0, MAX_AGE));
-        assert!(should_sweep(THRESHOLD + 1, THRESHOLD, 0, MAX_AGE));
+        assert!(should_sweep(THRESHOLD, THRESHOLD, 0, MAX_AGE, NO_MIN));
+        assert!(should_sweep(THRESHOLD + 1, THRESHOLD, 0, MAX_AGE, NO_MIN));
     }
 
     #[test]
     fn leaves_a_small_fresh_balance_alone() {
-        assert!(!should_sweep(THRESHOLD - 1, THRESHOLD, 0, MAX_AGE));
+        assert!(!should_sweep(THRESHOLD - 1, THRESHOLD, 0, MAX_AGE, NO_MIN));
     }
 
     /// The escape valve. Without it anything under the threshold sits at its address forever and the
     /// reserve fragments permanently across addresses nobody revisits.
     #[test]
     fn sweeps_a_small_balance_once_it_is_old_enough() {
-        assert!(should_sweep(1, THRESHOLD, MAX_AGE, MAX_AGE));
-        assert!(should_sweep(1, THRESHOLD, MAX_AGE + 100, MAX_AGE));
+        assert!(should_sweep(MIN, THRESHOLD, MAX_AGE, MAX_AGE, MIN));
+        assert!(should_sweep(MIN, THRESHOLD, MAX_AGE + 100, MAX_AGE, MIN));
     }
 
     /// An empty address is never worth a transaction, however old — a sweep would spend TRX to move
     /// nothing.
     #[test]
     fn never_sweeps_an_empty_address_however_old() {
-        assert!(!should_sweep(0, THRESHOLD, MAX_AGE * 10, MAX_AGE));
-        assert!(!should_sweep(-1, THRESHOLD, MAX_AGE * 10, MAX_AGE), "a negative balance is nonsense, not a sweep");
+        assert!(!should_sweep(0, THRESHOLD, MAX_AGE * 10, MAX_AGE, NO_MIN));
+        assert!(!should_sweep(-1, THRESHOLD, MAX_AGE * 10, MAX_AGE, NO_MIN), "a negative balance is nonsense, not a sweep");
     }
 
     #[test]
     fn a_zero_threshold_sweeps_any_positive_balance() {
-        assert!(should_sweep(1, 0, 0, MAX_AGE));
+        assert!(should_sweep(1, 0, 0, MAX_AGE, NO_MIN));
+    }
+
+    /// The age valve used to fire on ANY positive balance. That spends TRX to recover less USDT
+    /// than the transfer costs — a guaranteed loss, repeated per dust address. Leaving it put is
+    /// not a loss: an unswept address is still counted in the reserve.
+    #[test]
+    fn the_age_valve_never_sweeps_less_than_a_sweep_costs() {
+        assert!(!should_sweep(1, THRESHOLD, MAX_AGE * 10, MAX_AGE, MIN));
+        assert!(!should_sweep(MIN - 1, THRESHOLD, MAX_AGE * 10, MAX_AGE, MIN));
+    }
+
+    /// The floor is a floor, not a second threshold: at or above it the age valve works as before.
+    #[test]
+    fn the_floor_still_lets_the_age_valve_fire() {
+        assert!(should_sweep(MIN, THRESHOLD, MAX_AGE, MAX_AGE, MIN));
+        assert!(should_sweep(MIN + 1, THRESHOLD, MAX_AGE, MAX_AGE, MIN));
+    }
+
+    /// A misconfigured floor above the threshold still wins. Spending more than the balance is
+    /// wrong whichever rule asked for it, so the floor gates both paths.
+    #[test]
+    fn the_floor_outranks_the_threshold() {
+        assert!(!should_sweep(THRESHOLD, THRESHOLD, 0, MAX_AGE, THRESHOLD + 1));
     }
 }
 

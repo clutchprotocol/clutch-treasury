@@ -74,6 +74,7 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         deposit_match_window_hours: 24,
         sweep_threshold_usdt: threshold,
         sweep_max_age_hours: 168,
+        sweep_min_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
     }
