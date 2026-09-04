@@ -4,6 +4,7 @@ use payment_orchestrator::custody::{CustodyWatcher, DepositWatcher, TronGridWatc
 use payment_orchestrator::derive::AddressDeriver;
 use payment_orchestrator::api;
 use payment_orchestrator::configuration::OrchConfig;
+use payment_orchestrator::metrics;
 
 #[tokio::main]
 async fn main() {
@@ -55,7 +56,10 @@ async fn main() {
     // treasury's private zone. Same poll-interval convention as the poller above.
     tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));
 
+    metrics::serve(pool.clone(), config.metrics_addr.clone());
+
     let app = api::router(pool, config.clone(), deriver);
+
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("payment-orchestrator listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");

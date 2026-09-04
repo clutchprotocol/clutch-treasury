@@ -8,9 +8,18 @@ fn default_max_node_lag_blocks() -> u64 {
     50
 }
 
+fn default_metrics_addr() -> String {
+    "0.0.0.0:9101".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub http_addr: String,
+    /// Where the Prometheus listener binds. A separate port from `http_addr` on purpose: this
+    /// service's API must never grow a public metrics route. Defaulted so an existing
+    /// deployment boots unchanged - a missing field here would panic at startup.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
     pub database_url: String,
     pub node_ws_url: String,
     /// Comma-separated peer node WebSocket URLs, used ONLY to ask "is `node_ws_url` at the tip".

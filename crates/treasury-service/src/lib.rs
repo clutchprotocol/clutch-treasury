@@ -3,6 +3,7 @@ pub mod breakers;
 pub mod chain_sync;
 pub mod configuration;
 pub mod ledger;
+pub mod metrics;
 pub mod intents;
 pub mod outbox;
 pub mod payout;

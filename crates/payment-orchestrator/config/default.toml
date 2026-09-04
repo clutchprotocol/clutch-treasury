@@ -2,6 +2,9 @@
 # Was 8095, which no other file agreed with: the image healthchecked 8091 and would have reported
 # unhealthy forever while the process listened elsewhere.
 http_addr = "0.0.0.0:8091"
+# Prometheus scrape target. Deliberately NOT a route on http_addr: that one is public
+# through nginx's /payment/ route, and deposit counts are not public.
+metrics_addr = "0.0.0.0:9102"
 database_url = "postgres://postgres:postgres@localhost:5434/orchestrator"
 jwt_secret = ""
 # "*" for local dev; clutch-deploy overrides via APP_ALLOWED_ORIGINS for staging/production

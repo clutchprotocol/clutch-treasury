@@ -50,6 +50,7 @@ async fn pool() -> PgPool {
 fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
     OrchConfig {
         http_addr: "0.0.0.0:0".into(),
+        metrics_addr: "0.0.0.0:9102".into(),
         database_url: std::env::var("DATABASE_URL").unwrap(),
         jwt_secret: JWT_SECRET.into(),
         allowed_origins: "*".into(),

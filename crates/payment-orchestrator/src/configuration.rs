@@ -6,9 +6,18 @@ fn default_allowed_origins() -> String {
     "*".to_string()
 }
 
+fn default_metrics_addr() -> String {
+    "0.0.0.0:9102".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OrchConfig {
     pub http_addr: String,
+    /// Where the Prometheus listener binds. A separate port from `http_addr` on purpose: this
+    /// service's API must never grow a public metrics route. Defaulted so an existing
+    /// deployment boots unchanged - a missing field here would panic at startup.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
     pub database_url: String,
     pub jwt_secret: String,
     /// CORS: `"*"` or a comma-separated list of allowed origins (e.g.
