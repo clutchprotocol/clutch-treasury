@@ -56,8 +56,9 @@ async fn main() {
     // treasury's private zone. Same poll-interval convention as the poller above.
     tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));
 
-    let app = api::router(pool, config.clone(), deriver);
     metrics::serve(pool.clone(), config.metrics_addr.clone());
+
+    let app = api::router(pool, config.clone(), deriver);
 
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
     tracing::info!("payment-orchestrator listening on {}", config.http_addr);
