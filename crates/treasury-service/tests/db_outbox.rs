@@ -153,11 +153,14 @@ async fn a_deposit_backed_intent_denied_by_the_breaker_parks_instead_of_failing(
     approve_mint_intent(&pool, backed.id, "bob").await.unwrap();
     approve_mint_intent(&pool, manual.id, "bob").await.unwrap();
 
-    // The cap tightens AFTER approval — the real shape of the problem: approval passed, then the
-    // window closed before the outbox reached the row. No peers, so the sync check is skipped and
-    // the node is never contacted; the denial happens before any submission.
+    // The DAILY cap tightens after approval — the real shape of the problem: approval passed, then
+    // the window closed before the outbox reached the row. Deliberately not the per-transaction cap:
+    // that one is a property of the amount and no retry can pass it, so it routes to needs_manual
+    // (see an_over_cap_intent_goes_to_needs_manual_instead_of_retrying). This is the transient kind,
+    // where parking and retrying is the right answer. No peers, so the sync check is skipped and the
+    // node is never contacted; the denial happens before any submission.
     let mut cfg = test_config();
-    cfg.per_tx_mint_cap_clt = 1_000;
+    cfg.daily_mint_cap_clt = 1_500_000;
     let node = clutch_chain::node_client::NodeClient::new("ws://unused".into());
     let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&cfg.mint_authority_secret).unwrap();
     let processed = treasury_service::outbox::drain_once(&pool, &node, &[], &signer, &cfg).await.unwrap();
