@@ -16,7 +16,11 @@ backing_halt_bps = 10000
 confirmations = 2
 outbox_poll_ms = 2000
 reconciliation_interval_secs = 86400
-genesis_allocation = 1000000000000000
+# Zero. The chain no longer pre-mints anything at genesis, so every CLT in existence was minted
+# by this service against a deposit, and `onchain_supply - genesis_allocation` is simply the
+# supply. A non-zero value here would subtract CLT that does not exist from the supply that does,
+# and reconciliation would read the difference as CLT minted without a ledger entry behind it.
+genesis_allocation = 0
 trongrid_url = "https://api.trongrid.io"
 trongrid_api_key = ""
 custody_tron_address = ""
