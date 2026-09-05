@@ -45,10 +45,20 @@ pub enum SyncState {
     InSync { lag: u64 },
     /// Behind by more than the configured tolerance — do not act on what this node reports.
     Behind { lag: u64, primary: u64, best_peer: u64 },
-    /// No peer could be reached, so there is nothing to compare against. NOT the same as
-    /// in-sync, and deliberately a distinct variant so a caller cannot treat it as one by
+    /// The primary itself did not answer, so there is no height to compare in the first place.
+    ///
+    /// Split from `NoPeersAnswered` because the two look identical in a log and lead somewhere
+    /// completely different. This one is routine during a deploy — the primary restarts, every
+    /// pass in that window reports it — and is about the node this service reads, not about its
+    /// peers. Reported as a peer problem once, it cost a real investigation into a peer list that
+    /// was never at fault.
+    PrimaryUnreachable,
+    /// The primary answered, but nothing to compare it against: the node reported no peer of its
+    /// own, and no configured peer answered either.
+    ///
+    /// NOT the same as in-sync, and deliberately distinct so a caller cannot treat it as one by
     /// accident.
-    Unknown,
+    NoPeersAnswered,
 }
 
 /// Ask every peer for its height and compare against the primary.
@@ -59,8 +69,8 @@ pub async fn check(primary: &Arc<NodeClient>, peers: &[Arc<NodeClient>], toleran
     let info = match primary.get_chain_info().await {
         Ok(i) => i,
         // The primary being unreachable is a different problem, and every caller already handles
-        // its own RPC failures. Nothing to compare, so nothing to say.
-        Err(_) => return SyncState::Unknown,
+        // its own RPC failures. Nothing to compare, so nothing to say — but say WHICH nothing.
+        Err(_) => return SyncState::PrimaryUnreachable,
     };
     let primary_height = info.latest_block_index;
 
@@ -92,7 +102,7 @@ pub async fn check(primary: &Arc<NodeClient>, peers: &[Arc<NodeClient>], toleran
         }
     }
     if heights.is_empty() {
-        return SyncState::Unknown;
+        return SyncState::NoPeersAnswered;
     }
 
     let l = lag(primary_height, &heights);
