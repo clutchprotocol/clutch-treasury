@@ -100,11 +100,19 @@ pub async fn drain_once(
                 }
                 return Ok(0);
             }
-            crate::chain_sync::SyncState::Unknown => {
-                // No peer answered, so there is nothing to compare against. Proceeding is no worse
-                // than the behaviour before this check existed, and blocking would stop minting
-                // every time a peer restarts -- which, on a three-node stack, is every deploy.
-                tracing::warn!("outbox: could not confirm the node is at the tip (no peer answered)");
+            // Both arms proceed. Proceeding is no worse than the behaviour before this check
+            // existed, and blocking would stop minting every time a node restarts -- which, on a
+            // three-node stack, is every deploy. They are separate arms only so the log says which
+            // of the two happened, because they point at different things to go and look at.
+            crate::chain_sync::SyncState::PrimaryUnreachable => {
+                tracing::warn!(
+                    "outbox: could not confirm the node is at the tip — the node this service                      reads did not answer. Routine while it restarts; a fault if it persists."
+                );
+            }
+            crate::chain_sync::SyncState::NoPeersAnswered => {
+                tracing::warn!(
+                    "outbox: could not confirm the node is at the tip — the node answered but                      knows of no peer, and no configured peer answered either. The staleness                      guard cannot fire while this holds."
+                );
             }
             crate::chain_sync::SyncState::InSync { .. } => {
                 // Back in sync: re-arm the alert so the next episode is reported.
