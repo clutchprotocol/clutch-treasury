@@ -106,12 +106,12 @@ pub async fn drain_once(
             // of the two happened, because they point at different things to go and look at.
             crate::chain_sync::SyncState::PrimaryUnreachable => {
                 tracing::warn!(
-                    "outbox: could not confirm the node is at the tip — the node this service                      reads did not answer. Routine while it restarts; a fault if it persists."
+                    "outbox: could not confirm the node is at the tip — the node this service reads did not answer. Routine while it restarts; a fault if it persists."
                 );
             }
             crate::chain_sync::SyncState::NoPeersAnswered => {
                 tracing::warn!(
-                    "outbox: could not confirm the node is at the tip — the node answered but                      knows of no peer, and no configured peer answered either. The staleness                      guard cannot fire while this holds."
+                    "outbox: could not confirm the node is at the tip — the node answered but knows of no peer, and no configured peer answered either. The staleness guard cannot fire while this holds."
                 );
             }
             crate::chain_sync::SyncState::InSync { .. } => {
