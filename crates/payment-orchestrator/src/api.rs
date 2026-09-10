@@ -209,6 +209,10 @@ async fn list_deposits_handler(
                 "amount_usdt": d.received_usdt.unwrap_or(d.amount_usdt),
                 "tron_tx_id": d.tron_tx_id,
                 "created_at": d.created_at,
+                // When the money moved, null on rows that settled before it was recorded. Separate
+                // from `created_at` on purpose: a client that shows one as the other tells a user
+                // an old deposit is minutes old.
+                "transfer_at": d.transfer_at,
             })
         })
         .collect();
