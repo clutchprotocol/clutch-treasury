@@ -169,6 +169,19 @@ would select it refuses to boot.
 `KeySpec = ECC_SECG_P256K1` and `KeyUsage = SIGN_VERIFY`, and a key policy that does **not** grant
 `kms:ScheduleKeyDeletion` to the signing principal.
 
+**A real key is unavoidable — the emulator route is closed.** Checked on 2026-09-11: LocalStack's
+KMS cannot create an `ECC_SECG_P256K1` key at all. `CreateKey` fails with
+`Failed to generate key material: Curve not supported: secp256k1`
+([localstack#11678](https://github.com/localstack/localstack/issues/11678)), and a related report
+shows its `Sign` and `GetPublicKey` returning values that do not match for that curve even with
+custom key material. So there is no way to exercise the AWS integration in CI, and writing it
+against an emulator would in any case prove the wrong thing: an emulator-verified signer in the
+mint path is precisely the false confidence this whole module was factored to avoid.
+
+Recorded so nobody spends a day rediscovering it. The pure logic in
+`external_signature.rs` is the answer to that constraint — it is the part that *can* be tested
+without AWS, and it is tested.
+
 ### A2. KMS-backed payout signer — **Blocker** (same plumbing applies)
 
 `PayoutSigner` (`crates/treasury-service/src/payout.rs`) is the matching seam for the payout key.
