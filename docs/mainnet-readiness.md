@@ -72,7 +72,8 @@ recorded in its own section.
    whole test. Do it before the caps decision below, because the daily mint cap's exposure depends
    on how fast anyone finds out.
 3. **Name a second operator and rehearse a halt (G3).** One person knowing the breaker exists is
-   not a control. This is a conversation, not a task.
+   not a control. Everything they need now exists — a halt workflow and `docs/ON-CALL.md` — so what
+   is left is a conversation and one rehearsal, not a task.
 
 **Then the chain of things that unblock each other.**
 
@@ -701,15 +702,46 @@ single point of failure for consensus, custody, and the ledger simultaneously.
 **Verification:** a topology where losing any one host loses neither block production nor the
 ledger, and a documented recovery time for each component.
 
-### G3. Someone else can operate it — **Blocker**
+### G3. Someone else can operate it — **Blocker** (the prerequisites now exist, 2026-09-11)
 
-`treasury-service` has a manual halt (`minting_halted` in `breaker_state`) and a daily mint cap.
-That machinery is worth little if one person knows it exists. A money system needs a second person
-who can stop it.
+`treasury-service` has a manual halt (`minting_halted` in `breaker_state`), a per-transaction cap, a
+daily cap and four-eyes approval. That machinery is worth very little if one person knows it exists.
+A money system needs a second person who can stop it.
 
-**Verification:** a named second operator with access, and a rehearsal in which that person halts
-minting and resumes it without the maintainer's help.
+Two things were missing before a second operator was even possible, and both are now in place.
 
+**There was no way to halt.** `POST /internal/halt` existed in the service and nothing could reach
+it: resuming had a workflow and a script, halting had neither. An operator who decided something
+was wrong had to SSH in and curl with the Approver token by hand, which is the worst possible
+moment to be assembling a command. Found by writing the runbook below and noticing it instructed
+the reader to use a control that did not exist.
+
+`clutch-deploy` now has *Halt minting (stage)*, mirroring the resume pair, with the asymmetry kept
+deliberate: **resuming is gated and halting is not.** Resume refuses while the latest reconciliation
+is still a mismatch; halt has no such guard, because halting is cheap and fully reversible — deposits
+keep being credited, the reserve total stays correct, only new issuance stops — while being slow to
+halt is not reversible at all. It refuses to overwrite an existing `halt_reason`, since the first one
+is the one that explains why minting stopped.
+
+**There was no runbook.** `clutch-deploy/docs/ON-CALL.md` now covers what can break, what each of the
+ten D3 alerts means and what to do about it, what is safe to do alone, and what needs two people. It
+leads with the two rules that matter more than the rest combined:
+
+1. Never clear the breaker to make an alert go away.
+2. Never retry a payout whose outcome is unknown.
+
+Both trade a recoverable problem for an unrecoverable one, and both are the tempting move at 3am.
+It also names what only two people can do — the four-eyes mint is two separate dispatches so one run
+cannot be both roles — and says plainly that if you are on call alone and a mint needs approving, it
+waits.
+
+**What remains is a person.** No document closes this item. It needs a named second operator with
+access, who has read that runbook and done the three things in its "Before your first shift"
+section — including halting and resuming once on a quiet day, because rehearsing the control you are
+least likely to use is the point of rehearsing at all.
+
+**Verification:** a named second operator, and a rehearsal in which that person halts minting and
+resumes it without the maintainer's help.
 ---
 
 ## H. Market operations
