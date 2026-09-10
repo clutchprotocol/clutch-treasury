@@ -801,6 +801,33 @@ the dialog that would matter on a real deployment. **A real deployment needs ack
 than display** — a material term of the transaction, acknowledged once per account rather than
 displayed and scrolled past.
 
+**The blocking half now has a design proposal**, not an implementation:
+`docs/superpowers/specs/2026-09-11-dispute-resolution-design.md`. Writing it changed the framing of
+this item, and the correction matters more than the proposal.
+
+**The gap is asymmetric in the opposite direction to the one this item described.** The protocol
+already holds the full fare from `RideAcceptance` and releases it in rider-initiated `RidePay`
+installments, with the unpaid remainder returning to the rider on cancel. So a rider who is wronged
+mid-trip already has recourse — they stop paying and cancel, losing only what they released. That
+was never documented as recourse, which is why it read as absent; the disclosure landed the same day.
+
+The party with **no** protection is the driver, against a rider who takes the ride and simply
+declines to release the held fare. The driver has performed, cancels, and the money goes back to the
+rider. Any design that only adds rider protection makes the real imbalance worse, which is what would
+have happened if this had been built from the item as originally written.
+
+The spec sets out four options against the three questions, and recommends **timed auto-release of
+the held remainder**: after a window, the unreleased fare settles to the driver unless the rider has
+cancelled. It answers "who decides" with nobody, "what can a decision do" with settlement timing
+rather than reversal, and "what stops the mechanism being the attack" by making inaction favour the
+driver. It is one node-side rule and no new transaction type — against a juror protocol or an
+operator arbitration role, either of which is a subsystem or a liability question.
+
+**One decision inside it has a deadline attached to C1.** If the release window is a consensus
+parameter it belongs in `ChainInit`, and genesis-committed values cannot be added later without a new
+chain. Deciding whether the window is genesis-committed or per-acceptance has to happen before the
+mainnet genesis is fixed, not after.
+
 **The blocking half is untouched: a dispute mechanism still has to exist.** It is a design problem
 before it is an implementation one, and the design is not settled. The questions it has to answer,
 none of which have answers yet:
