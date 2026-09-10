@@ -104,14 +104,18 @@ recorded in its own section.
 
 **Then the two that are genuinely unfinished design work, not configuration.**
 
-11. **Design dispute resolution (H1).** The three unanswered questions are in that section. This is
-    the item that gates a *public* launch rather than a pilot, and it is a design problem before it
-    is an implementation one.
+11. **Decide on the dispute mechanism (H1).** A proposal now exists
+    (`docs/superpowers/specs/2026-09-11-dispute-resolution-design.md`) with a recommendation, so
+    this is a review rather than a design exercise. **One decision inside it has to happen before
+    step 13**, not after: if the release window is a consensus parameter it belongs in `ChainInit`,
+    and genesis-committed values cannot be added later without a new chain. Settle that before the
+    mainnet genesis is fixed even if the rest of the mechanism ships later.
 12. **Design reputation (H2).**
 
 **Last, and only after all of the above.**
 
-13. **Boot the mainnet genesis and read the first payout receipt (C1, B1, B2).** The first mainnet
+13. **Boot the mainnet genesis and read the first payout receipt (C1, B1, B2).** Check step 11's
+    consensus-parameter question is answered before this, since the genesis cannot be amended. The first mainnet
     payout is the first real test of the energy model, because Nile cannot show it. Re-measure the
     redemption fee from that receipt rather than scaling the testnet number.
 
