@@ -79,17 +79,19 @@ recorded in its own section.
 
 4. **Provision AWS KMS** — a key with `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, and a
    policy that does not grant `kms:ScheduleKeyDeletion` to the signing principal. This unblocks
-   the `KmsSigner` API call (A1, A2), which unblocks the key ceremony (A3), which unblocks the
+   the `KmsSigner` API call (A1, A2), which unblocks the key ceremony (A3 — procedure in
+   `docs/KEY-CEREMONY.md`, and it needs two people, so it also needs step 3), which unblocks the
    mainnet `mint_authority` (C1), and it is what finally closes D2 by taking the mnemonic out of
    `.env` entirely.
 5. **Decide the mainnet validator set (C2).** Hosts that share no operator, provider or power
    supply. Its *size* picks the block cadence at `60 / len`, so decide the number deliberately, and
    it is the other value C1 is waiting on.
 6. **Commission the audit (I1).** Long lead time, so start it while the above is in flight rather
-   than after. Point it at the signing and encoding path, the four-eyes mint flow, the payout
-   endpoint's bounds, and the reconciliation arithmetic.
+   than after. Send `docs/AUDIT-BRIEF.md`, which is written to be handed over as-is and states the
+   seven invariants a finding should be measured against.
 7. **Get legal advice (J1).** Also long lead time, and it can invalidate assumptions underneath
-   everything else, so it is cheaper early than late.
+   everything else, so it is cheaper early than late. Send `docs/LEGAL-BRIEF.md` — facts and
+   questions, no analysis, so counsel is not billing to discover the architecture.
 
 **Then the decisions that only need someone to make them.**
 
