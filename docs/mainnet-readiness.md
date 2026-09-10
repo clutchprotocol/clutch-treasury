@@ -302,20 +302,47 @@ itself. Encrypting the backup only moves the problem while the source file is re
 **Verification:** A1 and A2 land and the mnemonic is not in `.env` at all. Until then, confirm with
 `inspect-stage.yml` that exactly one `.env.bak` exists on the host and no timestamped copies remain.
 
-### D3. Reconciliation runs unattended and alerts — **Required**
+### D3. Reconciliation runs unattended and alerts — **Required** (rules done 2026-09-11)
 
-Reconciliation reads `ok` whenever reserve covers liability, and a reserve below liability is the
-one condition that halts minting. That check needs to run on a schedule and page someone, not be
-run by hand.
+Reconciliation already ran unattended: a worker loop on `reconciliation_interval_secs`, with a
+short retry on failure rather than the full interval, and a mismatch already called
+`ledger::alert`, which logs at error level and writes an `alerts` row that `metrics.rs` gauges.
 
-**Verification:** a scheduled reconciliation with an alert route that has been tested by forcing a
-failure.
+What did not exist was anything that **evaluated** any of it. Ten Prometheus alerting rules now
+do, in `clutch-deploy` (`config/monitoring/prometheus/rules/treasury.yml`, `db1bd1a`): reconciliation
+mismatch and staleness, a latched breaker, p1s from either service, either service failing scrapes,
+sweeping stalled, a stuck chain outbox, and deposit polling stalled or never having run. Verified
+loaded on stage — all ten report `health: ok` — via the `metrics` probe.
+
+**Still open, and it is the part that matters:** nothing delivers them. The rules fire into
+Prometheus and Grafana and stop there. `clutch-deploy/docs/ALERTING.md` sets out the two routes
+(Grafana contact points, or Alertmanager) and what closes the item.
+
+**Verification:** a delivery route, tested by forcing a failure. Stopping `treasury-service` for
+four minutes and confirming `TreasuryServiceDown` reaches a human is the cheapest forcing function.
+An untested route is in exactly the state the metrics were in before these rules existed.
+
+:::warning Found while verifying this
+Prometheus was in state `created` — created and never started, no logs, no restarts — so **stage
+had no monitoring at all** for some window before 2026-09-11, and nothing said so. Three wrong
+diagnoses preceded finding it, because the `metrics` probe's Prometheus queries had *also* been
+broken (the `prom/prometheus` image dropped `wget`) and the probe reported "could not query
+Prometheus" for both causes identically. A clean deploy restored it.
+
+Two lessons went into the probe rather than into this document: it now prints Prometheus's own
+container state and last log lines before querying anything, and it no longer sends its own stderr
+to `/dev/null`. A probe whose failure output cannot distinguish "I could not ask" from "the answer
+is empty" is the same defect it exists to catch, and its output gets read as evidence.
+
+This is also an argument for finishing the delivery route above rather than trusting dashboards:
+a dashboard nobody is looking at and a Prometheus that is not running look identical.
+:::
 
 ---
 
 ## E. Abuse and rate controls
 
-### E1. Rate limiting — **Required** (orchestrator done 2026-09-10)
+### E1. Rate limiting — **Required** (both services done; edge and load test open)
 
 Nothing had rate limiting. The deposit-address endpoint, the redemption endpoints, and
 `generateToken` are all reachable by anyone with a keypair, and keypairs are free. The per-address
@@ -390,14 +417,24 @@ real users, and it is the app people will copy.
 keychain, or an external signer), or it carries an unmissable warning and is not presented as the
 way to hold real CLT.
 
-### F2. SDK pin in the demo app's production build — **Required**
+### F2. SDK pin in the demo app's production build — **Closed 2026-09-10**
 
-`package.prod.json` pins `clutch-hub-sdk-js` at `^1.15.0`, which cannot resolve to any 4.x release.
-Since 3.0.0 changed the signed wire format, a production build from that file would produce
-transactions the node rejects. Tracked separately; listed here because a broken prod build path is
-not something to discover during a launch.
+`package.prod.json` pinned `clutch-hub-sdk-js` at `^1.15.0`, which cannot resolve to any 4.x
+release, and 3.0.0 changed the signed wire format — so a production build from that file would have
+produced transactions the node rejects.
 
-**Verification:** the pin matches the SDK the node accepts, or the prod build path is deleted.
+Re-pinning was the obvious fix until reading what the pin fed. Every part of that path was broken
+independently of the version: `build:prod` ran `npm install --production` and then `vite build`,
+and vite is a devDependency, so the first half removed what the second half invoked;
+`deploy-prod.ps1` deleted `package-lock.json` and then ran `npm ci`, which requires one, and
+switched to a `package.json` with no build script before running `npm run build`; and
+`restore-dev.ps1` depended on a file only the broken script created, which was neither tracked nor
+ignored. Nothing referenced any of it — not the Dockerfile, not the image workflow, not
+`clutch-deploy` — and there is no production demo app deployed for it to target.
+
+So it was deleted rather than given a second pin to go stale (`clutch-hub-demo-app` `cec9151`). The
+real production path is the image, which copies both repos, builds the SDK from source and runs
+`npm run build`, making an image a snapshot of two checkouts rather than of a version range.
 
 ---
 
