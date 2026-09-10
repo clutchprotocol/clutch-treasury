@@ -7,6 +7,29 @@ for each one, so readiness is a checklist rather than a judgement call.
 Scope is the whole Clutch stack, not only the treasury, because the treasury cannot be safe on
 its own. It lives here because this is the repo that holds funds.
 
+## This file is the canonical one
+
+A public version is published at
+[docs.clutchprotocol.io/reference/mainnet-readiness](https://docs.clutchprotocol.io/reference/mainnet-readiness)
+(`clutch-docs/docs/reference/mainnet-readiness.md`). It shares this structure and severities, but
+six items are generalized or omitted there because publishing them verbatim would be targeting
+information rather than honest disclosure:
+
+| Item | Why it is not public verbatim |
+|------|------------------------------|
+| D2 | Names the scripts and file pattern under which mnemonic copies accumulate on the host |
+| E1 | States that no rate limiting exists and which endpoints are reachable |
+| G1 | States that the live edge config is drifted and owned by no repo |
+| G2 | States that consensus, custody, and both databases share one host |
+| G3 | States that only one person can halt minting |
+| J1 | A written admission that no legal advice has been taken is quotable by a regulator |
+
+B3 is internal because it is housekeeping, not posture. Everything else appears publicly in some
+form, most of it already published before this document existed.
+
+**When an item here changes, update the public page in the same change.** A public page that
+understates a closed blocker is merely stale; one that overstates progress is worse than none.
+
 ## How to read this
 
 | Severity | Meaning |
