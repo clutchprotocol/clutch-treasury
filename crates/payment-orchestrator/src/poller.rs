@@ -217,7 +217,12 @@ pub async fn poll_once(
         // conclusion and stores the same hash; transitioning first could leave a `confirmed` intent
         // with no evidence recorded, which the treasury's verifier would then have to resolve down
         // its weaker no-hash path.
-        if let Err(e) = deposits::set_tron_tx_id(pool, id, tx_id).await {
+        // `block_timestamp` is epoch MILLISECONDS. It is the only honest answer to "when did this
+        // money arrive" — `created_at` is when we noticed, and for an address polled for the first
+        // time since a reset those two are days apart.
+        let transfer_at = chrono::DateTime::from_timestamp_millis(earliest.block_timestamp)
+            .unwrap_or_else(chrono::Utc::now);
+        if let Err(e) = deposits::set_tron_tx_id(pool, id, tx_id, transfer_at).await {
             tracing::error!("poller: failed to store tx id for intent {id}: {e}");
             continue;
         }

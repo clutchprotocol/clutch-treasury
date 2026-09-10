@@ -53,12 +53,22 @@ pub struct DepositIntent {
     /// history view is the first caller that has to show it, which is why it joins `INTENT_COLS`
     /// only now.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the transfer landed on chain, from the TRC-20 event's `block_timestamp`.
+    ///
+    /// NOT the same as `created_at`, and the difference is not always small: an address is
+    /// permanent, so its old transfers become new rows the first time it is polled after a reset.
+    /// A history view that shows `created_at` calls a six-day-old deposit "7m ago".
+    ///
+    /// `None` on rows that settled before this column existed, and on rows not yet settled. A
+    /// caller with nothing here should say when it noticed rather than silently passing the row's
+    /// age off as the transfer's.
+    pub transfer_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
-    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at";
+    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at, transfer_at";
 
 /// Claim the next BIP32 derivation index for a deposit address.
 ///
@@ -126,12 +136,25 @@ pub async fn set_received_usdt(pool: &PgPool, id: Uuid, received: i64) -> Result
     .map(|_| ())
 }
 
-pub async fn set_tron_tx_id(pool: &PgPool, id: Uuid, tron_tx_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE deposit_intents SET tron_tx_id = $1, updated_at = now() WHERE id = $2 AND tron_tx_id IS NULL")
-        .bind(tron_tx_id)
-        .bind(id)
-        .execute(pool)
-        .await?;
+pub async fn set_tron_tx_id(
+    pool: &PgPool,
+    id: Uuid,
+    tron_tx_id: &str,
+    transfer_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sqlx::Error> {
+    // Written in the same statement as the hash, under the same `tron_tx_id IS NULL` guard, because
+    // they are one fact: this row is backed by that transfer, which landed then. Two statements
+    // could leave a hash with no time against it if the process died between them, and a history
+    // view would then be back to showing the row's age as the transfer's.
+    sqlx::query(
+        "UPDATE deposit_intents SET tron_tx_id = $1, transfer_at = $2, updated_at = now() \
+         WHERE id = $3 AND tron_tx_id IS NULL",
+    )
+    .bind(tron_tx_id)
+    .bind(transfer_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
