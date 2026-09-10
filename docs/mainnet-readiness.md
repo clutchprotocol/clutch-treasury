@@ -110,7 +110,11 @@ recorded in its own section.
     step 13**, not after: if the release window is a consensus parameter it belongs in `ChainInit`,
     and genesis-committed values cannot be added later without a new chain. Settle that before the
     mainnet genesis is fixed even if the rest of the mechanism ships later.
-12. **Design reputation (H2).**
+12. **Decide on reputation (H2).** A proposal exists
+    (`docs/superpowers/specs/2026-09-11-reputation-design.md`) recommending it be derived off chain
+    from public history rather than put into consensus. Read it *after* step 11: H1's auto-release
+    removes most of the incentive reputation guards against, which may make the light version
+    sufficient.
 
 **Last, and only after all of the above.**
 
@@ -862,12 +866,39 @@ none of which have answers yet:
 **Verification:** a dispute mechanism specified, implemented and documented, with the passenger's
 recourse acknowledged rather than merely shown. The disclosure above is a floor, not the fix.
 
-### H2. Reputation — **Required**
+### H2. Reputation — **Required** (design proposal 2026-09-11)
 
 No driver or rider scoring exists, so nothing distinguishes a first-time counterparty from a
 repeatedly bad one.
 
-**Verification:** a reputation design that does not become a new attack surface, implemented.
+`docs/superpowers/specs/2026-09-11-reputation-design.md` proposes one. The constraint that decides
+everything is that **an account is a free keypair**, so any score attached to an address is
+discardable — an actor with a bad score makes a new key. Designs that are not answers to that are
+worse than nothing, because they look like protection while a new keypair defeats them for the price
+of one transaction. A `RideRating` transaction type is the specific thing to avoid: it puts a
+scoring rule into consensus, where it cannot be changed without a new chain, and still does not
+solve the clean-slate problem.
+
+Two things already costly in this system do answer it, and both are already on chain: deposit
+history, since CLT enters circulation only against verified USDT, and completed rides, which need a
+funded counterparty. The naive version of that fails to self-dealing — ride with yourself and the
+fare returns to you, so a fabricated ride costs only five transaction fees, about **$0.005** — which
+is why the measure has to be **distinct counterparties weighted by whether they have their own
+deposit history.** Funding is the cost a keypair cannot dodge.
+
+The recommendation is therefore to **derive reputation off chain from public history and keep
+scoring out of consensus**: the explorer aggregates facts per address, the Hub API exposes them, and
+an application decides what to make of them. No new transaction type, no new state, and no new
+attack surface in the node — which is what this item's own verification asks for. It deliberately
+produces facts rather than a single number, because a single number is what invites gaming.
+
+**Ordering:** build H1 first. Its timed auto-release means a rider who takes a ride and does not pay
+ends up paying anyway, which removes most of the incentive this design guards against. That is why
+this item is Required rather than a blocker, and with H1 shipped reputation becomes information for
+declining a counterparty in advance rather than the primary defence.
+
+**Verification:** a reputation design that does not become a new attack surface, implemented. The
+proposal satisfies the first clause by construction; the second is unbuilt.
 
 ### H3. Matching — **Recommended**
 
