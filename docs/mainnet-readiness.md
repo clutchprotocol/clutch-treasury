@@ -542,15 +542,42 @@ endpoint's bounds, and the reconciliation arithmetic.
 **Verification:** an audit report from an external firm, its findings triaged, and every critical
 and high finding either fixed or accepted in writing.
 
-### I2. Test coverage where money moves — **Required**
+### I2. Test coverage where money moves — **Verification met 2026-09-11**
 
-Counts today: 276 tests in `clutch-treasury`, 99 in `clutch-node`, 20 in `clutch-hub-api`. The SDK
-got its first two test files on 2026-09-10. The treasury is the best covered, which is the right
-priority; the Hub API is the thinnest and sits on the path every user takes.
+This item was written from test *counts*, which understated what exists. Read against the actual
+suites, the verification it asked for is already satisfied.
 
-**Verification:** the mint, burn, sweep, and payout paths each have tests covering the failure
-branches, not just the happy path, and the ambiguous-payout branch that pages a human is tested.
+**The payout path**, including the branch this item singled out. `db_redemption.rs` alone carries 24
+tests, and the failure branches are covered individually rather than as a group:
+`an_ambiguous_payout_is_never_retried`, `a_refusal_returns_the_intent_for_retry`,
+`a_paid_reply_without_a_tx_id_is_ambiguous_not_paid`, `a_500_is_ambiguous_not_refused`,
+`an_unrecognised_status_is_ambiguous`, `a_400_is_refused_because_the_signer_rejected_the_shape`,
+`a_reverted_payout_tx_is_never_paid_and_alerts_a_human_instead`,
+`mismatched_burn_fails_intent_never_pays`, and three separate daily-cap branches. The
+Refused-versus-Ambiguous distinction is what decides whether a burn can be paid twice, and every arm
+of it has its own test.
 
+**Mint, sweep and reconciliation**: `db_tron_verifier.rs` 24, `db_sweeper.rs` 10,
+`db_reconciliation.rs` 11, `db_breakers.rs` 8, `db_outbox.rs` 5 — including an over-cap intent
+routing to `needs_manual` rather than burning ten retries on something no retry can fix.
+
+**The arithmetic itself**, in `clutch-node`, is property-tested rather than example-tested:
+`fee_split_sums_exactly` asserts the three shares sum to the fare across *all* fares and both bps
+rates, and `floor_fee_bounded_by_fare` bounds the floor. Exactly-once refs are covered in both
+directions by `first_duplicate_ref_spans_mint_and_burn` and `keeps_every_ref_less_burn`.
+
+**What is actually thin**, and it is not what the counts suggested:
+
+- **`clutch-hub-sdk-js`**, at 6 tests, all added 2026-09-10. It builds and signs what users
+  authorise, so a defect there is a wrong transaction carrying a valid signature. It had no test CI
+  before this week either.
+- **`clutch-hub-demo-app`**, at zero. It is the reference every builder copies.
+- Neither moves money server-side — the Hub forwards signed transactions and cannot alter one
+  without invalidating the signature — which is why they rank below the paths above rather than
+  above them.
+
+**Verification:** met for the server-side money paths. Re-open against the SDK if it grows beyond
+transaction construction, and treat F1 as the demo app's real risk rather than its test count.
 ---
 
 ## J. Legal and regulatory
