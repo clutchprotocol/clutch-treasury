@@ -232,16 +232,43 @@ worth deciding together rather than separately:
 
 ## C. Chain and genesis
 
-### C1. Fresh mainnet genesis — **Blocker**
+### C1. Fresh mainnet genesis — **Blocker** (checkable as of 2026-09-11)
 
-`is_testnet = true` and `chain_id = 2077` are committed into the genesis hash, alongside
-`tx_fee`, `mint_authority`, `faucet_address`, `faucet_allocation`, and both referrer bps rates.
-Mainnet needs a new genesis with `is_testnet = false`, a distinct `chain_id`, and the KMS-backed
-mint authority from A1. `faucet_allocation` must be `0`, as it now is on stage.
+`is_testnet = true` and `chain_id = 2077` are committed into the genesis hash, alongside `tx_fee`,
+`mint_authority`, `faucet_address`, `faucet_allocation` and both referrer bps rates. Mainnet needs a
+new genesis with `is_testnet = false`, a distinct `chain_id`, and the KMS-backed mint authority from
+A1. `faucet_allocation` must be `0`, as it now is on stage.
 
-**Verification:** the mainnet genesis parameters are reviewed and recorded before first boot, all
-nodes report the same genesis hash, and a node configured with a nonzero faucet allocation refuses
-to start.
+The eight committed values cannot be changed after the chain starts without a new genesis, and a
+disagreement of one character between two nodes means they cannot peer — the hash is compared at
+handshake. Until now the only thing enforcing that was a comment in `node1.toml` saying the values
+must be byte-identical.
+
+`clutch-deploy/scripts/check-genesis.sh` now enforces it before boot. It compares every committed
+field across all node configs, compares the `authorities` list too — not genesis-committed, but
+`authorities[slot % len]` depends on order and length, so a divergent list makes a node reject
+blocks the others accept — and applies the value rules the node otherwise asserts at boot. Under
+`MAINNET=1` it adds the three that only matter for a real chain: `is_testnet` false,
+`faucet_allocation` zero, and a `chain_id` that is not 2077, because sharing the testnet id would
+let an auth challenge captured there authenticate the same key here.
+
+Verified in both directions: it passes on the current config and exits non-zero both on a config
+where one `tx_fee` differs and on the testnet config under `MAINNET=1`.
+
+**What is still needed, and each is a decision rather than a task:**
+
+| Value | Who decides, and on what |
+|---|---|
+| `chain_id` | Yours. Any value that is not 2077 and not another live chain's. |
+| `mint_authority` | Blocked on A1 — it must be the KMS key's address, so this cannot be filled before that key exists. |
+| `tx_fee` | Currently 1,000 CLT ($0.001). Validator compensation, so it depends on what running an authority costs. |
+| Referrer bps | Currently 200 + 200. An economic choice about app-builder incentive, not a safety one. |
+| `faucet_address` | Inert once the allocation is zero, but it stays a committed field, so pick something deliberately rather than carrying the testnet's over. |
+| `authorities` | Blocked on C2 — the mainnet set, whose size also picks the block cadence at `60 / len`. |
+
+**Verification:** the mainnet genesis parameters recorded here, `MAINNET=1 check-genesis.sh` passing
+against them, every node reporting the same genesis hash after first boot, and a node configured
+with a nonzero faucet allocation refusing to start.
 
 ### C2. Validator set — **Blocker**
 
