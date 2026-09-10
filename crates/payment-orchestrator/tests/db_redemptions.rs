@@ -340,6 +340,13 @@ async fn out_of_bounds_amount_is_rejected() {
         .await
         .unwrap();
     assert_eq!(too_small.status(), StatusCode::BAD_REQUEST, "below min_redemption_clt must be rejected");
+    // The demo app renders this string verbatim rather than duplicating the server's bounds, so a
+    // bound the reader cannot decode is a bound they cannot act on. Both forms have to survive:
+    // the base units a caller must send, and the dollars they typed.
+    let msg = body_json_of(too_small).await["error"].as_str().unwrap().to_string();
+    assert!(msg.contains("1000000"), "bounds message must keep base units, got {msg}");
+    assert!(msg.contains("$1.00"), "bounds message must name the minimum in dollars, got {msg}");
+    assert!(msg.contains("$50.00"), "bounds message must name the maximum in dollars, got {msg}");
 
     let too_large = app
         .oneshot(post_redemption_request(&bearer_for(DAVE_ADDR), VALID_TRON_ADDRESS, 999_000_000))

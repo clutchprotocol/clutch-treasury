@@ -8,10 +8,18 @@ fn default_max_node_lag_blocks() -> u64 {
     50
 }
 
-/// $1, in micro-USDT. A starting point, NOT a measurement: the real number is what one sweep
-/// costs in TRX at your energy prices, and it moves. Raise it once you have observed the cost.
+/// $5, in micro-USDT. Measured on 2026-09-10 rather than guessed: a TRC-20 USDT transfer into
+/// an address that already holds USDT burns 64,285 energy, and the chain parameter
+/// `getEnergyFee` was 100 sun per unit of energy. That is 6.43 TRX, about $2.19 at a TRX price
+/// of $0.34. A sweep is always that shape, because the treasury address holds USDT from its
+/// first sweep onward.
+///
+/// $5 is roughly twice the measured cost, and the doubling is the point: TRX price moves eat a
+/// thinner margin, and the energy price is a governance parameter that has already halved once
+/// (210 sun per energy to 100), so the cost can change without TRX moving at all. Re-measure
+/// this number rather than scaling it.
 fn default_sweep_min_usdt() -> i64 {
-    1_000_000
+    5_000_000
 }
 
 /// No fee. Adding the mechanism must not start charging anyone by itself — the number is a

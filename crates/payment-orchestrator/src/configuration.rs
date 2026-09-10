@@ -74,6 +74,14 @@ pub struct OrchConfig {
     /// `redemption_ref` for a payout that cannot happen while the float behind it is unfunded.
     /// Flip only once that rollout checklist is done.
     pub redemptions_enabled: bool,
+    /// The smallest redemption this service will accept, in CLT base units.
+    ///
+    /// It MUST stay above the treasury's `redemption_fee_usdt`. The two live in different
+    /// services and are not derived from each other, so nothing enforces the ordering at boot:
+    /// the treasury refuses an intent whose net payout would be zero or negative with a 400,
+    /// and this service maps that to `TreasuryRejected`, a 502 reading "treasury refused the
+    /// redemption request". Every amount between the fee and this minimum would fail that way,
+    /// with no message naming the real reason. Move the two together.
     pub min_redemption_clt: i64,
     pub max_redemption_clt: i64,
 }
