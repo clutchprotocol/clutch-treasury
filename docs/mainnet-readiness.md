@@ -290,17 +290,29 @@ both mint unlimited buckets and lock a chosen victim out of logging in. Source l
 the edge, where the hop is actually known — which makes it partly an item for G1, since the live
 edge config is not owned by a repo today.
 
+Reviewed and deliberately NOT done in `treasury-service`, on 2026-09-10. Rejecting an
+unauthenticated request there costs a header parse and three fixed-length byte comparisons, with no
+cryptography, so an unauthenticated flood is an ordinary HTTP flood that belongs to the edge rather
+than to a per-identity limiter. There are only three identities in the first place — one token per
+role — so keying a limiter on them bounds nothing useful, and a caller holding a role token is
+already bounded by four-eyes approval, a per-transaction cap, a daily cap, and the halt breaker.
+Adding a limiter there would be code with no threat behind it. Revisit if a per-person token scheme
+ever replaces the three shared ones.
+
+The token comparison itself was hardened in the same pass, since it was the thing actually worth
+fixing: `==` on `&str` short-circuits at the first differing byte, so its timing was a function of
+how much of the token a caller had already guessed. It is now a constant-time comparison over equal
+lengths. A weak oracle against a long random token, but these three tokens gate the mint ledger.
+
 Still open:
 
-- **`treasury-service`**, whose endpoints are internal-only and bearer-gated, so it is lower
-  priority, but "internal" is a network assumption rather than a bound.
 - **Source limiting at the edge**, per the paragraph above.
 - **The load test.** Every limit here is argued for, not yet measured under load, and the numbers
   are guesses in the honest sense: chosen well above observed client behaviour and well below what
   a flood needs to hurt, with nothing between those two bounds measured.
 
-**Verification:** a limit on the treasury service's endpoints too, source limiting at the edge, and
-a load test showing all of them hold with the chosen numbers recorded here.
+**Verification:** source limiting at the edge, and a load test showing every limit holds with the
+chosen numbers recorded here.
 
 ### E2. Deposit-address growth is bounded — **Recommended**
 
