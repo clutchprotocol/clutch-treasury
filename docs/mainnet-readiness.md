@@ -215,17 +215,38 @@ rotating an authority key is not a config edit. The procedure needs to exist bef
 
 ## D. Data durability and recovery
 
-### D1. Off-host ledger backup — **Blocker**
+### D1. Off-host ledger backup — **Blocker** (tooling done 2026-09-11)
 
 Both databases sit on named local Docker volumes with `restart: unless-stopped`, so data survives
 container recreation. It does not survive disk loss, host loss, or `docker compose down -v`. The
 treasury ledger is the record of who deposited what and which mints were approved; losing it means
-losing the ability to honour redemptions, and the chain does not carry the off-chain half. There is
-no `pg_dump` schedule, no off-host copy, and no restore procedure anywhere in `clutch-deploy`.
+losing the ability to honour redemptions, and the chain does not carry the off-chain half.
 
-**Verification:** encrypted off-host backups on a schedule, with a restore performed into a clean
-environment and reconciliation run green against it. The restore is what closes this, not the
-backup job.
+Built in `clutch-deploy` — see [`docs/BACKUP-RESTORE.md`](https://github.com/clutchprotocol/clutch-deploy/blob/main/docs/BACKUP-RESTORE.md):
+
+- `scripts/backup-treasury-db.sh` dumps both databases in Postgres custom format, pipes straight
+  into `openssl enc` so the plaintext never touches disk, writes mode 600 into a mode-700
+  gitignored directory, optionally pushes off host with `rclone`, and prunes to 14.
+- `scripts/restore-treasury-db.sh` restores into `<db>_restore_<stamp>` and cannot target a live
+  database. It prints row counts, because a restore that loads cleanly and is empty is the failure
+  the rehearsal exists to catch.
+- `.github/workflows/backup-treasury-db.yml` runs it daily at 03:17 UTC and on dispatch.
+
+Two guards in the dump path are the ones that matter: `pipefail`, so a failing `pg_dump` cannot
+leave a valid encryption of a truncated dump, and a 1 KB size floor. Both of those failures look
+exactly like a good backup otherwise. The script also refuses to run without `BACKUP_PASSPHRASE`.
+
+**Still open, and this is the whole point of the item:**
+
+1. **`BACKUP_REMOTE` is not set on the host**, so today's dumps share a disk with the databases
+   they came from. The script warns about this on every run. Set it to an rclone destination.
+2. **`BACKUP_PASSPHRASE` must be stored somewhere that is not the host.** A passphrase next to the
+   dump it protects is decoration.
+3. **No restore has been performed.** A dump nobody has restored is a hypothesis.
+
+**Verification:** the rehearsal in the runbook, performed — restore into a clean database, then
+point a `treasury-service` instance at it and get reconciliation green *against the restored
+ledger*. That is the verification; a loadable dump is not. Record the date here when done.
 
 ### D2. Plaintext mnemonic copies on the host — **Blocker** (mitigated 2026-09-10)
 
