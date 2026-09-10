@@ -43,16 +43,41 @@ use sha2::{Digest, Sha256};
 
 use crate::keys::Signer;
 
-/// Enough TRX at the derived address to pay for one TRC-20 transfer.
+/// Enough TRX at a deposit address to pay for the one TRC-20 transfer that sweeps it.
 ///
 /// A fresh address holds none: it has only ever received tokens, and receiving does not create a
 /// TRX balance. So every sweep needs the address funded first, and a sweep attempted without it
 /// fails at broadcast with a message about bandwidth that reads like a bug rather than an
 /// operational gap. Checked up front so the error names the real problem.
 ///
-/// 30 TRX covers a TRC-20 transfer to an already-created account at unstaked energy prices, with
-/// room for the fee market moving. It is a floor for a preflight check, not a spend.
-const MIN_TRX_SUN_FOR_TRANSFER: i64 = 30_000_000;
+/// A sweep is always the CHEAP shape of a TRC-20 transfer: it moves USDT into the treasury
+/// address, and that address holds USDT from its first sweep onward, so the transfer writes a
+/// balance slot that already exists. Measured on Tron mainnet on 2026-09-10 at 64,285 energy,
+/// which at the chain parameter `getEnergyFee` of 100 sun is 6.43 TRX, plus 0.345 TRX of
+/// bandwidth once the day's free 600 is spent. 10 TRX covers that with about half again on top.
+///
+/// Split out of MIN_TRX_SUN_FOR_TRC20 rather than sharing it, because this is a SPEND and not
+/// only a threshold: `fund` sends exactly this much, so whatever this number is sits parked at
+/// every address that has ever been swept, and there is one of those per user forever. One
+/// constant serving both meant the many cheap addresses were each sized for the most expensive
+/// transfer in the service.
+const MIN_TRX_SUN_FOR_SWEEP: i64 = 10_000_000;
+
+/// Enough TRX to pay for a TRC-20 transfer whose recipient may hold none of the token yet.
+///
+/// The EXPENSIVE shape, and the difference is not small: writing a balance slot that does not
+/// exist yet cost 130,285 energy against 64,285 for one that does, measured the same day, so
+/// 13.03 TRX at a `getEnergyFee` of 100 sun. A payout is always capable of this, because the
+/// recipient is the user's own address and we do not get to know what it holds. The fee
+/// account's USDT transfer to the payout float is the same shape the first time it runs.
+///
+/// 30 TRX rather than 14 because `getEnergyFee` is a governance parameter: the 13-27 TRX range
+/// this service was originally sized against corresponds to 210 sun per energy, and at that
+/// price this same transfer costs 27.4 TRX. So this covers a full return to the older price
+/// rather than only today's. Exactly two addresses hold this much -- the payout float and the
+/// fee account -- which is what makes the headroom affordable here and not at every deposit
+/// address.
+const MIN_TRX_SUN_FOR_TRC20: i64 = 30_000_000;
 
 /// TRX the fee account must hold ON TOP of what it is about to send.
 ///
@@ -357,19 +382,27 @@ impl SweepClient {
             .map_err(|e| e.to_string())
     }
 
-    /// Send `MIN_TRX_SUN_FOR_TRANSFER` to `target_address` from the fee account so it can pay for
-    /// its own TRC-20 transfer.
+    /// Send `amount_sun` to `target_address` from the fee account so it can pay for its own
+    /// TRC-20 transfer.
     ///
-    /// Two callers now: a deposit address about to be swept, and the payout float about to send a
-    /// redemption. Both are addresses of ours that hold tokens but no TRX, and the fee account is
-    /// the single TRX float behind both.
+    /// Two callers, and they no longer want the same amount: a deposit address about to be swept
+    /// needs MIN_TRX_SUN_FOR_SWEEP, the payout float about to send a redemption needs
+    /// MIN_TRX_SUN_FOR_TRC20. Both are addresses of ours that hold tokens but no TRX, and the fee
+    /// account is the single TRX float behind both. The amount is a parameter rather than a
+    /// constant read here so that the caller, which knows which of the two transfers is coming,
+    /// is the one that picks it.
     ///
     /// Sends the full minimum rather than the shortfall. Topping up the difference would, for an
     /// address already near the floor, broadcast a transaction worth less than its own bandwidth.
-    async fn fund(&self, signer: &Signer, target_address: &str) -> Result<SweepOutcome, String> {
+    async fn fund(
+        &self,
+        signer: &Signer,
+        target_address: &str,
+        amount_sun: i64,
+    ) -> Result<SweepOutcome, String> {
         let fee_address = signer.fee_address()?;
         let have = self.trx_balance_sun(&fee_address).await?;
-        let need = MIN_TRX_SUN_FOR_TRANSFER + FEE_ACCOUNT_RESERVE_SUN;
+        let need = amount_sun + FEE_ACCOUNT_RESERVE_SUN;
         if have < need {
             return Ok(SweepOutcome::FeeAccountDry { fee_address, have_sun: have, need_sun: need });
         }
@@ -377,7 +410,7 @@ impl SweepClient {
         let built = self
             .post(
                 "/wallet/createtransaction",
-                funding_body(&fee_address, target_address, MIN_TRX_SUN_FOR_TRANSFER),
+                funding_body(&fee_address, target_address, amount_sun),
             )
             .await?;
         // createtransaction returns the transaction at the top level and reports refusals as
@@ -386,8 +419,8 @@ impl SweepClient {
             return Err(format!("trongrid refused to build the funding transfer: {err}"));
         }
         let tx_id = self.sign_and_broadcast(&signer.fee_signing_key()?, built).await?;
-        tracing::info!("funded {target_address} with {MIN_TRX_SUN_FOR_TRANSFER} sun from {fee_address} in {tx_id}");
-        Ok(SweepOutcome::Funded { tx_id, amount_sun: MIN_TRX_SUN_FOR_TRANSFER })
+        tracing::info!("funded {target_address} with {amount_sun} sun from {fee_address} in {tx_id}");
+        Ok(SweepOutcome::Funded { tx_id, amount_sun })
     }
 
     /// Verify, sign and broadcast a transaction TronGrid built. Shared by the sweep and its funding
@@ -469,8 +502,8 @@ impl SweepClient {
         // reach this service — sweeping an arbitrary empty index costs nothing, so the TRX float
         // cannot be dispersed across addresses by asking for sweeps that were never owed.
         let trx = self.trx_balance_sun(&from).await?;
-        if trx < MIN_TRX_SUN_FOR_TRANSFER {
-            return self.fund(signer, &from).await;
+        if trx < MIN_TRX_SUN_FOR_SWEEP {
+            return self.fund(signer, &from, MIN_TRX_SUN_FOR_SWEEP).await;
         }
 
         let built: serde_json::Value = self
@@ -549,8 +582,8 @@ impl SweepClient {
             Ok(v) => v,
             Err(e) => return Ok(PayoutOutcome::Refused(format!("could not read the payout float's TRX balance: {e}"))),
         };
-        if trx < MIN_TRX_SUN_FOR_TRANSFER {
-            return match self.fund(signer, &from).await {
+        if trx < MIN_TRX_SUN_FOR_TRC20 {
+            return match self.fund(signer, &from, MIN_TRX_SUN_FOR_TRC20).await {
                 Ok(SweepOutcome::Funded { tx_id, amount_sun }) => Ok(PayoutOutcome::NeedsTrx { tx_id, amount_sun }),
                 // Only a balance check ran before this outcome — no sign_and_broadcast call was
                 // made for any transaction, so this is provably a non-broadcast (spec §3).
@@ -638,7 +671,7 @@ impl SweepClient {
                 return Ok(FundFloatOutcome::Refused(format!("could not read the fee account's TRX balance: {e}")))
             }
         };
-        if trx < MIN_TRX_SUN_FOR_TRANSFER {
+        if trx < MIN_TRX_SUN_FOR_TRC20 {
             // No two-pass funding path here, unlike sweep and payout: the fee account is what funds
             // those, so there is nothing to fund IT from. FEE_ACCOUNT_RESERVE_SUN does not apply
             // either — that reserve exists so an account SENDING TRX keeps enough to pay for the
@@ -646,7 +679,7 @@ impl SweepClient {
             return Ok(FundFloatOutcome::FeeAccountDry {
                 fee_address: from,
                 have_sun: trx,
-                need_sun: MIN_TRX_SUN_FOR_TRANSFER,
+                need_sun: MIN_TRX_SUN_FOR_TRC20,
             });
         }
 
@@ -931,10 +964,10 @@ mod funding_tests {
     /// wrong account, on a path that only runs against a live chain.
     #[test]
     fn funding_pays_from_the_fee_account_to_the_deposit_address() {
-        let body = funding_body(FEE, DEPOSIT, MIN_TRX_SUN_FOR_TRANSFER);
+        let body = funding_body(FEE, DEPOSIT, MIN_TRX_SUN_FOR_SWEEP);
         assert_eq!(body["owner_address"], FEE, "the fee account pays");
         assert_eq!(body["to_address"], DEPOSIT, "the deposit address receives");
-        assert_eq!(body["amount"], MIN_TRX_SUN_FOR_TRANSFER);
+        assert_eq!(body["amount"], MIN_TRX_SUN_FOR_SWEEP);
     }
 
     /// The fee account must be required to keep more than it sends. Funding is itself a transaction:
@@ -943,6 +976,31 @@ mod funding_tests {
     #[test]
     fn the_fee_account_must_hold_more_than_it_sends() {
         assert!(FEE_ACCOUNT_RESERVE_SUN > 0, "a zero reserve lets the account drain to unusable");
+    }
+
+    /// Both floors have to cover the transfer they gate, and they do not gate the same transfer.
+    /// An edit that tidies them back into one number breaks one end or the other: collapse down
+    /// and the payout float attempts a transfer it cannot pay for, collapse up and every deposit
+    /// address parks three times the TRX it will ever need, one address per user, forever.
+    ///
+    /// The energy figures are measurements from Tron mainnet on 2026-09-10 -- 64,285 for a
+    /// transfer into an address that already holds USDT, 130,285 for one that has to create the
+    /// balance slot -- priced at the `getEnergyFee` of 100 sun, plus 345,000 sun of bandwidth for
+    /// the case where the day's free 600 is already spent.
+    #[test]
+    fn each_floor_covers_the_transfer_it_gates() {
+        assert!(
+            MIN_TRX_SUN_FOR_SWEEP >= 64_285 * 100 + 345_000,
+            "the sweep floor must cover a transfer into an address that already holds USDT"
+        );
+        assert!(
+            MIN_TRX_SUN_FOR_TRC20 >= 130_285 * 100 + 345_000,
+            "the TRC-20 floor must cover a transfer that creates the recipient's balance slot"
+        );
+        assert!(
+            MIN_TRX_SUN_FOR_SWEEP < MIN_TRX_SUN_FOR_TRC20,
+            "the cheap shape must stay cheaper, or the split has been undone"
+        );
     }
 }
 
@@ -1109,7 +1167,7 @@ mod fund_float_tests {
     #[tokio::test]
     async fn the_whole_fee_account_balance_moves_to_the_derived_payout_float() {
         let balance = 1_000_000_000; // the 1,000 USDT actually sitting on the fee account
-        let (url, calls) = fake_trongrid(balance, MIN_TRX_SUN_FOR_TRANSFER).await;
+        let (url, calls) = fake_trongrid(balance, MIN_TRX_SUN_FOR_TRC20).await;
         let signer = fixture_signer();
 
         let outcome = SweepClient::new(config(url)).fund_float(&signer).await.unwrap();
@@ -1130,7 +1188,7 @@ mod fund_float_tests {
     /// on it.
     #[tokio::test]
     async fn an_empty_fee_account_moves_nothing_and_broadcasts_nothing() {
-        let (url, calls) = fake_trongrid(0, 100 * MIN_TRX_SUN_FOR_TRANSFER).await;
+        let (url, calls) = fake_trongrid(0, 100 * MIN_TRX_SUN_FOR_TRC20).await;
 
         let outcome = SweepClient::new(config(url)).fund_float(&fixture_signer()).await.unwrap();
 
@@ -1143,7 +1201,7 @@ mod fund_float_tests {
     /// built, signed or broadcast on the way to saying so.
     #[tokio::test]
     async fn a_fee_account_short_of_trx_reports_dry_and_broadcasts_nothing() {
-        let (url, calls) = fake_trongrid(1_000_000, MIN_TRX_SUN_FOR_TRANSFER - 1).await;
+        let (url, calls) = fake_trongrid(1_000_000, MIN_TRX_SUN_FOR_TRC20 - 1).await;
         let signer = fixture_signer();
 
         let outcome = SweepClient::new(config(url)).fund_float(&signer).await.unwrap();
@@ -1152,8 +1210,8 @@ mod fund_float_tests {
             outcome,
             FundFloatOutcome::FeeAccountDry {
                 fee_address: signer.fee_address().unwrap(),
-                have_sun: MIN_TRX_SUN_FOR_TRANSFER - 1,
-                need_sun: MIN_TRX_SUN_FOR_TRANSFER,
+                have_sun: MIN_TRX_SUN_FOR_TRC20 - 1,
+                need_sun: MIN_TRX_SUN_FOR_TRC20,
             }
         );
         assert_eq!(sequence(&calls), "usdt_balance,trx_balance", "no transfer may be built or broadcast");
@@ -1164,7 +1222,7 @@ mod fund_float_tests {
     /// reads the token balance before the TRX balance.
     #[tokio::test]
     async fn the_usdt_balance_is_read_before_the_trx_balance() {
-        let (url, calls) = fake_trongrid(500_000, MIN_TRX_SUN_FOR_TRANSFER).await;
+        let (url, calls) = fake_trongrid(500_000, MIN_TRX_SUN_FOR_TRC20).await;
 
         SweepClient::new(config(url)).fund_float(&fixture_signer()).await.unwrap();
 
