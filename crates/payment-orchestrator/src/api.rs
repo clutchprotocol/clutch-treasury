@@ -299,7 +299,16 @@ async fn create_redemption_handler(
         ),
         RedemptionOutcome::OutOfBounds { min, max } => (
             StatusCode::BAD_REQUEST,
-            json!({"error": format!("amount_clt must be between {min} and {max}")}),
+            // Base units AND dollars. The raw numbers are what a caller has to send, so they stay;
+            // the dollars are what the person reading the message actually typed. A seven-digit
+            // minimum is unreadable as a limit -- the demo app shows this string verbatim (see
+            // WithdrawPanel's note on deliberately not duplicating server bounds), and the minimum
+            // is now $10 rather than $1, so it gets read far more often than it used to.
+            json!({"error": format!(
+                "amount_clt must be between {min} and {max} base units (${:.2} to ${:.2})",
+                min as f64 / 1e6,
+                max as f64 / 1e6,
+            )}),
         ),
         RedemptionOutcome::TreasuryUnavailable => {
             resp_headers.insert("retry-after", "30".parse().unwrap());
