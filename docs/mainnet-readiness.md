@@ -835,14 +835,32 @@ so the limit is chosen rather than discovered.
 
 ## I. External review
 
-### I1. Security audit — **Blocker**
+### I1. Security audit — **Blocker** (brief written 2026-09-11)
 
-No audit is referenced in any repo. The roadmap lists "audited crypto" as unstarted. The areas that
-most need external eyes: the signing and encoding path, the four-eyes mint flow, the payout
-endpoint's bounds, and the reconciliation arithmetic.
+No external audit has been done. The areas that most need outside eyes are the signing and encoding
+path, the four-eyes mint flow, the bounds on the payout endpoint, and the reconciliation arithmetic.
 
-**Verification:** an audit report from an external firm, its findings triaged, and every critical
-and high finding either fixed or accepted in writing.
+`docs/AUDIT-BRIEF.md` is now written to be handed to a firm as-is. Sending that rather than a
+repository URL is the difference between paying an auditor to discover the architecture and paying
+them to attack it, and it is the cheapest thing that can be done about this item before money
+changes hands.
+
+It states the **seven invariants the design claims**, so a report can say which one a finding breaks
+— and so a firm that finds none of them broken has said something useful rather than nothing. It
+names where to look ordered by what a finding would cost rather than by lines of code, and it lists
+the known gaps explicitly, with the note that a finding restating one of them is not useful while a
+finding showing one is *worse than recorded* is.
+
+It also points at the live testnet as a legitimate target, since there is no mainnet to protect, and
+explains that test funds need no wallet.
+
+**Verification:** an audit report with every critical and high finding either fixed or accepted in
+writing.
+
+**Worth starting early.** Audits have long lead times and this one gates a real-funds launch, so
+commissioning it while the KMS and validator work is in flight costs nothing and saves the calendar.
+It is also cheaper to run against a system whose known gaps are already documented, which they now
+are.
 
 ### I2. Test coverage where money moves — **Verification met 2026-09-11**
 
