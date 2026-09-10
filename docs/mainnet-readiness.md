@@ -105,15 +105,23 @@ operation needs to be as controlled as the ceremony above.
 **Verification:** a written top-up procedure with two-person authorisation, a documented maximum
 top-up, and no code path in this repo that can move custody funds.
 
-### A5. Sweep signer review — **Required**
+### A5. Sweep signer review — **Reviewed 2026-09-11, holds**
 
-`SweepSigner` (`crates/treasury-service/src/sweeper.rs`) moves deposits into custody. The sweep API
-deliberately takes an index and nothing else, so owning the orchestrator cannot redirect a deposit.
-That property must be re-confirmed against the mainnet configuration, since it is the reason the
-sweep path is not a second payout path.
+All three write endpoints on `tron-signer` were read against this property. It holds:
 
-**Verification:** a reviewer confirms the mainnet sweep endpoint still takes no destination,
-amount, or contract parameter, and that its destination comes only from `tron-signer` config.
+| Endpoint | Request body | Destination | What bounds it |
+|---|---|---|---|
+| `/internal/sweep` | `{index}` and nothing else | `cfg.treasury_address`, from config | Cannot name a destination, amount or contract at all |
+| `/internal/payout` | `{intent_id, to, amount_usdt}` | caller-named `to` | Source is always the float; a per-transaction cap is checked before signing |
+| `/internal/fund-float` | none — a body sent anyway is ignored | the float | Cannot name anything |
+
+So a caller who owns the orchestrator, or anything else that can reach the signer, cannot redirect
+a deposit. Payout is the deliberate exception and its blast radius is the float balance, not
+custody. `intent_id` on payout is not used for signing; it exists so a broadcast can be tied back
+to the redemption that caused it, which is the only way an ambiguous payout is ever resolved.
+
+**Re-verify** whenever any of those three request types gains a field. The property is a shape,
+not a check, so it is broken by an addition rather than by a change.
 
 ---
 
@@ -200,32 +208,76 @@ Aura is an authority round-robin, so the validator set is permissioned by constr
 three authorities that are three containers in one compose project on one VPS. That is a single
 point of failure and a single point of control.
 
+Two couplings found while reviewing this on 2026-09-11, neither of them documented anywhere before:
+
+- **The authority count sets the block cadence.** `step_duration = 60 / authorities.len()` seconds,
+  so the current three authorities own 20-second slots. Changing the set size changes that cadence,
+  which makes "add a validator" a consensus-timing change rather than a roster edit. Note that the
+  README's and marketing site's "~1s blocks" describes transaction inclusion latency, not the slot
+  duration.
+- **There is a hard ceiling of 60 authorities**, and past it the node used to boot fine and then
+  panic on its first slot calculation, because the step duration truncated to zero. An empty set
+  divided by zero at construction. Both are now refused at startup with a message naming the reason
+  (`clutch-node` `ff53d5c`), along with a duplicate authority, which silently took two slots per
+  round.
+
 **Verification:** authorities run on hosts that do not share an operator, a provider, or a power
 supply, each with its own key, and the network has been observed continuing to produce blocks with
-one authority stopped.
+one authority stopped. Decide the mainnet set size deliberately, since it picks the block cadence.
 
-### C3. Key rotation path — **Required**
+### C3. Key rotation path — **Required** (premise corrected 2026-09-11)
 
-Consensus parameters are genesis-committed and peers compare the genesis hash at handshake, so
-rotating an authority key is not a config edit. The procedure needs to exist before it is needed.
+An earlier version of this item said rotation was hard because consensus parameters are
+genesis-committed. That was wrong, and worth correcting because it made the job look bigger than
+it is. `ChainInit` — the genesis-committed set — carries `chain_id`, `is_testnet`, `tx_fee`, both
+referrer bps rates, `mint_authority`, `faucet_address` and `faucet_allocation`. It does **not**
+carry the authority set, which is per-node config read at startup. So rotating an authority key
+needs no chain reset.
 
-**Verification:** a written rotation procedure, rehearsed on a throwaway network.
+The real hazard is different: `authorities[slot % len]` means the slot-to-author mapping depends on
+both the order and the length of that list. A node with a stale list rejects blocks from a new
+authority and expects blocks from a departed one, so the set has to change on every node together.
+Rotation is therefore a coordinated restart, not a rolling one.
+
+**Verification:** a written rotation procedure covering the coordinated-restart requirement and the
+cadence change that comes with a size change, rehearsed on a throwaway network.
 
 ---
 
 ## D. Data durability and recovery
 
-### D1. Off-host ledger backup — **Blocker**
+### D1. Off-host ledger backup — **Blocker** (tooling done 2026-09-11)
 
 Both databases sit on named local Docker volumes with `restart: unless-stopped`, so data survives
 container recreation. It does not survive disk loss, host loss, or `docker compose down -v`. The
 treasury ledger is the record of who deposited what and which mints were approved; losing it means
-losing the ability to honour redemptions, and the chain does not carry the off-chain half. There is
-no `pg_dump` schedule, no off-host copy, and no restore procedure anywhere in `clutch-deploy`.
+losing the ability to honour redemptions, and the chain does not carry the off-chain half.
 
-**Verification:** encrypted off-host backups on a schedule, with a restore performed into a clean
-environment and reconciliation run green against it. The restore is what closes this, not the
-backup job.
+Built in `clutch-deploy` — see [`docs/BACKUP-RESTORE.md`](https://github.com/clutchprotocol/clutch-deploy/blob/main/docs/BACKUP-RESTORE.md):
+
+- `scripts/backup-treasury-db.sh` dumps both databases in Postgres custom format, pipes straight
+  into `openssl enc` so the plaintext never touches disk, writes mode 600 into a mode-700
+  gitignored directory, optionally pushes off host with `rclone`, and prunes to 14.
+- `scripts/restore-treasury-db.sh` restores into `<db>_restore_<stamp>` and cannot target a live
+  database. It prints row counts, because a restore that loads cleanly and is empty is the failure
+  the rehearsal exists to catch.
+- `.github/workflows/backup-treasury-db.yml` runs it daily at 03:17 UTC and on dispatch.
+
+Two guards in the dump path are the ones that matter: `pipefail`, so a failing `pg_dump` cannot
+leave a valid encryption of a truncated dump, and a 1 KB size floor. Both of those failures look
+exactly like a good backup otherwise. The script also refuses to run without `BACKUP_PASSPHRASE`.
+
+**Still open, and this is the whole point of the item:**
+
+1. **`BACKUP_REMOTE` is not set on the host**, so today's dumps share a disk with the databases
+   they came from. The script warns about this on every run. Set it to an rclone destination.
+2. **`BACKUP_PASSPHRASE` must be stored somewhere that is not the host.** A passphrase next to the
+   dump it protects is decoration.
+3. **No restore has been performed.** A dump nobody has restored is a hypothesis.
+
+**Verification:** the rehearsal in the runbook, performed — restore into a clean database, then
+point a `treasury-service` instance at it and get reconciliation green *against the restored
+ledger*. That is the verification; a loadable dump is not. Record the date here when done.
 
 ### D2. Plaintext mnemonic copies on the host — **Blocker** (mitigated 2026-09-10)
 
