@@ -144,12 +144,17 @@ price near $0.34. `getEnergyFee` is a TRON governance parameter that has already
 TRX price recorded, and the fee set from it. Include the two cases separately: a recipient address
 that already holds USDT, and one that does not.
 
-### B3. Reconcile documented values against deployed values — **Required**
+### B3. Reconcile documented values against deployed values — **Closed 2026-09-10**
 
-The docs and the compose defaults currently disagree about live economics. `docker-compose.treasury.yml`
-defaults to a $1 fee with a $5 minimum; `clutch-node/clt-economics.md` describes a $5 fee with a $10
-minimum. Both are plausible, because every one of these is env-overridable and the host `.env` is not
-in the repo. Nobody should reason about mainnet economics from a number that might be stale.
+The docs and the compose defaults disagreed about live economics: the compose file defaults to a $1
+fee with a $5 minimum, while `clutch-node/clt-economics.md` described $5 and $10. The maintainer
+confirmed the live values are **$1 with a $5 minimum**, so the documents were the stale side, not
+the config. `clt-economics.md` and `clutch-treasury/redemptions.md` were corrected, and the $5
+figure now appears there as what it actually is: the fee a deployment needs when its payout float
+burns TRX for energy, which is where mainnet starts until delegation is proven on a real receipt.
+
+Re-open this item on any deployment whose `.env` overrides these, since the host `.env` is not in
+the repo.
 
 | Setting | Compose default | Unit |
 |---------|-----------------|------|
