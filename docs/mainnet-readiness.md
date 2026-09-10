@@ -263,15 +263,30 @@ failure.
 
 ## E. Abuse and rate controls
 
-### E1. Rate limiting — **Required**
+### E1. Rate limiting — **Required** (orchestrator done 2026-09-10)
 
-Neither `clutch-hub-api` nor any treasury crate has rate limiting. The deposit-address endpoint,
-the redemption endpoints, and `generateToken` are all reachable by anyone with a keypair, and
-keypairs are free. The per-address polling budget makes address enumeration a cost the treasury
-carries.
+Nothing had rate limiting. The deposit-address endpoint, the redemption endpoints, and
+`generateToken` are all reachable by anyone with a keypair, and keypairs are free. The per-address
+polling budget makes address enumeration a cost the treasury carries rather than the caller.
 
-**Verification:** rate limits on the authenticated endpoints and on token issuance, with the limits
-recorded and a load test showing them holding.
+Done in `payment-orchestrator`: a fixed-window limiter keyed on the authenticated `pk`, checked
+immediately after `authenticated_pk` in both POST handlers, returning 429. Default 10 per minute,
+`APP_RATE_LIMIT_PER_MINUTE` to override. Standard library only, capped at 10,000 tracked
+identities, evicting the entry closest to expiry when full rather than refusing a new identity —
+refusing would let an identity-churning attacker lock out real users. Five tests, verified by name
+in CI.
+
+Still open:
+
+- **`clutch-hub-api`**, which is Actix rather than Axum and needs its own middleware. `generateToken`
+  matters most there: it performs secp256k1 signature recovery before it knows whether the caller
+  is anyone, so it is the one endpoint where an unauthenticated flood costs real CPU.
+- **`treasury-service`**, whose endpoints are internal-only and bearer-gated, so it is lower
+  priority, but "internal" is a network assumption rather than a bound.
+- **The load test.** The limits are argued for, not yet measured under load.
+
+**Verification:** limits on `generateToken` and on the treasury service's endpoints too, with all
+of them recorded here and a load test showing they hold.
 
 ### E2. Deposit-address growth is bounded — **Recommended**
 

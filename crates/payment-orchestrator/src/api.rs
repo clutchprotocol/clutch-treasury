@@ -16,6 +16,7 @@ use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::derive::AddressDeriver;
 use crate::deposits;
+use crate::ratelimit::RateLimiter;
 use crate::redemptions::{self, RedemptionOutcome};
 
 #[derive(Clone)]
@@ -24,6 +25,10 @@ pub struct AppState {
     pub config: OrchConfig,
     /// Shared so the account xpub is parsed once, at startup.
     pub deriver: Arc<AddressDeriver>,
+    /// Shared so every request counts against the same windows. `AppState` is cloned per
+    /// request, so a limiter held by value here would give each request its own empty map and
+    /// silently enforce nothing.
+    pub limiter: Arc<RateLimiter>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -109,6 +114,11 @@ async fn create_deposit_handler(
         ));
     }
     let user_pk = authenticated_pk(&headers, &state.config)?;
+    // Checked after auth so the window keys on a signed identity rather than on anything a
+    // caller can set for free. ANY new mutating route here needs this line too.
+    if state.limiter.check(&user_pk).is_err() {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
 
     let clt_address = match canonical_clt_address(&user_pk) {
         Some(a) => a,
@@ -251,6 +261,13 @@ async fn create_redemption_handler(
         ));
     }
     let user_pk = authenticated_pk(&headers, &state.config)?;
+    // Same bound as the deposit route, and for a sharper reason: every accepted intent here is a
+    // claim against the payout float, whose balance is the ceiling on the whole rail's loss.
+    // Placed before the address-shape check below so a caller cannot spend its allowance-free
+    // path re-sending a malformed token.
+    if state.limiter.check(&user_pk).is_err() {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     // Address-shaped, lowercased, exactly as the deposit route insists — and here the stakes are
     // worse. The treasury matches the burn's on-chain sender against this string before it will pay,
     // so a public-key-form token creates a redemption that CANNOT be honoured: the user burns their
@@ -384,7 +401,8 @@ async fn get_redemption_handler(
 
 pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) -> Router {
     let cors = build_cors(&config.allowed_origins);
-    let state = AppState { pool, config, deriver };
+    let limiter = Arc::new(RateLimiter::per_minute(config.rate_limit_per_minute));
+    let state = AppState { pool, config, deriver, limiter };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler).get(list_deposits_handler))

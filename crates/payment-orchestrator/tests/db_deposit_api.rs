@@ -97,6 +97,9 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         redemptions_enabled: false,
         min_redemption_clt: 1_000_000,
         max_redemption_clt: 50_000_000,
+        // High enough that these tests never trip the limiter; its own behaviour is
+        // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
+        rate_limit_per_minute: 1_000,
     }
 }
 
@@ -670,4 +673,40 @@ async fn expired_legacy_intents_are_not_listed() {
     let rows = body["deposits"].as_array().expect("deposits must be an array");
     assert_eq!(rows.len(), 1, "only the real deposit — the expired legacy intent must be excluded");
     assert_eq!(rows[0]["tron_tx_id"].as_str().unwrap(), "tx-real-deposit");
+}
+
+/// The limiter is wired into the route, not merely unit-tested in isolation.
+///
+/// This also pins the sharing. `AppState` is cloned per request, so a limiter held by value
+/// rather than behind an `Arc` would hand every request its own empty map and enforce nothing,
+/// while every unit test in `ratelimit` still passed.
+#[tokio::test]
+async fn deposit_post_refuses_a_second_request_from_the_same_identity() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    config.rate_limit_per_minute = 1;
+    let app = router_with(pool.clone(), config);
+
+    let post = |app: axum::Router, pk: &'static str| async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/deposits")
+            .header("authorization", bearer_for(pk))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    };
+
+    assert_eq!(post(app.clone(), USER_A).await, StatusCode::OK, "the first request is allowed");
+    assert_eq!(
+        post(app.clone(), USER_A).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second request from the same identity inside the window must be refused"
+    );
+    assert_eq!(
+        post(app, USER_B).await,
+        StatusCode::OK,
+        "a different identity has its own allowance"
+    );
 }

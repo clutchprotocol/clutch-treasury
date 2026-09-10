@@ -10,6 +10,10 @@ fn default_metrics_addr() -> String {
     "0.0.0.0:9102".to_string()
 }
 
+fn default_rate_limit_per_minute() -> u32 {
+    10
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OrchConfig {
     pub http_addr: String,
@@ -84,6 +88,15 @@ pub struct OrchConfig {
     /// with no message naming the real reason. Move the two together.
     pub min_redemption_clt: i64,
     pub max_redemption_clt: i64,
+    /// Requests per minute per authenticated identity, on the two POST routes.
+    ///
+    /// Keypairs are free, so the JWT proves who is calling and bounds nothing about how often.
+    /// Both POST routes leave something durable behind — a permanently polled deposit address,
+    /// or a redemption intent against the payout float — so they need a bound that is not
+    /// "however fast you can sign challenges". Ten is far above what the demo app's one POST per
+    /// panel open needs, and far below what a flood needs to matter. See `ratelimit`.
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
 }
 
 impl OrchConfig {

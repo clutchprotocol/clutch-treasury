@@ -8,5 +8,6 @@ pub mod deposits;
 pub mod metrics;
 pub mod derive;
 pub mod poller;
+pub mod ratelimit;
 pub mod redemptions;
 pub mod treasury_bridge;

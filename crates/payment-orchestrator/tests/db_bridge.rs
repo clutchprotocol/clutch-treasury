@@ -73,6 +73,9 @@ fn test_config(treasury_url: String) -> OrchConfig {
         redemptions_enabled: false,
         min_redemption_clt: 1_000_000,
         max_redemption_clt: 50_000_000,
+        // High enough that these tests never trip the limiter; its own behaviour is
+        // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
+        rate_limit_per_minute: 1_000,
     }
 }
 
