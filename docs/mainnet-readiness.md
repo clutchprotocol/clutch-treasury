@@ -442,17 +442,31 @@ threshold together. Record whichever here.
 
 ## F. Client-side key handling
 
-### F1. Demo app key storage — **Blocker for any app handling real funds**
+### F1. Demo app key storage — **Second branch satisfied 2026-09-11**
 
-The reference app generates or imports keys and stores them in plaintext `localStorage` under
-`clutch_{passenger|driver}_privateKey`. Its own notes call this demo-grade and say not to make it a
-real wallet without discussion. Any XSS, any malicious extension, or a shared machine is total loss
-of that user's funds. This does not block a mainnet chain, but it blocks shipping this app to
-real users, and it is the app people will copy.
+The reference app generates or imports keys in the browser and stores them in plaintext
+`localStorage` under `clutch_{passenger|driver}_privateKey`. Any XSS, any malicious extension, or a
+shared machine is total loss of that user's funds. This does not block a mainnet chain, but it
+blocks shipping this app to real users, and it is the app people copy.
 
-**Verification:** either the reference app moves to a real key boundary (hardware wallet, OS
-keychain, or an external signer), or it carries an unmissable warning and is not presented as the
-way to hold real CLT.
+This item offered two branches. The second is now done (`clutch-hub-demo-app` `feat/key-storage-notice`,
+live on stage): a non-dismissible notice at wallet setup, before the key exists, which is the only
+moment a warning can change what someone does. It says the key is plaintext in this browser and
+readable by any script, extension or other user of the machine; that clearing site data destroys it
+irrecoverably; and never to put real funds behind it. It also addresses builders rather than riders:
+the SDK signs locally, so a hardware wallet, an OS keychain or an external signer substitutes in
+without changing how transactions are built. The README's storage section carried the same gap plus
+stale key names and a "remember keys" option that does not exist; both are fixed.
+
+There is no dismiss button on purpose. A remembered dismissal hides the warning from exactly the
+person who arrives on a shared machine later.
+
+**The first branch — an actual key boundary — remains the better answer** and is required before any
+app built on this pattern holds real funds. Nothing about the disclosure makes plaintext storage
+safe; it makes it *known*, which is the most that documentation can do.
+
+**Verification:** met as written. Re-open as a blocker against any deployment that intends real
+funds through this app, where only the first branch counts.
 
 ### F2. SDK pin in the demo app's production build — **Closed 2026-09-10**
 
