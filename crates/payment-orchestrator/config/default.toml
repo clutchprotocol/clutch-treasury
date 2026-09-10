@@ -26,5 +26,9 @@ permanent_deposit_addresses_enabled = false
 # this stays false until its rollout finishes (float funded, reconciliation verified) — see
 # OrchConfig::redemptions_enabled doc comment.
 redemptions_enabled = false
-min_redemption_clt = 1000000
+# $10. NOT a UX choice: it is pinned above the treasury's APP_REDEMPTION_FEE_USDT, which is $5
+# on stage. The treasury refuses any redemption that cannot cover its own fee, and that refusal
+# reaches the user as a bare 502 from this service, so a minimum at or below the fee turns a
+# whole band of amounts into an unexplained failure. Raise this whenever the fee rises.
+min_redemption_clt = 10000000
 max_redemption_clt = 50000000
