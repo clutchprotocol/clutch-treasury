@@ -559,15 +559,44 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Required**
+### G1. nginx ownership — **Required** (scope established 2026-09-11)
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
-hand-maintained config that the deploy script patches in place, so the checked-in copy has already
-drifted from the host. Editing `clutch-deploy/config/nginx/*.conf` changes nothing on stage. A money
-system should not have its edge config in a file no repo owns.
+hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
+has already drifted from the host. Editing `clutch-deploy/config/nginx/*.conf` changes nothing on
+stage. A money system should not have its edge config in a file no repo owns.
 
-**Verification:** the mainnet edge config lives in a repo, is deployed from it, and the live config
-read back from the host matches the checked-in one byte for byte.
+**What is actually on that host**, read through the `nginx` probe on 2026-09-11 so the move is a
+known quantity rather than an estimate. One file, thirteen `server` blocks:
+
+| Clutch vhosts (8) | v2ray vhosts (5) |
+|---|---|
+| `app-stage`, `api-stage`, `explorer-stage`, `node1-stage`, `node2-stage`, `node3-stage`, `seq-stage`, `grafana-stage` | `de2.clutchprotocol.io`, `de.wenda.ir`, `3x`, `sub`, `de-grpc` (the only `listen 80 http2`) |
+
+The `/payment/` route is at line 37, inside the `app-stage` block — the route that was added to this
+repo's copy, deployed, confirmed present on the server, and still 405'd for a full cycle before
+anyone checked which file was mounted.
+
+**The reason this is not simply copied into the repo:** five of the thirteen vhosts are not Clutch's,
+and one of them is a different domain entirely. Moving the file wholesale would mean this repo owning
+someone else's proxy configuration; leaving it means Clutch's edge is owned by nothing. Two ways out,
+and it is a host-reorganisation decision rather than a task:
+
+1. **Split by include.** The v2ray nginx keeps `nginx.conf` and adds an `include` of a directory that
+   `clutch-deploy` owns and deploys. Smallest change, and the Clutch vhosts become reviewable in git.
+   The v2ray project has to accept the include.
+2. **Clutch takes port 80.** Move nginx into `clutch-deploy` (the overlay for it already exists,
+   `docker-compose.stage.nginx.yml`, unusable today because :80 is taken) and have it proxy the v2ray
+   vhosts instead. Cleaner ownership, larger blast radius if it goes wrong, and it makes Clutch's
+   deploy able to break someone else's service.
+
+Nothing was deliberately dumped into a CI log here. The probe reports structure — sizes, server
+names, locations — rather than the file's contents, because a production edge config in a build log
+is a different problem from the one being solved.
+
+**Verification:** Clutch's edge config lives in a repo, is deployed from it, and the live config read
+back from the host matches the checked-in one. Until then, keep using the `nginx` probe rather than
+either copy, as the workspace notes already say.
 
 ### G2. Single host — **Required**
 
