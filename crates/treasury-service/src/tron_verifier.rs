@@ -37,7 +37,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
-use crate::ledger::alert;
+use crate::ledger::{alert, alert_once};
 
 /// A single TRC-20 transfer as TronGrid's trc20 endpoint reports it. Field names VERIFIED
 /// against a live response (T7), not inferred: `value` really is a decimal STRING in the
@@ -765,10 +765,16 @@ async fn stuck_intent_sweep(pool: &PgPool, intents: &[DepositBackedIntent]) {
     let now = chrono::Utc::now();
     for intent in intents {
         let age = now - intent.created_at;
+        // Hourly, not per pass. This loop reruns every few seconds and the condition it reports
+        // changes on the scale of hours, so `alert` here meant one row and one log line every tick
+        // for as long as the intent stayed stuck -- see `alert_once`.
+        const REPEAT_AFTER: chrono::TimeDelta = chrono::Duration::hours(1);
         if age > chrono::Duration::hours(24) {
-            alert(pool, "p1", "tron_verifier", &format!("mint intent {} unresolved for over 24h", intent.id)).await;
+            let m = format!("mint intent {} unresolved for over 24h", intent.id);
+            alert_once(pool, "p1", "tron_verifier", &m, REPEAT_AFTER).await;
         } else if age > chrono::Duration::minutes(30) {
-            alert(pool, "warn", "tron_verifier", &format!("mint intent {} unresolved for over 30m", intent.id)).await;
+            let m = format!("mint intent {} unresolved for over 30m", intent.id);
+            alert_once(pool, "warn", "tron_verifier", &m, REPEAT_AFTER).await;
         }
     }
 }

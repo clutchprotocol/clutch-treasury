@@ -666,6 +666,19 @@ async fn stuck_intent_past_24h_pages_p1() {
         .await
         .unwrap();
     assert!(n >= 1, "an intent unresolved for over 24h must page p1");
+
+    // The sweep reruns every few seconds while the intent stays stuck. Saying it again on every
+    // pass buries whatever else is raised in the meantime, and nothing prunes this table. Stage
+    // wrote four identical rows in ninety seconds before this guard existed.
+    for _ in 0..3 {
+        treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    }
+    let (n_after,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE severity = 'p1' AND source = 'tron_verifier'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n_after, n, "a still-stuck intent must not re-alert on every pass");
 }
 
 /// The gap the brief requires closing: the SAME on-chain transfer cannot back two different
