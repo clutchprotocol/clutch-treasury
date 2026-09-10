@@ -25,6 +25,22 @@ pub enum Role {
     ReadOnly,
 }
 
+/// Compare a presented secret against an expected one without leaking where they diverge.
+///
+/// `==` on `&str` compares length first and then short-circuits on the first differing byte, so
+/// the time it takes is a function of how much of the token the caller already guessed. That is a
+/// weak oracle against a long random token over a network, but these three tokens gate the mint
+/// ledger, and "weak" is not the standard to hold an auth check to. Length still leaks, which is
+/// acceptable: the tokens are fixed-length and their length is not the secret.
+fn secret_eq(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    // Accumulate every byte difference and compare once, so there is no early exit to time.
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Static bearer tokens, one per role — disjoint on purpose (four-eyes, spec §5).
 /// Returns the caller's role; the handler decides which roles it accepts.
 pub fn caller_role(headers: &HeaderMap, config: &AppConfig) -> Result<Role, StatusCode> {
@@ -33,11 +49,11 @@ pub fn caller_role(headers: &HeaderMap, config: &AppConfig) -> Result<Role, Stat
         .and_then(|v| v.to_str().ok())
         .map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if token == config.initiator_token {
+    if secret_eq(token, &config.initiator_token) {
         Ok(Role::Initiator)
-    } else if token == config.approver_token {
+    } else if secret_eq(token, &config.approver_token) {
         Ok(Role::Approver)
-    } else if token == config.readonly_token {
+    } else if secret_eq(token, &config.readonly_token) {
         Ok(Role::ReadOnly)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -473,4 +489,27 @@ pub fn router(pool: PgPool, config: AppConfig) -> Router {
         .route("/internal/reserve-status", get(reserve_status_handler))
         .route("/internal/reconciliation-report", get(reconciliation_report_handler))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod secret_eq_tests {
+    use super::secret_eq;
+
+    #[test]
+    fn matches_only_an_exact_secret() {
+        assert!(secret_eq("s3cret-token", "s3cret-token"));
+        assert!(!secret_eq("s3cret-token", "s3cret-tokeN"), "a single byte must not match");
+        assert!(!secret_eq("s3cret-toke", "s3cret-token"), "a prefix must not match");
+        assert!(!secret_eq("s3cret-token!", "s3cret-token"), "an extension must not match");
+        assert!(!secret_eq("", "s3cret-token"), "an empty presented token must not match");
+    }
+
+    /// The empty-expected case is what makes this worth pinning: if a role token were ever left
+    /// unset, a caller sending no token at all must not authenticate as that role. Config load
+    /// already refuses empty secrets, so this is defence in depth for a second mistake.
+    #[test]
+    fn an_empty_expected_secret_matches_only_an_empty_presented_one() {
+        assert!(!secret_eq("anything", ""));
+        assert!(secret_eq("", ""), "equal-and-empty is still equal — config load is what forbids it");
+    }
 }
