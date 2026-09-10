@@ -227,17 +227,28 @@ no `pg_dump` schedule, no off-host copy, and no restore procedure anywhere in `c
 environment and reconciliation run green against it. The restore is what closes this, not the
 backup job.
 
-### D2. Stop accumulating plaintext mnemonic copies — **Blocker**
+### D2. Plaintext mnemonic copies on the host — **Blocker** (mitigated 2026-09-10)
 
-`provision-treasury-secrets.sh` and `set-mint-caps.sh` each copy `.env` to a timestamped
-`.env.bak.*` before editing. `.env` holds `DEPOSIT_MNEMONIC`, so every run leaves another plaintext
-copy of the mnemonic on the host. They are chmodded 600, and the script comments note the first one
-predated that, but the count grows with every deploy and each copy is exactly as sensitive as the
-original.
+`provision-treasury-secrets.sh` and `set-mint-caps.sh` each copied `.env` to a timestamped
+`.env.bak.*` before editing. `.env` holds `DEPOSIT_MNEMONIC`, so every run left another plaintext
+copy of the mnemonic on the host, with no upper bound on the count.
 
-**Verification:** with KMS in place the mnemonic is no longer in `.env` at all. Until then, backups
-are pruned to one, encrypted at rest, and the scripts are changed to stop creating new plaintext
-copies.
+Done on 2026-09-10, in `clutch-deploy`:
+
+- Both scripts now keep exactly one `.env.bak`, overwritten per run, and delete the timestamped
+  pile earlier runs left. The copy happens before the delete, so a failed copy cannot leave
+  nothing recoverable.
+- `.env.bak` and `.env.bak.*` are gitignored. They were not, so `.env` was protected from being
+  committed while its backups were not.
+- **The host is not clean until one of those workflows runs again.** Re-dispatching *Provision
+  treasury secrets (stage)* sweeps it; that script writes a variable only if it is absent and can
+  never overwrite `DEPOSIT_MNEMONIC`, so re-running it is safe by construction.
+
+Still open, which is why this stays a blocker: the remaining backup is plaintext, and so is `.env`
+itself. Encrypting the backup only moves the problem while the source file is readable.
+
+**Verification:** A1 and A2 land and the mnemonic is not in `.env` at all. Until then, confirm with
+`inspect-stage.yml` that exactly one `.env.bak` exists on the host and no timestamped copies remain.
 
 ### D3. Reconciliation runs unattended and alerts — **Required**
 
