@@ -55,6 +55,66 @@ Five things must all be true before any mainnet address is handed to a user:
 
 Everything below expands these, plus the product and legal work that sits outside them.
 
+## What to do next, in order
+
+Several of these block each other, so the order is not a preference. Everything below needs a
+person, an account, a host, a firm or a lawyer — the engineering side of each item is done and
+recorded in its own section.
+
+**Start here, because nothing depends on it and its failure mode is the worst.**
+
+1. **Perform the D1 restore rehearsal.** Cheapest item on this list, and the only blocker whose
+   failure mode is losing the record of who is owed money. Set `BACKUP_REMOTE`, put
+   `BACKUP_PASSPHRASE` somewhere that is not the host, run the two scripts, and get reconciliation
+   green against the restored database.
+2. **Wire an alert destination and force a failure (D3).** The rules exist and are loaded. Stopping
+   `treasury-service` for four minutes and confirming `TreasuryServiceDown` reaches you is the
+   whole test. Do it before the caps decision below, because the daily mint cap's exposure depends
+   on how fast anyone finds out.
+3. **Name a second operator and rehearse a halt (G3).** One person knowing the breaker exists is
+   not a control. This is a conversation, not a task.
+
+**Then the chain of things that unblock each other.**
+
+4. **Provision AWS KMS** — a key with `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, and a
+   policy that does not grant `kms:ScheduleKeyDeletion` to the signing principal. This unblocks
+   the `KmsSigner` API call (A1, A2), which unblocks the key ceremony (A3), which unblocks the
+   mainnet `mint_authority` (C1), and it is what finally closes D2 by taking the mnemonic out of
+   `.env` entirely.
+5. **Decide the mainnet validator set (C2).** Hosts that share no operator, provider or power
+   supply. Its *size* picks the block cadence at `60 / len`, so decide the number deliberately, and
+   it is the other value C1 is waiting on.
+6. **Commission the audit (I1).** Long lead time, so start it while the above is in flight rather
+   than after. Point it at the signing and encoding path, the four-eyes mint flow, the payout
+   endpoint's bounds, and the reconciliation arithmetic.
+7. **Get legal advice (J1).** Also long lead time, and it can invalidate assumptions underneath
+   everything else, so it is cheaper early than late.
+
+**Then the decisions that only need someone to make them.**
+
+8. **Set the mainnet caps (B4).** Method and invariant checker are in place; the numbers are a risk
+   appetite. Set them in the same sitting as the alert route from step 2.
+9. **Pick the deposit-address ceiling (E2).** Accept ~6,000 with the D3 alert as the tripwire, or
+   raise `MAX_ADDRESSES_PER_PASS`, `poll_interval_secs` and that alert threshold together.
+10. **Choose how the edge config gets an owner (G1).** An include of a directory `clutch-deploy`
+    owns, or Clutch taking port 80. Host reorganisation either way.
+
+**Then the two that are genuinely unfinished design work, not configuration.**
+
+11. **Design dispute resolution (H1).** The three unanswered questions are in that section. This is
+    the item that gates a *public* launch rather than a pilot, and it is a design problem before it
+    is an implementation one.
+12. **Design reputation (H2).**
+
+**Last, and only after all of the above.**
+
+13. **Boot the mainnet genesis and read the first payout receipt (C1, B1, B2).** The first mainnet
+    payout is the first real test of the energy model, because Nile cannot show it. Re-measure the
+    redemption fee from that receipt rather than scaling the testnet number.
+
+Nothing in this list is blocked on further engineering. Where an item still needs code — the KMS
+API call, a dispute mechanism — that is named in its own section along with what has to exist first.
+
 ---
 
 ## A. Key custody and signing
