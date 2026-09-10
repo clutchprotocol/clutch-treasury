@@ -525,14 +525,43 @@ minting and resumes it without the maintainer's help.
 These are product gaps, already listed honestly in the org README. They do not endanger the
 reserve; they decide whether a real ride market is usable.
 
-### H1. Dispute resolution — **Blocker for a public launch**
+### H1. Dispute resolution — **Blocker for a public launch** (disclosure half done 2026-09-11)
 
-Cancellations are on-chain, but there is no arbitration when two parties disagree and no no-show or
-fraud handling. Passengers also give up card-issuer chargebacks by signing payment directly. With
-test money that is a design conversation; with real money the passenger has no recourse at all.
+Cancellations are on-chain, but there is no arbitration when two parties disagree, and no no-show
+or fraud handling. Passengers also give up card-issuer chargebacks by signing payment directly,
+which is a fair trade for instant settlement on a testnet and a serious gap with real money: the
+passenger would have no recourse at all.
 
-**Verification:** a dispute mechanism specified, implemented, and documented, with the passenger's
-recourse stated plainly in the app before they pay.
+This item had two halves, and one was purely a disclosure failure. That half is done
+(`clutch-hub-demo-app` `feat/state-the-recourse`): a note now sits with the offers, immediately
+above the Accept buttons, saying that accepting holds the full fare on chain at once, that the
+passenger signs the payment themselves so no issuer can reverse it and there is no arbitration if
+the two sides disagree, and that either side can cancel before the fare is fully paid with the
+unpaid part returning to the passenger. That last part is the recourse that *does* exist, and it was
+as undocumented as the parts that do not.
+
+It is inline rather than a confirmation modal on purpose. For play money, a dialog demanding
+acknowledgement of "you have no recourse" is theatre, and it trains people to click through exactly
+the dialog that would matter on a real deployment. **A real deployment needs acknowledgement rather
+than display** — a material term of the transaction, acknowledged once per account rather than
+displayed and scrolled past.
+
+**The blocking half is untouched: a dispute mechanism still has to exist.** It is a design problem
+before it is an implementation one, and the design is not settled. The questions it has to answer,
+none of which have answers yet:
+
+- Who decides? An operator role is a trusted third party, which is the thing this architecture
+  removed. A staked juror set is a whole second protocol. A time-locked default (say, funds release
+  to the driver unless the passenger objects within N blocks) needs no arbiter but rewards whoever
+  is more patient.
+- What can a decision *do*? A burn is irreversible and a `RidePay` is final, so any remedy has to
+  be a new transaction rather than an undo — which means either an escrow window before settlement
+  or a separate insurance pool, and the first contradicts "paid in seconds".
+- What stops the mechanism itself being the attack? A free dispute that freezes a driver's payout
+  is a denial-of-service against drivers.
+
+**Verification:** a dispute mechanism specified, implemented and documented, with the passenger's
+recourse acknowledged rather than merely shown. The disclosure above is a floor, not the fix.
 
 ### H2. Reputation — **Required**
 
