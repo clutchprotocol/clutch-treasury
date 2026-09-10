@@ -179,14 +179,55 @@ whichever document is wrong is corrected. The two independent redemption
 bounds must remain numerically aligned, for the reason given in the workspace notes: a request the
 signer would reject must never become a burn nobody can pay.
 
-### B4. Mainnet caps set deliberately — **Blocker**
+### B4. Mainnet caps set deliberately — **Blocker** (analysis and a checker done 2026-09-11)
 
 The stage caps were sized for test money. Mainnet caps are the loss ceiling for every failure mode
-above, so they are the last line of defence and must be chosen on purpose.
+above them, so they are the last line of defence and have to be chosen on purpose.
 
-**Verification:** each cap has a written rationale naming the worst case it bounds, and the pair of
-redemption bounds is still aligned across the two services that enforce them.
+**What each one actually bounds**, which is the part that was missing:
 
+| Cap | Stage value | The worst case it bounds |
+|---|---|---|
+| `PER_TX_MINT_CAP_CLT` | $50 | One erroneous mint. Mints are four-eyes approved against a verified deposit, so the realistic failure is a bug computing the amount, not a rogue approval. |
+| `DAILY_MINT_CAP_CLT` | $500 | **A compromised mint authority.** This is the important one: the per-transaction cap does nothing against an attacker willing to submit repeatedly. Total exposure is this cap multiplied by the time until someone notices, which is why it and the D3 alert route are the same decision. |
+| `MAX_REDEMPTION_CLT` | $25 | One redemption. Must equal the signer's cap — see below. |
+| `PER_TX_PAYOUT_CAP_USDT` | $25 | One payout out of the float, enforced independently in `tron-signer`. |
+| `MIN_REDEMPTION_CLT` | $5 | Nothing, on its own. It exists so the smallest allowed redemption is not one the treasury refuses for failing to cover its fee. |
+| `REDEMPTION_FEE_USDT` | $1 | Nothing. It is a cost recovery, and it is capped from below by the on-chain payout cost (B2). |
+| Rolling 24-hour ceiling | above both | The same compromise scenario as the daily mint cap, from the payout side. |
+
+The float balance is a cap nobody set: **a compromised `treasury-service` cannot move more than the
+float holds**, because it cannot reach custody at all (A4, A5). Keeping the float small is
+therefore a safety control and not just an operational convenience.
+
+**The relationships are now checked mechanically** rather than remembered:
+`clutch-deploy/scripts/check-cap-invariants.sh`, which `set-mint-caps.sh` runs after every change.
+It enforces five things, each with the quiet failure it prevents:
+
+1. `per_tx_mint <= daily_mint` — otherwise no mint clears both and minting is simply off.
+2. `max_redemption <= per_tx_payout_cap` — **the one that costs a user money.** The two live in
+   services that do not derive from each other, so a request between them burns the CLT and then
+   cannot be paid.
+3. `fee < min_redemption` — otherwise the smallest allowed redemption is one the treasury refuses,
+   reaching the user as a bare 502 with no explanation.
+4. `min_redemption <= max_redemption` — otherwise every redemption is refused, silently.
+5. The fee as a share of the smallest redemption, because that ratio is what a user experiences.
+
+The stage set passes all five.
+
+**What is still a decision, and it is yours:** the mainnet numbers. The method is above; the inputs
+are expected deposit sizes and how much a single error or a compromise window may cost. Two things
+worth deciding together rather than separately:
+
+- **The daily mint cap and the alert route (D3) bound the same risk.** A cap of X with an alert that
+  reaches someone in minutes is a very different exposure from the same cap with no route at all.
+  Set them in the same sitting.
+- **A higher per-transaction mint cap is needed for larger real deposits**, and it widens the blast
+  radius of an amount-computation bug by exactly that much. There is no clever answer; there is only
+  a number with a reason attached.
+
+**Verification:** each mainnet cap recorded here with the worst case it bounds, and
+`check-cap-invariants.sh` passing against the mainnet `.env`.
 ---
 
 ## C. Chain and genesis
