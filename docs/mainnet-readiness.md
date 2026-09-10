@@ -276,17 +276,31 @@ identities, evicting the entry closest to expiry when full rather than refusing 
 refusing would let an identity-churning attacker lock out real users. Five tests, verified by name
 in CI.
 
+Done in `clutch-hub-api`: `generateToken` is bounded twice before any cryptography, since it is
+the only mutation not behind `AuthGuard` and therefore the only one that does secp256k1 recovery
+before it knows whether the caller is anybody. Globally at 120 per minute, and at 10 per minute
+per claimed `publicKey`. Both bounds are needed: `publicKey` is a caller-supplied string, so the
+per-key limit alone is bypassed by varying it, and only the global cap actually bounds recovery
+work. Six tests, verified by name in CI — which that repo did not have until this change, since
+its image build never compiles `cfg(test)` code or runs a test.
+
+Not keyed on client IP anywhere, deliberately. Behind Cloudflare and nginx the peer address is a
+proxy, so an IP bound would have to trust a forwarded header, and a spoofable one lets an attacker
+both mint unlimited buckets and lock a chosen victim out of logging in. Source limiting belongs at
+the edge, where the hop is actually known — which makes it partly an item for G1, since the live
+edge config is not owned by a repo today.
+
 Still open:
 
-- **`clutch-hub-api`**, which is Actix rather than Axum and needs its own middleware. `generateToken`
-  matters most there: it performs secp256k1 signature recovery before it knows whether the caller
-  is anyone, so it is the one endpoint where an unauthenticated flood costs real CPU.
 - **`treasury-service`**, whose endpoints are internal-only and bearer-gated, so it is lower
   priority, but "internal" is a network assumption rather than a bound.
-- **The load test.** The limits are argued for, not yet measured under load.
+- **Source limiting at the edge**, per the paragraph above.
+- **The load test.** Every limit here is argued for, not yet measured under load, and the numbers
+  are guesses in the honest sense: chosen well above observed client behaviour and well below what
+  a flood needs to hurt, with nothing between those two bounds measured.
 
-**Verification:** limits on `generateToken` and on the treasury service's endpoints too, with all
-of them recorded here and a load test showing they hold.
+**Verification:** a limit on the treasury service's endpoints too, source limiting at the edge, and
+a load test showing all of them hold with the chosen numbers recorded here.
 
 ### E2. Deposit-address growth is bounded — **Recommended**
 
