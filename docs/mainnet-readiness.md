@@ -393,13 +393,44 @@ Still open:
 **Verification:** source limiting at the edge, and a load test showing every limit holds with the
 chosen numbers recorded here.
 
-### E2. Deposit-address growth is bounded — **Recommended**
+### E2. Deposit-address growth is bounded — **Measured 2026-09-11; ceiling is a decision**
 
-Addresses are permanent and polled on a rotation with a fixed per-pass budget. Detection latency
-grows with the number of addresses handed out, and addresses can be requested for free.
+Addresses are permanent and never stop being watched, so the set only grows. Cost per pass is
+constant because `due_addresses` rotates through a fixed budget, oldest-checked-first — which means
+growth shows up as *latency*, not as load. The relationship is exact rather than empirical:
 
-**Verification:** a measured relationship between address count and worst-case detection latency,
-and a decision on the acceptable ceiling.
+> worst-case cold detection latency = ceil(addresses / `MAX_ADDRESSES_PER_PASS`) × `poll_interval_secs`
+
+With the deployed values (`MAX_ADDRESSES_PER_PASS = 50`, a compile-time constant in `poller.rs`;
+`poll_interval_secs = 30`):
+
+| Addresses handed out | Worst-case cold latency |
+|---|---|
+| 50 | 30 seconds |
+| 500 | 5 minutes |
+| 3,000 | 30 minutes |
+| 6,000 | 1 hour |
+| 12,000 | 2 hours |
+
+This is the *cold* path only. Opening the deposit panel marks an address hot for 24 hours and hot
+addresses are polled first, so anyone actually in the act of depositing is unaffected. The cold
+number is what governs a payment to an address whose owner has not looked at the panel recently.
+
+**This ties directly to the alert added in D3.** `OrchestratorPollingStalled` fires when the oldest
+poll age exceeds one hour, so at roughly **6,000 addresses the alert becomes a false positive** — it
+would fire continuously against a perfectly healthy rotation. The alert is therefore also the
+tripwire for this ceiling, which is a better arrangement than a separate threshold nobody maintains,
+but it means the two numbers have to move together.
+
+Headroom exists if the ceiling needs raising: 50 addresses per 30 seconds is about 1.7 requests per
+second at TronGrid, well inside a keyed tier. `MAX_ADDRESSES_PER_PASS` is a constant rather than
+config, so raising it is a code change and a release — deliberate, since it is also the thing
+protecting an unkeyed endpoint from being hammered into throttling, a failure that already cost a
+day of debugging once and which looks exactly like "nobody is paying".
+
+**The decision left:** accept ~6,000 as the ceiling and treat the D3 alert as the signal to revisit,
+or pick a higher target now and move `MAX_ADDRESSES_PER_PASS`, `poll_interval_secs` and the alert
+threshold together. Record whichever here.
 
 ---
 
