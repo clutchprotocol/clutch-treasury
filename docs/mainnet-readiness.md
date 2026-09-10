@@ -181,15 +181,44 @@ this stack's Keccak-over-hex-string convention, so `digest_for_hash_hex` is the 
 per-transaction cap and the float balance stay in place; the KMS boundary is in addition to them,
 not a replacement for them.
 
-### A3. Key ceremony and tested recovery — **Blocker**
+### A3. Key ceremony and tested recovery — **Blocker** (procedure written 2026-09-11)
 
 `keys.md` requires a real ceremony and tested recovery before any real-funds deployment. Neither
-has happened.
+has happened, and neither could have: there was no written procedure, and you cannot hold a ceremony
+you have not written down.
 
-**Verification:** a written ceremony record (who was present, what was generated, where each share
-went), plus a recovery rehearsal in which the mint and payout keys were restored from backup into a
-fresh environment and used to sign a test operation. The rehearsal is the artefact, not the plan
-for one.
+`docs/KEY-CEREMONY.md` is now that procedure. Writing it surfaced something worth stating, because
+it changes what this item actually asks for:
+
+**A KMS key has no key material to hold.** It is generated inside the HSM and cannot be exported —
+that is the whole reason for using it. So the traditional centre of a ceremony, splitting and
+escrowing a seed among custodians, does not apply and should not be simulated. What replaces it is
+narrower and easier to get wrong: witnessing that the key was created with the *right configuration*
+(a wrong `KeySpec` signs happily and produces signatures the node cannot verify, surfacing as a
+rejected mint rather than an error at creation), recording the key's *identity*, and testing that
+*access* recovers.
+
+That last one is the step people skip and it is the one `keys.md` means by "tested recovery". A KMS
+key with no exercised access-recovery path is exactly as lose-able as a seed phrase in one person's
+drawer; the failure just arrives as an IAM misconfiguration rather than a house fire. The procedure
+requires a second principal, in a separate identity, to actually sign from a machine that has never
+held the first one's credentials — not merely to be configured.
+
+Six steps, each with values to record, and deliberately only the last one irreversible: retiring
+`APP_MINT_AUTHORITY_SECRET` from the host happens after everything else is proven. That step is also
+what finally closes D2, since the mint secret and the deposit mnemonic leave `.env` together.
+
+Two ordering constraints the procedure enforces: the mint key goes first and alone, end to end
+including recovery, before the payout key is started — two ceremonies in one afternoon is how a step
+gets skipped on the second. And it refuses to proceed with one person present, noting that this is
+the same problem as G3 and is not solved by continuing anyway.
+
+**Verification:** the ceremony performed, with the register it describes existing outside the AWS
+account and holding the key ARN, the derived address, who was present, and the date recovery was
+last exercised. The derived address is also the mainnet `mint_authority` in C1, so an error there
+is baked into the genesis hash.
+
+**Blocked on:** the AWS account and key from A1, and a second person — which is G3.
 
 ### A4. Custody key stays absent — **Required, by design**
 
