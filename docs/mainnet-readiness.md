@@ -239,8 +239,14 @@ both the order and the length of that list. A node with a stale list rejects blo
 authority and expects blocks from a departed one, so the set has to change on every node together.
 Rotation is therefore a coordinated restart, not a rolling one.
 
-**Verification:** a written rotation procedure covering the coordinated-restart requirement and the
-cadence change that comes with a size change, rehearsed on a throwaway network.
+The procedure is now written: `clutch-deploy/docs/AUTHORITY-ROTATION.md`. It covers the same-size
+key replacement and the size change separately, insists on one variable at a time, and names the
+60-authority ceiling. Its rehearsal section includes rehearsing the *failure* — change the list on
+one node only and watch it reject blocks — because knowing what that looks like in the logs is the
+point of rehearsing at all.
+
+**Verification:** the rehearsal performed on a throwaway network, with the date recorded in that
+document. Writing it down is not the same as having done it once.
 
 ---
 
