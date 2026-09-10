@@ -902,16 +902,39 @@ transaction construction, and treat F1 as the demo app's real risk rather than i
 
 ## J. Legal and regulatory
 
-### J1. Get advice before accepting a dollar — **Blocker**
+### J1. Get advice before accepting a dollar — **Blocker** (brief written 2026-09-11)
 
 Not engineering, and not something anyone on this repo can sign off. A fully-reserved token that is
 redeemable for USDT, issued and custodied by an identifiable operator, is money transmission or
-e-money in most jurisdictions, with registration, KYC, AML, safeguarding, and reporting
+e-money in most jurisdictions, with registration, customer due diligence, safeguarding and reporting
 consequences. The reserve model being honest does not exempt it.
+
+`docs/LEGAL-BRIEF.md` is now written to hand to counsel: what the system actually does, stated as
+facts, with the questions listed and deliberately **not** answered. It contains no legal analysis,
+because nobody here is qualified to provide any and a wrong guess costs more than the advice.
+
+Assembling it clarified which facts are likely to dominate, and one of them is not technical:
+
+1. **The operator holds user funds.** USDT is swept to a custody address the operator controls, so
+   the token is a claim on the operator's own holdings rather than on a third party. This is the
+   central fact and everything else is a detail beside it.
+2. **There is no identity verification and no geographic restriction.** An account is a keypair; the
+   operator never learns who anyone is. If due diligence turns out to be required, that is an
+   architectural change and not a policy one — the system currently *cannot* identify anyone.
+3. **The operator is one individual**, with no company, no second signatory, and no segregation
+   between operating and user funds beyond the reserve address itself.
+
+The brief also states the question the operator most wants answered: whether a lawful configuration
+exists at small scale — low caps, restricted jurisdictions, clear disclosure — that permits a limited
+real-funds pilot, and what it would have to be. If the answer is that any real-funds operation needs
+a licence first, that is a useful answer and better had before building further.
 
 **Verification:** written advice from a qualified lawyer in the operating jurisdiction, and whatever
 registrations that advice names, in place.
 
+**Worth starting early**, alongside the audit rather than after it. Legal advice can invalidate
+assumptions underneath the rest of this document, and it is cheaper to learn that before the
+remaining engineering is built on them.
 ---
 
 ## What already holds
