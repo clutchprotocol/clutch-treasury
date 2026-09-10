@@ -309,6 +309,43 @@ async fn happy_path_approves_and_ledgers_custody_exactly_once_across_a_rerun() {
     assert!(verified_at.is_some());
 }
 
+/// A transfer older than `deposit_match_window_hours` must still verify when its hash is known.
+///
+/// The poller that records the hash scans an address's whole history with no lower bound, so it
+/// will confirm an intent against a transfer of any age. That is not hypothetical: deposit
+/// addresses are permanent, so a database reset erases the record of an old deposit while leaving
+/// the transfer itself on chain, and the next poll of that address produces an intent for a
+/// transfer older than the intent. If the verifier then bounds its own request by the match
+/// window, the hash it was handed is invisible to it — Transient forever, `created` forever, and a
+/// p1 stuck alert a day later for money that was on chain all along. Stage hit this on 2026-09-10
+/// with a six-day-old transfer.
+///
+/// The mock answers ONLY when `min_timestamp` is absent, so a request that still carries the bound
+/// matches no mock at all, reads the 404 as Transient, and leaves the intent `created`.
+#[tokio::test]
+async fn a_transfer_older_than_the_match_window_verifies_when_its_hash_is_known() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{DEPOSIT_ADDR}/transactions/trc20")))
+        .and(query_param_is_missing("min_timestamp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [trc20_transfer_json("tx-older-than-window", DEPOSIT_ADDR, USDT, "50000000")]
+        })))
+        .mount(&server)
+        .await;
+    mount_transaction_confirmed(&server, "tx-older-than-window", true).await;
+    let config = test_config(server.uri());
+
+    let id =
+        seed_deposit_intent(&pool, 50_000_000, 50_000_000, "client-ref-older-than-window", Some("tx-older-than-window"))
+            .await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(approved, 1, "a transfer identified by hash must verify whatever its age");
+    assert_eq!(status_of(&pool, id).await, "approved");
+}
+
 /// Happy path via the FALLBACK match (deposit_tx_id NULL — Bitcart's response lacked a hash):
 /// the verifier must find the transfer by amount+recipient+contract alone and backfill
 /// deposit_tx_id, then approve exactly as the has-hash path does.

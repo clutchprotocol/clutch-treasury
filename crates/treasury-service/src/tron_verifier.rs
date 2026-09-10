@@ -558,7 +558,22 @@ async fn evaluate(
     let earliest_ms =
         (intent.created_at - chrono::Duration::hours(config.deposit_match_window_hours)).timestamp_millis();
 
-    let transfers = match client.trc20_transfers(&deposit_address, &config.usdt_contract, Some(earliest_ms)).await {
+    // ...but ONLY when the fallback is what will run. The window exists to bound a match made on
+    // an address and an amount alone; a recorded hash identifies the transfer exactly, and bounding
+    // the REQUEST by the window can then only hide the very evidence we were handed.
+    //
+    // The poller that records that hash has no such bound: it reads an address's whole history and
+    // confirms the intent against the earliest transfer it has not seen before. So it will happily
+    // hand this verifier a hash for a transfer far older than the window, and the verifier will
+    // never find it -- Transient on every pass, `created` forever, until the 24h stuck sweep pages
+    // a human about a deposit that was on chain the whole time.
+    //
+    // Stage hit exactly that on 2026-09-10. Deposit addresses are permanent, so a database reset
+    // erases the record of an old deposit while leaving its transfer on chain; the next poll of
+    // that address created an intent for a transfer six days older than the intent itself.
+    let request_from_ms = if intent.deposit_tx_id.is_some() { None } else { Some(earliest_ms) };
+
+    let transfers = match client.trc20_transfers(&deposit_address, &config.usdt_contract, request_from_ms).await {
         Ok(t) => t,
         Err(e) => return Evidence::Transient(format!("trongrid trc20 list: {e}")),
     };
