@@ -61,19 +61,48 @@ Everything below expands these, plus the product and legal work that sits outsid
 
 The named blocker, already tracked in [`keys.md`](keys.md).
 
-### A1. KMS-backed mint signer — **Blocker**
+### A1. KMS-backed mint signer — **Blocker** (hard half done and tested 2026-09-11)
 
-The mint authority is an environment variable (`ChainSigner` /
-`EnvKeySigner`, `crates/clutch-chain/src/signer.rs`). It is the only key that can create CLT, so a
-host compromise is unbounded issuance against a fixed reserve. `keys.md` names the intended
-replacement: a `KmsSigner` on AWS KMS `ECC_SECG_P256K1`, following the `alloy-signer-aws` pattern.
-The trait is the swap boundary; nothing on the other side of it exists.
+The mint authority is an environment variable (`ChainSigner` / `EnvKeySigner`,
+`crates/clutch-chain/src/signer.rs`). It is the only key that can create CLT, so a host compromise
+is unbounded issuance against a fixed reserve. `keys.md` names the replacement: a `KmsSigner` on
+AWS KMS `ECC_SECG_P256K1`, following the `alloy-signer-aws` pattern.
 
-**Verification:** the mint path runs through a `KmsSigner` in the mainnet compose file, the private
-key material has never existed outside KMS, and `EnvKeySigner` is unreachable in that configuration
-(a config that would select it refuses to boot).
+**The part that was hard is now done and verified**: `crates/clutch-chain/src/external_signature.rs`,
+eight tests, no AWS dependency. An external signer returns a DER `(r, s)` and nothing else, while
+the node needs `(r, s, v)` in low-s form because it identifies a signer by *recovering* the public
+key. Neither the recovery id nor the normalisation comes back from KMS, and getting either wrong
+produces a signature that is valid ECDSA and recovers to the **wrong address** — rejected as an
+unauthorised mint, at the worst possible moment rather than an obvious one.
 
-### A2. KMS-backed payout signer — **Blocker**
+- `digest_for_hash_hex` fixes the convention in one place, so a signer cannot quietly disagree with
+  `EnvKeySigner` about what is being signed. It is Keccak-256 of the hex *string's* UTF-8 bytes, not
+  of the bytes that hex encodes, and a test pins that the two differ.
+- `address_from_uncompressed`, with a test that it agrees with `EnvKeySigner` for the same key.
+- `recoverable_from_der` normalises `s` and then **finds** the recovery id by trying both and
+  keeping the one that recovers to the signer's own key. A search rather than a calculation: it
+  cannot be off by one, and it doubles as proof the signature came from the expected key. A
+  signature from another key, and a digest other than the one signed, both fail there.
+
+The strongest test is the equivalence — same key, same transaction hash, byte-identical `r`, `s`
+and `v` to the in-process signer — plus a high-s input constructed as `n - s`, because KMS makes no
+low-s promise and normalising flips which recovery id is correct.
+
+**What remains is the API call, and only that.** `KMS_SIGNER_SHAPE` in that file documents it beside
+the code it depends on, including the detail most likely to be got wrong: `MessageType` must be
+`DIGEST`, not `RAW`, or KMS hashes the digest again and signs the wrong preimage. It cannot be
+written here because there is no KMS to call, and an unexercised AWS code path in the mint flow is
+worse than an absent one.
+
+**Verification:** signing through a `KmsSigner` in the mainnet configuration, key material that has
+never existed outside KMS, and `EnvKeySigner` unreachable in that configuration — a config that
+would select it refuses to boot.
+
+**Needed from the operator before that can be built:** an AWS account, a key created with
+`KeySpec = ECC_SECG_P256K1` and `KeyUsage = SIGN_VERIFY`, and a key policy that does **not** grant
+`kms:ScheduleKeyDeletion` to the signing principal.
+
+### A2. KMS-backed payout signer — **Blocker** (same plumbing applies)
 
 `PayoutSigner` (`crates/treasury-service/src/payout.rs`) is the matching seam for the payout key.
 Today the payout float is derived from the deposit mnemonic at `m/44'/195'/0'/2/0` and held by
@@ -81,9 +110,15 @@ Today the payout float is derived from the deposit mnemonic at `m/44'/195'/0'/2/
 per-transaction cap, which is a real bound and the reason this is survivable on stage, but the key
 is still a plaintext secret on a VPS.
 
-**Verification:** payouts are signed through KMS, and the float's key material has never been on
-disk. The per-transaction cap and float balance remain in place; the KMS boundary is in addition to
-them, not a replacement.
+The signature plumbing above is Ethereum-style secp256k1 and TRON uses the same curve and the same
+recoverable-signature shape, so `external_signature.rs` covers this key too — with one difference
+to check when it is wired: TRON's digest is a plain SHA-256 of the transaction's raw bytes, **not**
+this stack's Keccak-over-hex-string convention, so `digest_for_hash_hex` is the wrong helper there.
+`recoverable_from_der` and the recovery-id search apply unchanged.
+
+**Verification:** payouts signed through KMS, and the float's key material never on disk. The
+per-transaction cap and the float balance stay in place; the KMS boundary is in addition to them,
+not a replacement for them.
 
 ### A3. Key ceremony and tested recovery — **Blocker**
 
