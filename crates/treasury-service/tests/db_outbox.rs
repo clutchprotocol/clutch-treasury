@@ -107,6 +107,8 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         max_node_lag_blocks: 50,
         chain_id: 2077,
         mint_authority_secret: "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509".into(),
+        mint_authorities: String::new(),
+        mint_threshold: 0,
         initiator_token: "i".into(),
         approver_token: "a".into(),
         readonly_token: "r".into(),
