@@ -26,16 +26,49 @@ rather than a house fire.
 
 ## Which keys
 
-`keys.md` requires three, none interchangeable:
+`keys.md` requires three roles, none interchangeable. The mint role is now **three keys, not one**
+— see the next section.
 
 | Key | State today | Ceremony needed |
 |---|---|---|
-| **Mint** | Environment variable (`EnvKeySigner`) | Yes — this one first. It is the only key that can create CLT. |
-| **Payout initiation** | Derived from the deposit mnemonic at `m/44'/195'/0'/2/0`, held by `tron-signer` | Yes, after the mint key. Bounded by the float balance and a per-transaction cap, which is why it is second rather than first. |
+| **Mint**, x3 | Environment variable (`EnvKeySigner`), single | Yes — these first. Together they are the only thing that can create CLT. |
+| **Payout initiation** | Derived from the deposit mnemonic at `m/44'/195'/0'/2/0`, held by `tron-signer` | Yes, after the mint keys. Bounded by the float balance and a per-transaction cap, which is why it is second rather than first. |
 | **Reserve custody** | Does not exist in this stack, deliberately — nothing here can spend `APP_TREASURY_ADDRESS` | No KMS ceremony. It is a wallet a human holds, and what it needs is the two-person top-up procedure in A4, not this. |
 
-Do the mint key alone, end to end, including the recovery test, before starting the payout key.
-Two ceremonies on one afternoon is how a step gets skipped on the second.
+Do the mint keys end to end, including the recovery test, before starting the payout key. Two
+ceremonies on one afternoon is how a step gets skipped on the second.
+
+## The mint role is a 2-of-3
+
+Decided 2026-09-12. The chain has supported M-of-N minting since 2026-09-11, and the configuration
+chosen is **three authorities, any two of which must sign**. `mint_cosigners` and `mint_threshold`
+are committed into the genesis hash, so this is settled before the mainnet chain boots and cannot
+be changed afterwards without a new chain.
+
+What that buys, precisely: a single compromised key mints nothing. The attacker needs two, and the
+whole point of the placement below is that no single breach yields two.
+
+**Put the three keys in three different places.** Three keys in one AWS account is a 2-of-3 on
+paper and a 1-of-1 in practice, because one compromised account holds all of them.
+
+| Key | Where | Why there |
+|---|---|---|
+| **A**, the submitter | Cloud KMS, the account `treasury-service` can reach | This is the one that signs the transaction envelope and needs to be callable by the running service. |
+| **B** | A *different* provider or a different account with separate credentials | An attacker who takes the service's cloud account still has one key, not two. |
+| **C**, the cold spare | Offline: paper or a hardware device in a safe, never on a networked machine | Not for routine minting. It exists so that losing A or B loses availability rather than the chain, since any two of three can still sign. |
+
+Routine minting is therefore A plus B. C is the recovery path.
+
+**A note on what this is and is not.** If one person holds all three, this is multi-*place*
+control: an attacker must breach two separate stores rather than read one file, which is a real
+and worthwhile gain. It is not multi-*person* control, and a compromised operator still mints.
+That is readiness item G3, and it stays open until a second human holds one of these keys. When
+one does, hold B.
+
+**Generate and test all three before the genesis.** Each key's address goes into the genesis
+configuration, and a wrong or missing address there cannot be corrected later. Run the
+`check_authorisation` path against a throwaway chain with the three real addresses before
+committing the mainnet genesis.
 
 ## Before the day
 
@@ -52,6 +85,12 @@ Two ceremonies on one afternoon is how a step gets skipped on the second.
 
 Record every value marked **[record]** as you go, in the register described below. Do not
 reconstruct it afterwards from memory or from the console.
+
+**Run steps 1 to 4 three times, once per mint key, in the three locations named above.** Finish
+each key completely, including the recovery test, before starting the next. Batching the three
+creations and then doing three recovery tests at the end is how the third recovery test does not
+happen. Record which of A, B or C each register entry is for, because an address on its own does
+not say where its key lives, and that placement is the entire security property.
 
 1. **Create the key.**
    `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, origin `AWS_KMS`.
