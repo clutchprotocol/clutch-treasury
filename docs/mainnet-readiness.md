@@ -132,7 +132,7 @@ API call, a dispute mechanism — that is named in its own section along with wh
 
 The named blocker, already tracked in [`keys.md`](keys.md).
 
-### A1. KMS-backed mint signer — **Blocker** (hard half done and tested 2026-09-11)
+### A1. Mint authority custody — **Blocker** (M-of-N shipped 2026-09-11; KMS hard half done)
 
 The mint authority is an environment variable (`ChainSigner` / `EnvKeySigner`,
 `crates/clutch-chain/src/signer.rs`). It is the only key that can create CLT, so a host compromise
@@ -154,6 +154,40 @@ unauthorised mint, at the worst possible moment rather than an obvious one.
   keeping the one that recovers to the signer's own key. A search rather than a calculation: it
   cannot be off by one, and it doubles as proof the signature came from the expected key. A
   signature from another key, and a digest other than the one signed, both fail there.
+
+#### M-of-N minting, shipped 2026-09-11
+
+Custody was only ever half the problem, and the smaller half. `Mint::verify_state` authorised
+against **one** address, and every other control on minting — four-eyes approval, the
+per-transaction cap, the daily cap, the halt breaker — lives off-chain in `treasury-service`. A
+holder of that key submits a Mint straight to the node and not one of them runs. Non-exportable
+custody lowers the probability of theft; it does nothing about the consequence.
+
+The chain now supports M-of-N. `ChainInit` gained `mint_cosigners` and `mint_threshold`; a Mint is
+authorised when submitted by one member of the set and carrying `threshold - 1` further approval
+signatures from distinct other members. Design:
+[`2026-09-11-m-of-n-mint-authority-design.md`](https://github.com/clutchprotocol/clutch-node/blob/main/docs/superpowers/specs/2026-09-11-m-of-n-mint-authority-design.md).
+
+- **clutch-node** ([#11](https://github.com/clutchprotocol/clutch-node/pull/11)), 25 tests. Cosigners
+  sign a separate approval digest over `[chain_id, to, amount, credit_ref]` rather than the
+  transaction hash, which covers the arguments they live in and so has no fixed point. Backward
+  compatible: a single-signer chain encodes byte-identically to before, pinned by a test against a
+  hand-built legacy encoding, so the running testnet keeps its genesis hash.
+- **clutch-treasury**, 3 new tests. `treasury-service` never holds an approver key — the signature
+  arrives already made on the approve call, is checked to recover to a configured authority, and is
+  relayed. If this service could produce the second signature, the second signature would mean
+  nothing. Migration 0013 enforces one signature per signer per intent by primary key, the same rule
+  the node enforces, in both places.
+
+**Still open, and it is a decision rather than code:** choosing N and the threshold for mainnet
+genesis, then generating the keys. `mint_threshold` is genesis-committed, so this is free now and
+costs a chain reset afterwards — the only item on this list that gets permanently more expensive by
+waiting.
+
+One honest limit. If one person holds all N keys, this is multi-*place* control, not
+multi-*person*: an attacker must breach several stores rather than read one file, which is real,
+but a compromised operator still mints. G3 and the public disclosure stay necessary until there is
+a second human.
 
 The strongest test is the equivalence — same key, same transaction hash, byte-identical `r`, `s`
 and `v` to the in-process signer — plus a high-s input constructed as `n - s`, because KMS makes no
