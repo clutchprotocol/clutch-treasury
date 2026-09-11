@@ -309,3 +309,105 @@ mod tests {
         );
     }
 }
+
+/// Recover the address that produced `(r, s, v)` over `data`.
+///
+/// The companion to the rest of this module: that half turns an external signer's answer into a
+/// signature, and this half answers "who signed this" for a signature somebody else made. Used to
+/// check an M-of-N mint approval against the authority set without ever holding the approver's
+/// key — which is the property that makes the second signature worth anything.
+///
+/// `data` is hashed with Keccak-256 exactly as `SignatureKeys::verify` does in clutch-node, so a
+/// signature this accepts is one the node accepts. The address comes back `0x`-prefixed lowercase.
+pub fn recover_address_hex(data: &[u8], r: &str, s: &str, v: u64) -> Result<String, String> {
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let message =
+        Message::from_digest_slice(&digest).map_err(|e| format!("bad digest: {e}"))?;
+
+    let r_bytes = hex::decode(r.trim_start_matches("0x").trim_start_matches("0X"))
+        .map_err(|e| format!("r is not hex: {e}"))?;
+    let s_bytes = hex::decode(s.trim_start_matches("0x").trim_start_matches("0X"))
+        .map_err(|e| format!("s is not hex: {e}"))?;
+    if r_bytes.len() != 32 || s_bytes.len() != 32 {
+        return Err(format!(
+            "r and s must be 32 bytes each, got {} and {}",
+            r_bytes.len(),
+            s_bytes.len()
+        ));
+    }
+    let mut compact = [0u8; 64];
+    compact[..32].copy_from_slice(&r_bytes);
+    compact[32..].copy_from_slice(&s_bytes);
+
+    // v is 27 or 28 in this stack; anything else is not a signature from it.
+    let recid = RecoveryId::from_i32(v as i32 - 27)
+        .map_err(|_| format!("v must be 27 or 28, got {v}"))?;
+    let sig = RecoverableSignature::from_compact(&compact, recid)
+        .map_err(|e| format!("not a valid signature: {e}"))?;
+
+    let pubkey = Secp256k1::new()
+        .recover_ecdsa(&message, &sig)
+        .map_err(|e| format!("could not recover: {e}"))?;
+    address_from_uncompressed(&pubkey.serialize_uncompressed())
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+    use crate::signer::{ChainSigner, EnvKeySigner};
+    use crate::tx::mint_approval_digest_hex;
+
+    const SK: &str = "0883ddd3d07303b87c954b0c9383f7b78f45e002520fc03a8adc80595dbf6509";
+
+    /// A signature made by the in-process signer must recover to that signer's own address, or
+    /// treasury-service would reject every approval it relays.
+    #[test]
+    fn a_signature_recovers_to_its_signer() {
+        let signer = EnvKeySigner::from_secret_hex(SK).unwrap();
+        let digest = mint_approval_digest_hex(
+            2077,
+            "0x4444444444444444444444444444444444444444",
+            5_000_000,
+            &"a".repeat(64),
+        );
+        let (r, s, v) = signer.sign_hash_hex(&digest).unwrap();
+        let recovered = recover_address_hex(digest.as_bytes(), &r, &s, v).unwrap();
+        assert_eq!(recovered, signer.address());
+    }
+
+    /// The check that makes the digest meaningful: a signature over one mint must not recover to
+    /// the signer when checked against a different mint.
+    #[test]
+    fn a_signature_over_another_digest_does_not_recover_to_the_signer() {
+        let signer = EnvKeySigner::from_secret_hex(SK).unwrap();
+        let approved = mint_approval_digest_hex(
+            2077,
+            "0x4444444444444444444444444444444444444444",
+            5_000_000,
+            &"a".repeat(64),
+        );
+        let inflated = mint_approval_digest_hex(
+            2077,
+            "0x4444444444444444444444444444444444444444",
+            50_000_000,
+            &"a".repeat(64),
+        );
+        let (r, s, v) = signer.sign_hash_hex(&approved).unwrap();
+        let recovered = recover_address_hex(inflated.as_bytes(), &r, &s, v);
+        // Either it fails to recover at all, or it recovers to some other address. Both are a
+        // refusal; what must never happen is recovering to the approver.
+        if let Ok(addr) = recovered {
+            assert_ne!(addr, signer.address());
+        }
+    }
+
+    #[test]
+    fn malformed_components_are_refused() {
+        let d = "aa".repeat(32);
+        assert!(recover_address_hex(d.as_bytes(), "zz", &"11".repeat(32), 27).is_err());
+        assert!(recover_address_hex(d.as_bytes(), &"11".repeat(16), &"11".repeat(32), 27).is_err());
+        assert!(recover_address_hex(d.as_bytes(), &"11".repeat(32), &"11".repeat(32), 42).is_err());
+    }
+}

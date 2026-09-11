@@ -28,6 +28,9 @@ struct OutboxRow {
     amount_clt: i64,
     credit_ref: String,
     client_ref: Option<String>,
+    /// Approval signatures from other authorities, loaded per row just before signing. Empty on a
+    /// single-signer chain.
+    cosignatures: Vec<clutch_chain::tx::MintCosignature>,
 }
 
 /// Picks due `pending` outbox rows, re-checks breakers (approval alone is never
@@ -66,6 +69,7 @@ pub async fn drain_once(
         beneficiary,
         amount_clt,
         credit_ref,
+        cosignatures: Vec::new(),
         client_ref,
     })
     .collect();
@@ -124,7 +128,7 @@ pub async fn drain_once(
     }
 
     let mut processed = 0u32;
-    for row in rows {
+    for mut row in rows {
         // Authoritative gate: re-checked immediately before submission, not only at approval
         // time. Between approval and here the backing ratio can fall, reconciliation can go
         // stale, or the daily cap can fill. `_excluding` because this intent is already
@@ -148,6 +152,38 @@ pub async fn drain_once(
             continue;
         }
 
+        // Approval signatures from other authorities, on an M-of-N chain. Loaded here rather
+        // than in the row query because they arrive between approval and submission, and the
+        // row may have been picked up before the last one landed.
+        let stored: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT sig_r, sig_s, sig_v FROM mint_approval_signatures
+             WHERE intent_id = $1 ORDER BY created_at",
+        )
+        .bind(row.intent_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let cosignatures: Vec<clutch_chain::tx::MintCosignature> = stored
+            .into_iter()
+            .map(|(r, s, v)| clutch_chain::tx::MintCosignature { r, s, v: v as u64 })
+            .collect();
+        row.cosignatures = cosignatures;
+
+        // The submitter is one signature, so the chain needs `threshold - 1` approvals on top.
+        // Park rather than fail: an approval still arriving is the ordinary case, and submitting
+        // now would burn a nonce on a transaction the node is certain to reject.
+        let needed = config.effective_mint_threshold();
+        if 1 + row.cosignatures.len() < needed {
+            let reason = format!(
+                "waiting for approval signatures: have {} of the {} the chain requires",
+                1 + row.cosignatures.len(),
+                needed
+            );
+            tracing::info!("mint intent {} parked: {}", row.intent_id, reason);
+            park_row(pool, row.outbox_id, &reason).await?;
+            continue;
+        }
+
         let nonce = match node.get_next_nonce(&signer.address()).await {
             Ok(n) => n,
             Err(e) => {
@@ -164,6 +200,7 @@ pub async fn drain_once(
                 to: row.beneficiary.clone(),
                 amount: row.amount_clt as u64,
                 credit_ref: row.credit_ref.clone(),
+                cosignatures: row.cosignatures.clone(),
             },
         ) {
             Ok(s) => s,

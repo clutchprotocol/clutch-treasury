@@ -173,10 +173,20 @@ async fn get_mint_intent_handler(
     Ok(Json(intent_json(&intent)))
 }
 
+/// An approver's signature over the mint approval digest, made with a key this service never
+/// sees. Optional, because a single-signer chain needs none.
+#[derive(Deserialize)]
+struct ApprovalSignature {
+    r: String,
+    s: String,
+    v: u64,
+}
+
 async fn approve_mint_intent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    body: Option<Json<ApprovalSignature>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let role = caller_role(&headers, &state.config)?;
     if role != Role::Approver {
@@ -202,6 +212,60 @@ async fn approve_mint_intent_handler(
     // (see actor_name) — a real cross-person four-eyes collision is a schema-level guarantee
     // (db_ledger.rs::four_eyes_enforced_in_db), not reachable through this single-shared-
     // token-per-role API. Any error here is a state conflict (already approved/submitted/etc).
+    // Record the approval signature BEFORE marking the intent approved. If storing it fails, the
+    // intent stays pending and the approver retries; the reverse order could leave an intent
+    // marked approved with no signature behind it, which on an M-of-N chain is an intent the
+    // outbox will never be able to submit and nothing will explain why.
+    if let Some(Json(sig)) = body {
+        let (beneficiary, amount_clt, credit_ref): (String, i64, String) = sqlx::query_as(
+            "SELECT beneficiary, amount_clt, credit_ref FROM mint_intents WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let digest = clutch_chain::tx::mint_approval_digest_hex(
+            state.config.chain_id,
+            &beneficiary,
+            amount_clt as u64,
+            &credit_ref,
+        );
+        let signer = clutch_chain::external_signature::recover_address_hex(
+            digest.as_bytes(),
+            &sig.r,
+            &sig.s,
+            sig.v,
+        )
+        .map_err(|e| {
+            tracing::warn!("approval signature for {id} does not recover: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+
+        // The node would reject it anyway; refusing here keeps a useless signature from sitting in
+        // the table looking like progress toward the threshold.
+        let authorities = state.config.mint_authority_set();
+        if !authorities.contains(&signer) {
+            tracing::warn!("approval signature for {id} recovers to {signer}, not an authority");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        sqlx::query(
+            "INSERT INTO mint_approval_signatures (intent_id, signer_address, sig_r, sig_s, sig_v)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (intent_id, signer_address) DO NOTHING",
+        )
+        .bind(id)
+        .bind(&signer)
+        .bind(&sig.r)
+        .bind(&sig.s)
+        .bind(sig.v as i64)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tracing::info!("stored approval signature from {signer} for mint intent {id}");
+    }
+
     let approved = intents::approve_mint_intent(&state.pool, id, actor_name(role))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;

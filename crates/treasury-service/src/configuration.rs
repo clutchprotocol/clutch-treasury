@@ -52,6 +52,19 @@ pub struct AppConfig {
     pub max_node_lag_blocks: u64,
     pub chain_id: u64,
     pub mint_authority_secret: String,
+    /// Addresses whose approval signatures this service will accept and relay, comma-separated.
+    ///
+    /// Verification convenience only: the node is authoritative and re-checks every signature
+    /// against the genesis-committed set. Its job here is to reject a useless signature at the
+    /// approve call rather than at submission time, where it would burn a nonce.
+    #[serde(default)]
+    pub mint_authorities: String,
+    /// Signatures the chain requires for a Mint. 0 and 1 both mean single-signer.
+    ///
+    /// Must match the chain's genesis `mint_threshold`. Used to refuse submitting a mint that
+    /// cannot possibly be accepted, rather than discovering it from the node.
+    #[serde(default)]
+    pub mint_threshold: u8,
     pub initiator_token: String,
     pub approver_token: String,
     pub readonly_token: String,
@@ -118,6 +131,21 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// The configured approval authorities, lowercased and 0x-prefixed for comparison.
+    pub fn mint_authority_set(&self) -> Vec<String> {
+        self.mint_authorities
+            .split(',')
+            .map(|a| a.trim().trim_start_matches("0x").trim_start_matches("0X").to_lowercase())
+            .filter(|a| !a.is_empty())
+            .map(|a| format!("0x{a}"))
+            .collect()
+    }
+
+    /// Signatures a Mint needs. 0 and 1 both mean one, matching the node.
+    pub fn effective_mint_threshold(&self) -> usize {
+        self.mint_threshold.max(1) as usize
+    }
+
     pub fn load(env: &str) -> Result<Self, ConfigError> {
         dotenv().ok();
         let cfg: Self = Config::builder()
