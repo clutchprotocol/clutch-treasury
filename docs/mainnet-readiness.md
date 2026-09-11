@@ -539,7 +539,7 @@ document. Writing it down is not the same as having done it once.
 
 ## D. Data durability and recovery
 
-### D1. Off-host ledger backup — **Blocker** (tooling done 2026-09-11)
+### D1. Off-host ledger backup — **Blocker** (tooling rehearsed against stage 2026-09-12)
 
 Both databases sit on named local Docker volumes with `restart: unless-stopped`, so data survives
 container recreation. It does not survive disk loss, host loss, or `docker compose down -v`. The
@@ -560,13 +560,44 @@ Two guards in the dump path are the ones that matter: `pipefail`, so a failing `
 leave a valid encryption of a truncated dump, and a 1 KB size floor. Both of those failures look
 exactly like a good backup otherwise. The script also refuses to run without `BACKUP_PASSPHRASE`.
 
+#### Rehearsed on 2026-09-12, and it found a live bug
+
+`.github/workflows/rehearse-restore.yml` runs the whole loop against stage: dump both databases,
+encrypt, decrypt, restore into a throwaway database, count rows, drop it. The passphrase is
+generated per run and never written anywhere, which keeps it a test of the machinery rather than a
+backup nobody can decrypt.
+
+**The first run failed two lines in, with no output at all.** `env_get` is a grep, and under
+`set -euo pipefail` a grep matching nothing fails the pipeline, which inside a command substitution
+kills the script. Reading the unset optional `BACKUP_REMOTE` aborted the entire backup before a
+single line printed.
+
+This was not hypothetical. The scheduled job had already run once, at 08:07 UTC on 2026-09-11, and
+died exactly that way — exit 1, no message, on a host where nobody was watching. Had nobody
+rehearsed, the first evidence would have been a restore that found no backups.
+
+Fixed, and the error path now works too: a run without `BACKUP_PASSPHRASE` prints the abort naming
+the variable and how to generate one, instead of exiting silently.
+
+The second run succeeded end to end against real data:
+
+| Database | Restored rows (sample) |
+|---|---|
+| `treasury` | alerts 523, reconciliation_runs 33, treasury_events 24, mint_intents 8, chain_outbox 8, redemption_intents 5 |
+| `orchestrator` | deposit_intents 8, deposit_addresses 6 |
+
+Both throwaway copies were dropped. Nothing touched a live database.
+
 **Still open, and this is the whole point of the item:**
 
-1. **`BACKUP_REMOTE` is not set on the host**, so today's dumps share a disk with the databases
-   they came from. The script warns about this on every run. Set it to an rclone destination.
-2. **`BACKUP_PASSPHRASE` must be stored somewhere that is not the host.** A passphrase next to the
-   dump it protects is decoration.
-3. **No restore has been performed.** A dump nobody has restored is a hypothesis.
+1. **`BACKUP_PASSPHRASE` is not set**, so no real backup exists yet — the scheduled job still
+   aborts, now with a clear message. Generate one and store it somewhere that is **not** this host.
+   A passphrase next to the dump it protects is decoration.
+2. **`BACKUP_REMOTE` is not set**, so when dumps do start they share a disk with the databases they
+   came from. The script warns on every run.
+3. **Reconciliation has not been run against a restored ledger.** Row counts prove the restore is
+   not empty; they do not prove the ledger is coherent. That is the verification below, and it is
+   the only one that actually closes this item.
 
 **Verification:** the rehearsal in the runbook, performed — restore into a clean database, then
 point a `treasury-service` instance at it and get reconciliation green *against the restored
