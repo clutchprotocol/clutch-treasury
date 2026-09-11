@@ -77,12 +77,28 @@ recorded in its own section.
 
 **Then the chain of things that unblock each other.**
 
-4. **Provision AWS KMS** — a key with `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, and a
-   policy that does not grant `kms:ScheduleKeyDeletion` to the signing principal. This unblocks
-   the `KmsSigner` API call (A1, A2), which unblocks the key ceremony (A3 — procedure in
-   `docs/KEY-CEREMONY.md`, and it needs two people, so it also needs step 3), which unblocks the
-   mainnet `mint_authority` (C1), and it is what finally closes D2 by taking the mnemonic out of
-   `.env` entirely.
+4. **Provision key custody for the three mint keys** (A, B and C — see 12b and
+   `docs/KEY-CEREMONY.md`). AWS is declined as a provider (maintainer, 2026-09-11), so the
+   requirement is stated by property rather than by vendor: a key that signs **secp256k1**, whose
+   material cannot be exported, and whose deletion is not grantable to the principal that signs
+   with it.
+
+   Options that meet it, cheapest first. Azure Key Vault software-protected keys use curve
+   `P-256K` with algorithm `ES256K`, no per-key monthly charge and transaction-priced. Google Cloud
+   KMS software keys use `EC_SIGN_SECP256K1_SHA256` at roughly $0.06 per key per month. Verify
+   curve support and pricing before committing; both were quoted from memory. A self-hosted signer
+   on a host that is not the application host is the no-vendor option — weaker, since it does not
+   give non-exportability, but it still means compromising the web stack does not yield the key.
+
+   Key C is offline and needs no provider at all.
+
+   This unblocks the signer API call (A1, A2), which unblocks the key ceremony (A3 — it needs two
+   people, so it also needs step 3), which unblocks the mainnet genesis (C1), and it is what
+   finally closes D2 by taking the mnemonic out of `.env` entirely.
+
+   `external_signature.rs` is deliberately vendor-neutral: it turns a DER `(r, s)` from any
+   external signer into the `(r, s, v)` the node needs, so only the API call itself changes with
+   the provider.
 5. **Decide the mainnet validator set (C2).** Hosts that share no operator, provider or power
    supply. Its *size* picks the block cadence at `60 / len`, so decide the number deliberately, and
    it is the other value C1 is waiting on.
@@ -118,13 +134,10 @@ recorded in its own section.
 
 **And one decision that has to be made before the genesis, not after.**
 
-12b. **Choose N and the mint threshold (A1).** The chain supports M-of-N minting as of
-    2026-09-11 and nothing else is needed to use it. `mint_cosigners` and `mint_threshold` are
-    genesis-committed, so picking them is free now and costs a chain reset later — the same
-    constraint as step 11's release-window question, and the reason both sit here rather than
-    after step 13. A 2-of-3 with the keys in three different places is the smallest configuration
-    worth having; with one keyholder it is multi-place rather than multi-person control, which is
-    a real gain and not the same thing.
+12b. **~~Choose N and the mint threshold (A1).~~ Decided 2026-09-12: a 2-of-3.** What remains is
+    generating the three keys in the ceremony (A3), in the three separate locations named in
+    `docs/KEY-CEREMONY.md`. Their addresses are genesis-committed, so all three must exist and be
+    tested before step 13.
 
 **Last, and only after all of the above.**
 
@@ -189,15 +202,29 @@ signatures from distinct other members. Design:
   nothing. Migration 0013 enforces one signature per signer per intent by primary key, the same rule
   the node enforces, in both places.
 
-**Still open, and it is a decision rather than code:** choosing N and the threshold for mainnet
-genesis, then generating the keys. `mint_threshold` is genesis-committed, so this is free now and
-costs a chain reset afterwards — the only item on this list that gets permanently more expensive by
-waiting.
+**Decided 2026-09-12: a 2-of-3.** Three authorities, any two of which must sign. Recorded in
+`docs/KEY-CEREMONY.md`, which now runs three times rather than once.
 
-One honest limit. If one person holds all N keys, this is multi-*place* control, not
-multi-*person*: an attacker must breach several stores rather than read one file, which is real,
-but a compromised operator still mints. G3 and the public disclosure stay necessary until there is
-a second human.
+The placement is the security property, not the number. Three keys in one cloud account is a 2-of-3
+on paper and a 1-of-1 in practice:
+
+| Key | Where | Role |
+|---|---|---|
+| A | Cloud KMS, the account `treasury-service` can reach | Signs the transaction envelope; must be callable by the running service |
+| B | A different provider or account, separate credentials | An attacker holding the service's cloud account still has one key |
+| C | Offline, never on a networked machine | Cold spare, so losing A or B costs availability rather than the chain |
+
+Routine minting is A plus B. C is the recovery path.
+
+**Still open:** generating the three keys, which happens in the ceremony and needs two people, so
+it depends on G3. Each address goes into the genesis configuration and cannot be corrected
+afterwards, so all three must exist and be tested against a throwaway chain before the mainnet
+genesis is committed.
+
+One honest limit. If one person holds all three, this is multi-*place* control, not
+multi-*person*: an attacker must breach two separate stores rather than read one file, which is
+real, but a compromised operator still mints. G3 and the public disclosure stay necessary until a
+second human holds one of these keys — and when one does, it should be B.
 
 The strongest test is the equivalence — same key, same transaction hash, byte-identical `r`, `s`
 and `v` to the in-process signer — plus a high-s input constructed as `n - s`, because KMS makes no
