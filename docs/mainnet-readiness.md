@@ -872,7 +872,7 @@ resumes it without the maintainer's help.
 These are product gaps, already listed honestly in the org README. They do not endanger the
 reserve; they decide whether a real ride market is usable.
 
-### H1. Dispute resolution — **Blocker for a public launch** (disclosure half done 2026-09-11)
+### H1. Dispute resolution — **Built and merged 2026-09-12; window set to 2 hours**
 
 Cancellations are on-chain, but there is no arbitration when two parties disagree, and no no-show
 or fraud handling. Passengers also give up card-issuer chargebacks by signing payment directly,
@@ -936,6 +936,41 @@ none of which have answers yet:
 
 **Verification:** a dispute mechanism specified, implemented and documented, with the passenger's
 recourse acknowledged rather than merely shown. The disclosure above is a floor, not the fix.
+
+**Built, merged and verified on 2026-09-12** as option B of
+`docs/superpowers/specs/2026-09-11-dispute-resolution-design.md`
+([clutch-node#12](https://github.com/clutchprotocol/clutch-node/pull/12), 204 tests).
+
+Once `ride_auto_release_secs` has elapsed since a `RideAcceptance`, the same `RideCancel` pays the
+unpaid remainder to the **driver** instead of refunding the rider. Inaction used to favour whoever
+owed money and now favours whoever is owed. No new transaction type, and no settlement pass
+scanning open trips each block.
+
+The four decisions the design left open, settled:
+
+| Question | Decision | Why |
+|---|---|---|
+| Units | Seconds | Block cadence is `60 / authority_count`, so a block-denominated window would change whenever the validator set does |
+| Window | **7200 (2 hours)**, decided 2026-09-12 | Long enough for a rider to notice, short enough that a driver is not financing them |
+| Cancel inside the window | Stays free | Charging would punish the legitimately wronged rider, whose protection this is |
+| Where configured | `ChainInit`, genesis-committed | It decides who receives money, so a node with a different value computes a different balance from the same block |
+| Window start | Acceptance | There is no completion signal, so a long ride and a short one get the same window |
+
+Per-acceptance was rejected because a rider choosing their own window chooses one that never
+expires. `clutch-deploy/scripts/check-genesis.sh` now enforces 7200 under `MAINNET=1`, as an exact
+value rather than "non-zero", because a typo that shortens the window is the failure that looks
+fine.
+
+Every uncertain case settles exactly as before: the rule disabled, an acceptance with no recorded
+timestamp, an unreadable driver address, or the clock not yet past the window. `accepted_at` is
+written even when the rule is off, so a chain enabling it later does not find trips it cannot date.
+
+**Scope, honestly.** This closes *silent* non-payment. A bad-faith rider who actively cancels every
+time still escapes, which is visible on chain and belongs to H2. That is why cancelling was left
+free rather than made costly: the alternative punishes the rider this protects.
+
+**Still open:** the mechanism ships disabled and is switched on by the mainnet genesis, so it is
+part of C1 rather than a separate deployment.
 
 ### H2. Reputation — **Required** (design proposal 2026-09-11)
 
