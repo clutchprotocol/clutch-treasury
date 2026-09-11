@@ -116,6 +116,16 @@ recorded in its own section.
     removes most of the incentive reputation guards against, which may make the light version
     sufficient.
 
+**And one decision that has to be made before the genesis, not after.**
+
+12b. **Choose N and the mint threshold (A1).** The chain supports M-of-N minting as of
+    2026-09-11 and nothing else is needed to use it. `mint_cosigners` and `mint_threshold` are
+    genesis-committed, so picking them is free now and costs a chain reset later — the same
+    constraint as step 11's release-window question, and the reason both sit here rather than
+    after step 13. A 2-of-3 with the keys in three different places is the smallest configuration
+    worth having; with one keyholder it is multi-place rather than multi-person control, which is
+    a real gain and not the same thing.
+
 **Last, and only after all of the above.**
 
 13. **Boot the mainnet genesis and read the first payout receipt (C1, B1, B2).** Check step 11's
