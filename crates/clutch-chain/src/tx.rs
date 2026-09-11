@@ -16,6 +16,34 @@ pub fn intent_ref(intent_id: &str) -> String {
     keccak_hex(intent_id.as_bytes())
 }
 
+/// What a mint approver signs on an M-of-N chain. MUST stay byte-identical to
+/// `mint_approval_digest_hex` in clutch-node's `transactions/mint.rs` — the node recomputes this
+/// from the submitted Mint and recovers each cosignature against it, so a divergence here makes
+/// every approval fail to recover to an authority and mints nothing.
+///
+/// Deliberately NOT the transaction hash. That hash covers the Mint arguments, and the
+/// cosignatures live in those arguments, so signing it would require signing something containing
+/// your own signature. `nonce` and `from` are excluded so approvers need not know who will submit
+/// or in what order; replay is closed by `credit_ref` being exactly-once on chain.
+pub fn mint_approval_digest_hex(chain_id: u64, to: &str, amount: u64, credit_ref: &str) -> String {
+    let mut stream = RlpStream::new();
+    stream.begin_list(4);
+    stream.append(&chain_id);
+    stream.append(&normalize_address(to));
+    stream.append(&amount);
+    stream.append(&credit_ref.to_string());
+    keccak_hex(&stream.out())
+}
+
+/// One approval signature over `mint_approval_digest_hex`, from an authority other than the one
+/// submitting. `v` is 27 or 28.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintCosignature {
+    pub r: String,
+    pub s: String,
+    pub v: u64,
+}
+
 fn strip_0x(s: &str) -> &str {
     s.trim_start_matches("0x").trim_start_matches("0X")
 }
@@ -26,7 +54,14 @@ fn normalize_address(addr: &str) -> String {
 
 pub enum FunctionData {
     Transfer { to: String, value: u64 },
-    Mint { to: String, amount: u64, credit_ref: String },
+    Mint {
+        to: String,
+        amount: u64,
+        credit_ref: String,
+        /// Empty on a single-signer chain, which then encodes exactly as it did before this
+        /// field existed.
+        cosignatures: Vec<MintCosignature>,
+    },
     Burn { amount: u64, redemption_ref: Option<String> },
 }
 
@@ -39,11 +74,23 @@ fn encode_function_call(data: &FunctionData) -> Vec<u8> {
             args.append(value);
             (0u8, args.out().to_vec())
         }
-        FunctionData::Mint { to, amount, credit_ref } => {
-            let mut args = RlpStream::new_list(3);
+        FunctionData::Mint { to, amount, credit_ref, cosignatures } => {
+            // 3 items with no cosignatures, 4 with. Must match clutch-node's `Mint` Decodable,
+            // which accepts exactly those two shapes and rejects anything else.
+            let mut args = RlpStream::new_list(if cosignatures.is_empty() { 3 } else { 4 });
             args.append(&normalize_address(to));
             args.append(amount);
             args.append(credit_ref);
+            if !cosignatures.is_empty() {
+                let mut sigs = RlpStream::new_list(cosignatures.len());
+                for c in cosignatures {
+                    sigs.begin_list(3);
+                    sigs.append(&c.r);
+                    sigs.append(&c.s);
+                    sigs.append(&c.v);
+                }
+                args.append_raw(&sigs.out(), 1);
+            }
             (6u8, args.out().to_vec())
         }
         FunctionData::Burn { amount, redemption_ref } => {
@@ -133,6 +180,7 @@ mod tests {
             to: "0x4444444444444444444444444444444444444444".to_string(),
             amount: 5_000_000,
             credit_ref: "a".repeat(64),
+            cosignatures: Vec::new(),
         };
         let signed = build_raw_transaction(&signer, 1, 2077, &data).unwrap();
         assert!(signed.raw_hex.starts_with("0x"));

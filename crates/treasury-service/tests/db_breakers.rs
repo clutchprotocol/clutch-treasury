@@ -32,6 +32,8 @@ fn test_config() -> AppConfig {
         max_node_lag_blocks: 50,
         chain_id: 2077,
         mint_authority_secret: "x".into(),
+        mint_authorities: String::new(),
+        mint_threshold: 0,
         initiator_token: "i".into(),
         approver_token: "a".into(),
         readonly_token: "r".into(),
