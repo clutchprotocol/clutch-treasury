@@ -128,3 +128,47 @@ being the primary defence and becomes information a rider or driver can use to d
 counterparty in advance.
 
 Build H1 first. If it works, C may be all that reputation ever needs to be.
+
+## Re-read after H1 shipped — 2026-09-13
+
+H1 shipped on 2026-09-12 with a two-hour window. Re-reading this as that section asked, the
+conclusion holds and the design gets **sharper**, not just less urgent.
+
+**What H1 removed.** Silent non-payment is gone. A rider who takes a ride and simply stops sending
+instalments now pays anyway once the window passes. Reputation no longer has to cover that case at
+all, and any metric aimed at it would be measuring a closed hole.
+
+**What is left is one specific, detectable act.** The only remaining way to take a ride without
+paying is to submit a `RideCancel` *before* the deadline with fare still unpaid. That is narrower
+than "cancellations" and it is exactly what should be surfaced.
+
+This matters because the naive metric would have been wrong in a way that punishes the innocent.
+A raw cancellation count conflates:
+
+| Event | What it means |
+|---|---|
+| Driver cancels, fare unpaid, inside the window | A rider who did not show, or a trip that could not start. **Not misconduct.** |
+| Rider cancels, fare unpaid, inside the window | The remaining non-payment route. **The signal.** |
+| Either cancels after the window | Settles to the driver regardless, so it carries no payment incentive at all. |
+
+The chain already distinguishes all three, because a cancel records who sent it and the state
+records how much was paid and when the trip was accepted. So the metric is not a count of
+cancellations. It is **cancels initiated by the rider, with fare unpaid, before the auto-release
+deadline** — which needs no new on-chain data and no blame attribution, only reading three facts
+that are already there.
+
+**Consequences for the three open decisions:**
+
+1. *Which facts are exposed* — answered. Not a cancellation count. The narrow event above, split by
+   who initiated, with the deadline as the divider. A driver cancelling a no-show stops appearing
+   as misconduct, which was the objection to exposing counts at all.
+2. *Whether "has deposited" is public* — unchanged. Still the Sybil signal, still already derivable
+   from the chain by anyone who cares, still worth saying out loud rather than assuming.
+3. *Whether the demo app shows a number* — unchanged, and now easier to hold. Show the counts, not a
+   score. With one meaningful event type there is less temptation to compress several into an index
+   that hides which one fired.
+
+**Still C, still Required, still not a blocker.** H1 carries the load; this is information for
+declining a counterparty in advance. The work is a read-only view over data the explorer already
+indexes, and it needs decision 2 answered before it is built, because that one is about publishing
+a fact about a person rather than about a ride.

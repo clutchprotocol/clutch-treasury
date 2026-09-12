@@ -1025,7 +1025,7 @@ free rather than made costly: the alternative punishes the rider this protects.
 **Still open:** the mechanism ships disabled and is switched on by the mainnet genesis, so it is
 part of C1 rather than a separate deployment.
 
-### H2. Reputation — **Required** (design proposal 2026-09-11)
+### H2. Reputation — **Required** (re-read after H1 shipped, 2026-09-13)
 
 No driver or rider scoring exists, so nothing distinguishes a first-time counterparty from a
 repeatedly bad one.
@@ -1058,6 +1058,23 @@ declining a counterparty in advance rather than the primary defence.
 
 **Verification:** a reputation design that does not become a new attack surface, implemented. The
 proposal satisfies the first clause by construction; the second is unbuilt.
+
+**Re-read on 2026-09-13**, as the design asked once H1 shipped. The recommendation holds and the
+metric gets sharper.
+
+H1 closed silent non-payment, so reputation no longer has to cover it. The only remaining way to
+take a ride without paying is a rider cancelling before the deadline with fare unpaid — which is
+narrower than "cancellations" and is what should be surfaced.
+
+That distinction matters because the naive metric punishes the innocent. A driver cancelling a
+no-show and a rider cancelling to avoid paying are both cancellations, and the chain already tells
+them apart: a cancel records who sent it, and state records how much was paid and when the trip was
+accepted. So the metric is cancels initiated by the rider, with fare unpaid, before the
+auto-release deadline. No new on-chain data, no blame attribution.
+
+That answers the first of the three open decisions outright. The second — whether "has deposited"
+is public — still needs answering before anything is built, because it publishes a fact about a
+person rather than about a ride.
 
 ### H3. Matching — **Recommended**
 
