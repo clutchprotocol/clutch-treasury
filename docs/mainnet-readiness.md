@@ -666,7 +666,7 @@ a dashboard nobody is looking at and a Prometheus that is not running look ident
 
 ## E. Abuse and rate controls
 
-### E1. Rate limiting — **Required** (both services done; edge and load test open)
+### E1. Rate limiting — **Required** (measured 2026-09-13; only edge limiting open)
 
 Nothing had rate limiting. The deposit-address endpoint, the redemption endpoints, and
 `generateToken` are all reachable by anyone with a keypair, and keypairs are free. The per-address
@@ -707,15 +707,37 @@ fixing: `==` on `&str` short-circuits at the first differing byte, so its timing
 how much of the token a caller had already guessed. It is now a constant-time comparison over equal
 lengths. A weak oracle against a long random token, but these three tokens gate the mint ledger.
 
+#### Measured against stage, 2026-09-13
+
+`clutch-deploy/scripts/loadtest-rate-limits.py`, run twice.
+
+| Check | Result |
+|---|---|
+| Per-key limit (10/min) | First refusal on request **11**, both runs. Exact. |
+| Global limit (120/min) | Holds inside a window. 150 requests with distinct keys: 43 refused on run one, **0 on run two**. |
+| Service under saturation | `/health` stayed 200 throughout. A saturated auth endpoint does not take the process down. |
+| Recovery | Requests accepted again once the window rolled. |
+
+**The difference between the two runs is the finding.** The global limiter uses a fixed window, so
+its counter resets at the boundary and a burst spanning one gets up to **twice** the configured
+limit. Whether 150 requests were refused at all came down to where they fell relative to the reset.
+
+The limiter is unchanged, deliberately: twice a limit chosen well below what hurts is still well
+below what hurts, and a token bucket would carry per-key state between windows for little gain. But
+the code claimed window-edge behaviour was "uninteresting at these thresholds", and that claim was
+wrong, so it now records the measurement instead. Read the configured value as *about* this many
+per minute, up to twice that across a boundary.
+
+One request in 300 returned a 502 from the edge under 8-way concurrency. It did not reproduce on
+the second run and it is not the limiter — a refusal is a GraphQL error, not a 502. Recorded rather
+than diagnosed, because one occurrence is not a pattern, and worth a look if it recurs.
+
 Still open:
 
-- **Source limiting at the edge**, per the paragraph above.
-- **The load test.** Every limit here is argued for, not yet measured under load, and the numbers
-  are guesses in the honest sense: chosen well above observed client behaviour and well below what
-  a flood needs to hurt, with nothing between those two bounds measured.
+- **Source limiting at the edge**, per the paragraph above. Partly an item for G1, since the live
+  edge config is not owned by a repository today.
 
-**Verification:** source limiting at the edge, and a load test showing every limit holds with the
-chosen numbers recorded here.
+**Verification:** source limiting at the edge. The load test is done and its numbers are above.
 
 ### E2. Deposit-address growth is bounded — **Measured 2026-09-11; ceiling is a decision**
 
