@@ -831,7 +831,7 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Required** (scope established 2026-09-11)
+### G1. nginx ownership — **Required** (mechanism live 2026-09-13; one route still to migrate)
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
 hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
@@ -869,6 +869,48 @@ is a different problem from the one being solved.
 **Verification:** Clutch's edge config lives in a repo, is deployed from it, and the live config read
 back from the host matches the checked-in one. Until then, keep using the `nginx` probe rather than
 either copy, as the workspace notes already say.
+
+#### A managed block, live on the host since 2026-09-13
+
+Clutch routes now live in `clutch-deploy/config/nginx/clutch.d/` and are injected into the mounted
+file between markers by `scripts/ensure-nginx-clutch-block.sh` on every deploy. Everything outside
+the markers belongs to the `v2ray` project and is never touched; everything inside is replaced
+wholesale, so a route file deleted from the repo disappears from the host rather than lingering
+where no diff would show it.
+
+**The obvious design does not work here, and was shipped before that was noticed.** An
+`include /etc/nginx/clutch.d/*.conf;` with the directory synced from the repo passed `nginx -t`,
+reloaded cleanly, and could never have loaded a thing: the container bind-mounts exactly **one**
+path, the single `nginx.conf`, so no host directory is visible inside it and the include resolved
+against the container's own filesystem. A glob matching nothing is valid nginx, which is why
+nothing complained. Adding a mount means editing another project's compose file. Confirmed by
+inspecting the container's mounts, then replaced with the managed block and the dead include
+removed.
+
+Guards, in order: the set of `server_name`s must be identical before and after, then `nginx -t`,
+then reload, with a restore from backup on either failure. The name check runs on the candidate
+before anything is written, because a config can be syntactically perfect and have quietly lost a
+server block — and this file serves **14** vhosts that are not ours while the deploy's own health
+gate only reaches a clutch route.
+
+That guard was itself wrong at first: it matched `server_name` only at the start of a line, so a
+server block written on one line was invisible to it — precisely the vhost that could then vanish
+unnoticed. Widened, and the count went from 13 to 14, which is the evidence that at least one such
+block exists on that host.
+
+`PROBE=nginx` now prints the live managed block and reports any stale include by name. Neither was
+visible before: markers are comments, and an include that loads nothing still passes validation.
+
+**Still open.** The `/payment/` route is still patched into the hand-maintained file by
+`ensure-nginx-payment-route.sh` rather than owned by the repo. Migrating it means deleting the
+inline block in the same run that adds the repo-owned one, or `nginx -t` fails on a duplicate
+`location`. That is brace-counting surgery on a live money route, and the honest call is that it
+belongs in a change someone is watching rather than in an unattended deploy. The mechanism it would
+use is proven; new routes are owned from today.
+
+**Verification:** every clutch route present in `config/nginx/clutch.d/`, with
+`ensure-nginx-payment-route.sh` retired and the probe showing no clutch route outside the managed
+block.
 
 ### G2. Single host — **Required**
 
