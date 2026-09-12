@@ -831,7 +831,7 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Required** (mechanism live 2026-09-13; one route still to migrate)
+### G1. nginx ownership — **Required** (mechanism live and one route migrated, 2026-09-13)
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
 hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
@@ -901,16 +901,38 @@ block exists on that host.
 `PROBE=nginx` now prints the live managed block and reports any stale include by name. Neither was
 visible before: markers are comments, and an include that loads nothing still passes validation.
 
-**Still open.** The `/payment/` route is still patched into the hand-maintained file by
-`ensure-nginx-payment-route.sh` rather than owned by the repo. Migrating it means deleting the
-inline block in the same run that adds the repo-owned one, or `nginx -t` fails on a duplicate
-`location`. That is brace-counting surgery on a live money route, and the honest call is that it
-belongs in a change someone is watching rather than in an unattended deploy. The mechanism it would
-use is proven; new routes are owned from today.
+#### `/payment/` migrated, 2026-09-13
 
-**Verification:** every clutch route present in `config/nginx/clutch.d/`, with
-`ensure-nginx-payment-route.sh` retired and the probe showing no clutch route outside the managed
-block.
+The route now lives in `config/nginx/clutch.d/payment.conf`, and
+`ensure-nginx-payment-route.sh` is retired and deleted. The live host was read first rather than
+trusting the generator: the block there was byte-identical to what that script produced, with no
+hand-tuning accumulated, so this was a change of owner and not a rewrite.
+
+The strip is conditional on the repo's content, not a date or a flag — the old inline block goes
+exactly when the managed block carries a replacement, so the route is never absent even briefly.
+Two mechanisms able to write the same `location` is how you get a duplicate and a config nginx
+refuses, which is why the old script had to go rather than sit dormant. Brace counting is bounded
+at 40 lines: if the marker survived but its block did not, unbounded counting would eat whatever
+came next, so overrunning aborts and writes nothing. A post-check asserts exactly one `/payment/`
+location remains.
+
+Cleaning up after myself took a second pass. Removing the dead include line left four orphan
+comments on the host describing a directive that no longer existed — config nothing accounts for,
+which is the drift this item exists to end, introduced while ending it.
+
+**Still open, and it is larger than it looked.** The probe lists Clutch routes across **six**
+vhosts in that file: the demo app, the Hub API, the explorer, and the three nodes with their `/ws`
+and `/metrics` endpoints. Only `/payment/` is repo-owned. The managed block is injected into **one**
+server block, so covering the rest needs either a managed block per vhost or whole server blocks
+owned — a different shape from what exists, and the routes concerned are the API and node
+WebSocket endpoints everything else depends on.
+
+That is a migration to do one vhost at a time with someone watching, not in a single unattended
+deploy. The mechanism, the guards and the rollback are all proven now; what is missing is the
+multi-anchor version and the care to use it.
+
+**Verification:** every clutch route present in `config/nginx/clutch.d/`, and the probe showing no
+clutch route outside a managed block in any vhost.
 
 ### G2. Single host — **Required**
 
