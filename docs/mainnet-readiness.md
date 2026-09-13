@@ -12,7 +12,7 @@ its own. It lives here because this is the repo that holds funds.
 A public version is published at
 [docs.clutchprotocol.io/reference/mainnet-readiness](https://docs.clutchprotocol.io/reference/mainnet-readiness)
 (`clutch-docs/docs/reference/mainnet-readiness.md`). It shares this structure and severities, but
-six items are generalized or omitted there because publishing them verbatim would be targeting
+seven items are generalized or omitted there because publishing them verbatim would be targeting
 information rather than honest disclosure:
 
 | Item | Why it is not public verbatim |
@@ -22,6 +22,7 @@ information rather than honest disclosure:
 | G1 | States that the live edge config is drifted and owned by no repo |
 | G2 | States that consensus, custody, and both databases share one host |
 | G3 | States that only one person can halt minting |
+| G4 | Closed the day it was found, and the public page has no infrastructure section for it to sit in. The generic lesson — a green deploy is not evidence the deploy shipped anything — is worth more as a blog post than as a line on a readiness page |
 | J1 | A written admission that no legal advice has been taken is quotable by a regulator |
 
 B3 is internal because it is housekeeping, not posture. Everything else appears publicly in some
