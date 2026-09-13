@@ -12,7 +12,7 @@ its own. It lives here because this is the repo that holds funds.
 A public version is published at
 [docs.clutchprotocol.io/reference/mainnet-readiness](https://docs.clutchprotocol.io/reference/mainnet-readiness)
 (`clutch-docs/docs/reference/mainnet-readiness.md`). It shares this structure and severities, but
-six items are generalized or omitted there because publishing them verbatim would be targeting
+seven items are generalized or omitted there because publishing them verbatim would be targeting
 information rather than honest disclosure:
 
 | Item | Why it is not public verbatim |
@@ -22,6 +22,7 @@ information rather than honest disclosure:
 | G1 | States that the live edge config is drifted and owned by no repo |
 | G2 | States that consensus, custody, and both databases share one host |
 | G3 | States that only one person can halt minting |
+| G4 | Closed the day it was found, and the public page has no infrastructure section for it to sit in. The generic lesson — a green deploy is not evidence the deploy shipped anything — is worth more as a blog post than as a line on a readiness page |
 | J1 | A written admission that no legal advice has been taken is quotable by a regulator |
 
 B3 is internal because it is housekeeping, not posture. Everything else appears publicly in some
@@ -982,6 +983,44 @@ least likely to use is the point of rehearsing at all.
 
 **Verification:** a named second operator, and a rehearsal in which that person halts minting and
 resumes it without the maintainer's help.
+
+### G4. A deploy ships the commit it says it does — **Closed 2026-09-13**
+
+Every workflow that touches the stage host begins by SSHing in and running `git pull --ff-only` in
+the checkout, then running scripts from that checkout. On 2026-09-13 that pull started failing:
+
+```
+fatal: Cannot fast-forward to multiple branches.
+```
+
+A bare `git pull --ff-only` resolves `FETCH_HEAD` against every branch it has just fetched. Pushing
+two feature branches was enough to stop the host updating — the first fetch that brings new remote
+branches is the one that breaks, so it recurs on any branch push and looks like nothing in the repo.
+
+**The failure was survivable; swallowing it was not.** `deploy-stage.yml` ran
+`git pull --ff-only || echo "Note: git pull failed or not a git repo — continuing"`, so a deploy
+whose pull had failed went on to `compose pull`, recreate containers with whatever compose files and
+scripts the host already had, pass its health gate, and report success. The one line admitting the
+repo had not moved was three hundred lines up a log nobody reads on a green run. For a stack whose
+deploy also rewrites the edge nginx config and restarts the services that mint, that is a deploy
+reporting a state it did not produce.
+
+Found by accident: a read-only probe shipped the same morning did not run, and the only clue was
+that its new output was missing.
+
+Fixed in `clutch-deploy` on 2026-09-13:
+
+- every workflow now names `git pull --ff-only origin main`, which has exactly one thing to merge
+- `deploy-stage` no longer swallows the failure — a deploy that cannot update the checkout stops
+- the probe still continues on a failed pull, because a probe of a stale checkout still answers most
+  questions, but it says `WARNING` and says what it means for everything below it
+- `PROBE=git` reports branch, upstream, branch/remote config and how many commits behind
+  `origin/main` the checkout is. It previously reported status, HEAD and `core.fileMode` — none of
+  which would have shown this
+
+**Verification:** met. The host reports `0 commit(s) behind origin/main` on a clean tree with
+`branch.main.merge refs/heads/main`, and a failed pull now fails the deploy rather than continuing
+past it.
 ---
 
 ## H. Market operations
