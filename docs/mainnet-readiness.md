@@ -832,7 +832,7 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Closed 2026-09-13** (one remainder recorded below)
+### G1. nginx ownership — **Closed 2026-09-13**
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
 hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
@@ -1015,11 +1015,31 @@ upgrade leaves the socket open and an unbounded `curl` never returns — and tha
 fixed, and the second is the more instructive: a gate that can hang is a gate that can let a change
 through while reporting failure.
 
-**The remainder: upstreams.** `clutch_api`, `clutch_web`, `clutch_explorer_api` and
-`clutch_explorer_web` are still declared in the hand-maintained file. A route file cannot own them —
-an `upstream` block in one would be a duplicate and nginx would refuse the whole config — so owning
-them needs a second injection point, in a different part of the file, with its own guards. Every
-*route* is repo-owned; the names those routes resolve to are not.
+#### The upstreams too, later the same day
+
+`clutch_api`, `clutch_web`, `clutch_explorer_api` and `clutch_explorer_web` were the recorded
+remainder: every route was owned, but the names those routes resolve to were not, so a change to one
+appeared in no diff anywhere.
+
+They could not live in a route file. A `location` lands inside a `server`; an `upstream` belongs to
+`http`, one level up — so they have their own flat directory, `config/nginx/clutch.upstreams/`,
+their own marker and their own anchor at `http {`. Flat rather than per-vhost because an upstream is
+not owned by a vhost and several vhosts name the same one. All four are single-server blocks: one
+host, one container each, existing so routes have a name to point at rather than for load balancing.
+
+One thing would have broken it. The strip that removes old managed blocks was keyed on the route
+marker alone, which would have left the upstream block in place and inserted a second — a duplicate
+`upstream`, and a config nginx refuses outright. It now keys on the prefix both kinds share.
+
+**The upstream guard is deliberately weaker than the `server_name` one.** That one refuses any
+change, because this repo has no business declaring a vhost. This one refuses only names that
+*disappear*, because adding an upstream is what adding a service looks like, while an upstream
+vanishing means every route naming it 502s with the config still passing `nginx -t`. The first
+version was the strict kind and the test suite caught it by refusing a legitimate addition.
+
+Read back off the host afterwards, once the probe was taught to show it — its managed-block dump
+matched only the route marker, so the thing that had just been migrated was the one thing it could
+not display.
 
 **Verification:** met. Every clutch route is present in `config/nginx/clutch.d/`, and the probe
 shows no clutch route outside a managed block in any vhost.
