@@ -832,7 +832,7 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Required** (mechanism live and one route migrated, 2026-09-13)
+### G1. nginx ownership — **Required** (two of six vhosts repo-owned, 2026-09-13)
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
 hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
@@ -921,16 +921,68 @@ Cleaning up after myself took a second pass. Removing the dead include line left
 comments on the host describing a directive that no longer existed — config nothing accounts for,
 which is the drift this item exists to end, introduced while ending it.
 
-**Still open, and it is larger than it looked.** The probe lists Clutch routes across **six**
-vhosts in that file: the demo app, the Hub API, the explorer, and the three nodes with their `/ws`
-and `/metrics` endpoints. Only `/payment/` is repo-owned. The managed block is injected into **one**
-server block, so covering the rest needs either a managed block per vhost or whole server blocks
-owned — a different shape from what exists, and the routes concerned are the API and node
-WebSocket endpoints everything else depends on.
+**Larger than it looked.** The probe lists Clutch routes across **six** vhosts in that file: the
+demo app, the Hub API, the explorer, and the three nodes with their `/ws` and `/metrics` endpoints.
+The managed block is injected into **one** server block, so covering the rest needed a different
+shape from what existed.
 
-That is a migration to do one vhost at a time with someone watching, not in a single unattended
-deploy. The mechanism, the guards and the rollback are all proven now; what is missing is the
-multi-anchor version and the care to use it.
+#### One block per vhost, and the Hub API moved in, 2026-09-13
+
+`config/nginx/clutch.d/` is now one subdirectory per vhost, named for the vhost, and each gets its
+own block anchored at that vhost's `server_name`. Blocks are deleted and rebuilt on every run
+rather than edited in place: one code path instead of two, it migrated the old single-block marker
+with no special case, and a file — or a whole vhost — removed from the repo disappears from the
+host instead of lingering as a route nobody can find in a diff.
+
+**Adopting a route that already exists is the hard half.** These were hand-written on the host long
+before the repo owned any of them, so taking one over means deleting the existing copy in the same
+pass that adds the managed one. nginx refuses a duplicate `location`, so a half-done takeover does
+not serve the old route — it serves nothing. The strip is scoped to the one server block being
+adopted: every vhost in that file has a `location /`, and a strip without that scope would take
+over one vhost by breaking the rest. `nginx -t` with restore-on-failure is the backstop, so a
+signature that fails to match leaves both copies, the config is rejected, and the previous one goes
+back.
+
+That superseded the special case written for the retired `ensure-nginx-payment-route.sh`, which is
+now deleted. Keeping it would have been worse than redundant: it brace-counted forward from its own
+marker comment, so once the generic strip had removed the block underneath it, it would have eaten
+whatever came next.
+
+**`api-stage.clutchprotocol.io` is repo-owned as of 2026-09-13** — `/graphql`, `/graphql/ws`,
+`/health` and `/`, copied verbatim from the live host and read back afterwards to confirm. The
+`clutch_api` upstream they proxy to is still outside the repo; an `upstream` block in a route file
+would be a duplicate, so the upstream remains part of what this item has left to solve. The server
+block's `add_header` directives sit outside any location and were left alone.
+
+Two post-reload gates were added, because the deploy's existing health gate runs *before* the block
+is written and says nothing about the config the reload has since installed:
+
+- `/health` must answer 200 — the vhost still proxies to the Hub API at all
+- `/graphql/ws` must answer **101** to a real WebSocket handshake
+
+The second is the one that earns its place. Lose the `Upgrade` headers and the request falls
+through to `location /`, which has none: the handshake degrades to a plain 200, every page still
+loads, and every subscription silently never fires. A `POST /graphql` gate was written and then
+dropped — `location /` proxies everything to the same upstream with the path preserved, so losing
+the `/graphql` block entirely would still answer correctly, and the typo it would have caught is
+one `nginx -t` rejects at config load.
+
+**A failed gate now restores the previous config.** Reverting the repo change would not undo a bad
+outcome: the hand-written locations are stripped in the same pass that adds the managed ones, so a
+later deploy without the route file would leave the vhost with no routes at all. The backup the
+block script writes before every edit is the only thing that puts the previous edge back.
+
+The script has ten checks in CI against a fixture shaped like the host's config. They found three
+real defects before any of this reached the host: a blank line printed before the block survived
+the strip, so the file would have grown one line per deploy; the strip count was read off the same
+stderr `awk` was using to warn about escaped dots; and the eight-space indent applied to a blank
+separator left eight spaces of nothing.
+
+**Still open: four vhosts.** The demo app's own routes (`/api/`, `/graphql`, `/graphql/ws`,
+`/health`, `/`, `/explorer/api/`, `/explorer/`), the explorer, and the three nodes with `/ws` and
+`/metrics`. The mechanism is proven on a vhost everything depends on now, so these are repetitions
+rather than a new design — but each is still a live route, read from the host first and deployed
+with the gates watching.
 
 **Verification:** every clutch route present in `config/nginx/clutch.d/`, and the probe showing no
 clutch route outside a managed block in any vhost.
