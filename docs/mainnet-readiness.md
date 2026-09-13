@@ -832,7 +832,7 @@ real production path is the image, which copies both repos, builds the SDK from 
 
 ## G. Infrastructure and deploy
 
-### G1. nginx ownership — **Required** (two of six vhosts repo-owned, 2026-09-13)
+### G1. nginx ownership — **Closed 2026-09-13** (one remainder recorded below)
 
 The nginx serving stage belongs to the `v2ray` compose project, not `clutch-deploy`. It mounts a
 hand-maintained config that `deploy-stage.sh` patches in place each deploy, so the checked-in copy
@@ -978,14 +978,51 @@ the strip, so the file would have grown one line per deploy; the strip count was
 stderr `awk` was using to warn about escaped dots; and the eight-space indent applied to a blank
 separator left eight spaces of nothing.
 
-**Still open: four vhosts.** The demo app's own routes (`/api/`, `/graphql`, `/graphql/ws`,
-`/health`, `/`, `/explorer/api/`, `/explorer/`), the explorer, and the three nodes with `/ws` and
-`/metrics`. The mechanism is proven on a vhost everything depends on now, so these are repetitions
-rather than a new design — but each is still a live route, read from the host first and deployed
-with the gates watching.
+#### All six vhosts, 2026-09-13
 
-**Verification:** every clutch route present in `config/nginx/clutch.d/`, and the probe showing no
-clutch route outside a managed block in any vhost.
+The explorer, the three nodes and finally `app-stage` followed `api-stage`, each read off the live
+host and diffed against the file committed for it. **24 locations across six vhosts, every one
+inside a managed block, none outside** — read back from the host afterwards rather than inferred
+from a green deploy.
+
+`app-stage` went last on purpose. Every other vhost degrades to one broken path if a migration goes
+wrong; its `location /` is the whole site.
+
+Two things the migration itself taught:
+
+**The strip had to learn about comments.** node1's block carried
+`# WebSocket endpoint (use wss://...)` directly above its `/ws` location. Removing the location and
+leaving the comment produces config describing a directive that is no longer there — the same drift
+this item exists to end, and it had already happened once here. A comment directly above an adopted
+location now goes with it; comments above locations nobody adopts are left alone.
+
+**Each node was read separately rather than derived from node1.** They differ only in hostname,
+upstream and ports, which is now a measured fact rather than an assumption. "Presumably identical"
+is how a hand-maintained difference gets erased.
+
+Seventeen gates now run after the reload, because the deploy's own health gate runs *before* the
+block is written and says nothing about the config the reload has since installed. Every repo-owned
+vhost is checked: the SPA, `/health`, a prefix-stripping `/api/health`, real WebSocket handshakes
+expecting 101, and the nodes' `location /` expecting **404** — a route rather than an accident, so
+asserting it is how one quietly turning into a proxy would be noticed. Any failure restores the
+backup and fails the deploy.
+
+Both mechanisms were proved by failing. The first gate run rejected a correct config because the
+generalised helper had dropped the `graphql-transport-ws` subprotocol the Hub API requires; the
+restore fired and every surface stayed up. The second hung on a node's `/ws`, because a successful
+upgrade leaves the socket open and an unbounded `curl` never returns — and that timeout landed
+*after* the reload, so the restore never ran and the change shipped under a failed deploy. Both are
+fixed, and the second is the more instructive: a gate that can hang is a gate that can let a change
+through while reporting failure.
+
+**The remainder: upstreams.** `clutch_api`, `clutch_web`, `clutch_explorer_api` and
+`clutch_explorer_web` are still declared in the hand-maintained file. A route file cannot own them —
+an `upstream` block in one would be a duplicate and nginx would refuse the whole config — so owning
+them needs a second injection point, in a different part of the file, with its own guards. Every
+*route* is repo-owned; the names those routes resolve to are not.
+
+**Verification:** met. Every clutch route is present in `config/nginx/clutch.d/`, and the probe
+shows no clutch route outside a managed block in any vhost.
 
 ### G2. Single host — **Required**
 
