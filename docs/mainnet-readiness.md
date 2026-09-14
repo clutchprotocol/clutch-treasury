@@ -1169,7 +1169,7 @@ past it.
 These are product gaps, already listed honestly in the org README. They do not endanger the
 reserve; they decide whether a real ride market is usable.
 
-### H1. Dispute resolution — **Built and merged 2026-09-12; window set to 2 hours**
+### H1. Dispute resolution — **Built 2026-09-12; live on the testnet 2026-09-14**
 
 Cancellations are on-chain, but there is no arbitration when two parties disagree, and no no-show
 or fraud handling. Passengers also give up card-issuer chargebacks by signing payment directly,
@@ -1268,6 +1268,30 @@ free rather than made costly: the alternative punishes the rider this protects.
 
 **Still open:** the mechanism ships disabled and is switched on by the mainnet genesis, so it is
 part of C1 rather than a separate deployment.
+
+#### Enabled on stage, 2026-09-14
+
+The mechanism had never executed. `ride_auto_release_secs` is genesis-committed and was absent from
+all three node configs, so it defaulted to `0` and every `RideCancel` on the testnet refunded the
+passenger — the code was tested, the behaviour had never happened on a chain.
+
+Stage was reset with the parameter set. Confirmed from committed state rather than the config file:
+all three nodes answer `ride_auto_release_secs: 300` over `get_chain_info`, at the same height, with
+`total_supply: "0"`.
+
+**300 seconds on stage, against the 7200 of the decision of record.** Two hours cannot be exercised
+on a development chain — nobody waits that long to test a cancel — so at 7200 the rule would reach
+mainnet having never run against a real ride. `check-genesis.sh` was verified to refuse 300 under
+`MAINNET=1`, so the short window cannot leak into a mainnet genesis.
+
+Exposing the value was part of this. `get_chain_info` did not carry it, so a genesis parameter that
+decides **who receives money** was unobservable from outside the node: an operator could only read
+the host's config file, which is the config rather than the committed state, and a client had no way
+to tell a rider how long a cancel still refunds them. It is in the response now.
+
+**Still not verified end to end.** A fresh chain has no CLT — `faucet_allocation` is 0 and the faucet
+is gone — so funding a passenger and a driver means a real Nile USDT deposit, and the Nile faucet
+has a human check. The rule is live and observable; it has still never fired against an actual ride.
 
 ### H2. Reputation — **Required** (re-read after H1 shipped, 2026-09-13)
 
