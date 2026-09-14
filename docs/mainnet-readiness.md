@@ -667,7 +667,7 @@ a dashboard nobody is looking at and a Prometheus that is not running look ident
 
 ## E. Abuse and rate controls
 
-### E1. Rate limiting — **Required** (measured 2026-09-13; only edge limiting open)
+### E1. Rate limiting — **Required** (edge limiter live in dry run, 2026-09-14)
 
 Nothing had rate limiting. The deposit-address endpoint, the redemption endpoints, and
 `generateToken` are all reachable by anyone with a keypair, and keypairs are free. The per-address
@@ -733,12 +733,44 @@ One request in 300 returned a 502 from the edge under 8-way concurrency. It did 
 the second run and it is not the limiter — a refusal is a GraphQL error, not a 502. Recorded rather
 than diagnosed, because one occurrence is not a pattern, and worth a look if it recurs.
 
-Still open:
+#### Edge limiting, in dry run, 2026-09-14
 
-- **Source limiting at the edge**, per the paragraph above. Partly an item for G1, since the live
-  edge config is not owned by a repository today.
+G1 closed, so the edge config is owned by a repo and this became possible. A per-client limiter now
+runs on every clutch vhost — **and refuses nothing yet, on purpose.**
 
-**Verification:** source limiting at the edge. The load test is done and its numbers are above.
+**The key is the hard part, and it is the same objection the app raised.** At nginx the hop is
+Cloudflare, not the client, so a naive `$binary_remote_addr` key would put every visitor on the
+planet in one bucket. An nginx `geo` block matches on the *real peer address*, so a trusted flag is
+set only when the request genuinely came from Cloudflare, and a `map` honours `CF-Connecting-IP`
+only in that case. A request reaching the origin directly with a forged header is not from those
+ranges, its header is ignored, and the key falls back to the peer. That is trusting a header **from
+a known hop**, which is precisely the distinction the application could not make and why it was
+right to refuse.
+
+Not `set_real_ip_from`, which would achieve the same by rewriting `$remote_addr`. It is only legal
+at http, server or location level: at http it changes `$remote_addr` for the v2ray vhosts sharing
+that file, and per-server it means twenty-two CIDRs copied into six server blocks, which is how one
+of the six silently falls behind. `geo` and `map` only define variables, so they sit at http level
+and affect nothing that does not read them.
+
+**Measured 2026-09-14:** 250 requests at 30 concurrent from one address produced **169
+`REJECTED_DRY_RUN`**, every one served with 200. So the limiter evaluates, the key tracks a single
+client correctly, and nothing is being refused.
+
+Seeing that took its own work. A dry run is invisible by construction, and nginx reports it at
+`warn` while the default `error_log` level is `error` — so the first attempt produced no evidence at
+all and looked like a limiter that was not loaded. Raising that level means editing a v2ray
+directive, so the limiter writes its own log via `$limit_req_status` instead, in a format carrying
+**no client address**: the measurement needs how often and where, not who.
+
+**Still open: the enforcement flip.** The rate — 600 a minute per client, burst 20 — is chosen to be
+far above a person and far below a flood, but that is reasoning, not evidence. Guessing low means
+refusing real users at the edge with a 429 and no application log to explain it. What is missing is
+a period of real traffic with the dry run watched: if no genuine client trips it, turn
+`limit_req_dry_run` off; if some do, raise the rate first. That flip is one line.
+
+**Verification:** the limiter enforcing, with a dry-run period on record showing it would not have
+refused real users. The load test and the dry-run measurement are done and their numbers are above.
 
 ### E2. Deposit-address growth is bounded — **Measured 2026-09-11; ceiling is a decision**
 
