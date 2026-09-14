@@ -426,7 +426,7 @@ async fn reserve_status_handler(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let last_reconciliation: Option<(String, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as("SELECT status, run_at FROM reconciliation_runs ORDER BY run_at DESC LIMIT 1")
+        sqlx::query_as("SELECT status, run_at FROM reconciliation_runs ORDER BY run_at DESC, id DESC LIMIT 1")
             .fetch_optional(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -501,6 +501,58 @@ async fn reconciliation_report_handler(
     Ok(Json(json!({"items": items})))
 }
 
+/// The reserve position, for publication.
+///
+/// Deliberately NOT `/internal/reserve-status`, which any role token can read: that one carries the
+/// breaker state, the remaining daily mint headroom and the outbox depth, and those are operational
+/// internals an attacker would find useful. This one carries the four numbers a holder needs to
+/// check the claim that CLT is fully reserved, and nothing else.
+///
+/// Unauthenticated, and that is not an oversight: `treasury-service` publishes no port, so
+/// "unauthenticated" means "reachable from the compose network", which is the same trust boundary
+/// its Prometheus metrics already sit behind. Reaching the public internet is `clutch-explorer`'s
+/// job -- it has a public API, and it can cache and rate-limit in front of this.
+///
+/// `status` is published raw, including `mismatch`. A reconciliation page that hides a mismatch is
+/// worth less than no page at all, because it converts "unverified" into "verified fine".
+///
+/// The absence of a run is NOT an error: a chain with no reconciliation yet is a real state, and
+/// answering 500 would make a consumer show "unavailable" when the honest answer is "never run".
+async fn public_reconciliation_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let row: Option<(chrono::DateTime<chrono::Utc>, i64, i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT run_at, onchain_supply, genesis_allocation, ledger_liability, custody_reported, status
+         FROM reconciliation_runs ORDER BY run_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let Some((run_at, onchain_supply, genesis_allocation, ledger_liability, custody_reported, status)) = row
+    else {
+        return Ok(Json(json!({ "last_run": null })));
+    };
+
+    Ok(Json(json!({
+        "last_run": {
+            "run_at": run_at,
+            // What exists on chain, and the part of it the treasury issued. They differ only by the
+            // genesis allocation, which is 0 on every chain run so far -- published anyway, because
+            // a reader cannot check the subtraction without it.
+            "onchain_supply": onchain_supply,
+            "genesis_allocation": genesis_allocation,
+            "treasury_minted": onchain_supply - genesis_allocation,
+            // What the ledger says is owed, and what is actually held against it. Units line up
+            // exactly: USDT has 6 decimals and 1 USD is 1,000,000 CLT, so one micro-USDT is one CLT
+            // and these compare directly.
+            "ledger_liability": ledger_liability,
+            "custody_reported": custody_reported,
+            "status": status,
+        }
+    })))
+}
+
 fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
     json!({
         "id": intent.id,
@@ -552,6 +604,7 @@ pub fn router(pool: PgPool, config: AppConfig) -> Router {
         .route("/internal/custody-deposits", post(custody_deposits_handler))
         .route("/internal/reserve-status", get(reserve_status_handler))
         .route("/internal/reconciliation-report", get(reconciliation_report_handler))
+        .route("/public/reconciliation", get(public_reconciliation_handler))
         .with_state(state)
 }
 
