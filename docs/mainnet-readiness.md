@@ -665,6 +665,56 @@ a dashboard nobody is looking at and a Prometheus that is not running look ident
 
 ---
 
+### D4. The chain is producing blocks — **Rules done 2026-09-14, same delivery gap as D3**
+
+D3 covered the money path and nothing covered the chain underneath it. So the single most
+consequential fact a validator set can report — that it has stopped — was the one condition
+nothing evaluated, while ten rules watched the treasury reading from it.
+
+**The property.** Aura authors a block every `60 / authorities` seconds (20s on the three-node
+testnet) and authors an **empty** block when there is nothing to include. Height advancing is
+therefore a heartbeat, not a measure of traffic: a quiet chain still climbs, and a chain that
+stops climbing is broken. That is what makes "height has not changed" a usable alert at all,
+and it is a property of Aura rather than of this deployment — a consensus that only produced on
+demand would need a different signal.
+
+Four rules now evaluate it, in `clutch-deploy/config/monitoring/prometheus/rules/chain.yml`:
+`ChainHeightNotAdvancing` (no node has advanced in 5 minutes — the halt itself),
+`ChainNodeBehind` (validators disagree by more than 50 blocks),
+`ChainNodeDown`, and `ChainLatestBlockHashMissing`.
+
+**What happened on 2026-09-14.** The stage chain halted at block 84 and ran halted for most of a
+day. It was reported by a human, in the words "the explorer has no data" — three layers below the
+actual fault. Four things had to be wrong at once for that to be the first signal:
+
+1. **No alert covered chain liveness.** This item.
+2. **The authoring error was logged at `debug!`.** Most authoring attempts legitimately fail —
+   a node that is not the slot's author must fail — so the error was routine by construction and
+   had been turned down to match. The one case that is not routine went down with it. The node now
+   warns after 300 seconds of *continuous* failure and logs the reason.
+3. **The chain probe read node1 only.** node1 is the p2p bootstrap, which says nothing about which
+   node is worth reading; node3 owned the slot and held the real reason. The probe reads all three.
+4. **The explorer had no probe at all**, so the symptom the user saw could not be checked from the
+   inspection workflow that exists for this.
+
+The fault itself was a transaction whose nonce the chain had already consumed sitting in the pool.
+`author_new_block` puts the whole pool into the candidate block, so it failed every block, and the
+only thing that removes a pooled transaction is the import of a block carrying it — a deadlock no
+restart could break. `evict_permanently_invalid` now drops those at authoring time.
+
+**Its cause was upstream of the node.** `get_next_nonce` answered `confirmed + 1` while ignoring
+the pool, so the treasury's outbox, sending several mints in one pass, was handed the same nonce
+for every one of them; the first landed and the rest could never be valid. That is fixed at the
+node (`Blockchain::next_nonce_for` is pool-aware), which is the only place all callers route
+through — the treasury was not doing anything wrong.
+
+**Verification:** the same delivery gap as D3 — the rules fire into Prometheus and stop there.
+Beyond that, this one is cheap to force honestly: stop all three nodes for six minutes and confirm
+`ChainHeightNotAdvancing` fires. Unlike the treasury rules it needs no synthetic condition, because
+the thing being detected is simply the absence of something.
+
+---
+
 ## E. Abuse and rate controls
 
 ### E1. Rate limiting — **Required** (edge limiter live in dry run, 2026-09-14)
