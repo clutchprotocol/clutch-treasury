@@ -20,6 +20,12 @@ const ALREADY_PROCESSED_SUBSTR: &str = "already processed";
 
 const MAX_ATTEMPTS: i32 = 10;
 
+/// How long a row may sit in `submitted` before it is treated as dead and re-queued.
+///
+/// Ten minutes is thirty blocks at the testnet's 20s cadence — far outside any plausible inclusion
+/// delay, and short enough that a depositor is not left waiting on a mint that is never coming.
+const SUBMITTED_TIMEOUT_SECS: i64 = 600;
+
 struct OutboxRow {
     outbox_id: i64,
     intent_id: Uuid,
@@ -42,6 +48,79 @@ struct OutboxRow {
 /// still behind.
 static STALE_ALERTED: AtomicBool = AtomicBool::new(false);
 
+/// Re-queue submissions that were never confirmed.
+///
+/// `submitted` was terminal in practice: this loop retries `pending` and `failed`, only the watcher
+/// writes `confirmed`, and nothing timed a submission out. So a transaction that died — a nonce
+/// already consumed, a chain reset underneath it, a reorg — left a row waiting for ever while
+/// reconciliation reported the amount as under-issuance, also for ever. That is CLT a depositor
+/// paid for and never received, and stage carried exactly one such row for over a day before a
+/// human noticed it in a reconciliation alert.
+///
+/// Re-queuing is safe rather than merely convenient, and for a reason that already exists in this
+/// file: `credit_ref` is UNIQUE and the chain holds `processed_ref_<credit_ref>` as an exactly-once
+/// marker, so a resubmission of a mint that really did land comes back as ALREADY_PROCESSED_SUBSTR
+/// and is handled by the branch below — marked submitted-with-no-hash for the watcher to credit.
+/// There is no path here that mints twice.
+///
+/// `attempts` is carried forward rather than reset, so a submission that keeps dying eventually
+/// hits MAX_ATTEMPTS and becomes a human's problem instead of an infinite loop.
+async fn requeue_stuck_submissions(pool: &PgPool) -> Result<u32, String> {
+    let rows: Vec<(i64, Uuid, i32, i64)> = sqlx::query_as(
+        "SELECT o.id, o.intent_id, o.attempts, i.amount_clt
+           FROM chain_outbox o
+           JOIN mint_intents i ON i.id = o.intent_id
+          WHERE o.status = 'submitted'
+            AND i.updated_at < now() - make_interval(secs => $1)",
+    )
+    .bind(SUBMITTED_TIMEOUT_SECS as f64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut requeued = 0u32;
+    for (outbox_id, intent_id, attempts, amount_clt) in rows {
+        if attempts >= MAX_ATTEMPTS {
+            let reason = format!(
+                "mint of {amount_clt} CLT has been submitted {attempts} times without ever being \
+                 confirmed on chain — not retrying again. The beneficiary has paid and holds \
+                 nothing; this needs a human."
+            );
+            alert(pool, "p1", "outbox", &reason).await;
+            sqlx::query("UPDATE chain_outbox SET status = 'failed', last_error = $2 WHERE id = $1")
+                .bind(outbox_id)
+                .bind(&reason)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE mint_intents SET status = 'needs_manual', updated_at = now() WHERE id = $1")
+                .bind(intent_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            continue;
+        }
+
+        tracing::warn!(
+            "outbox: mint {intent_id} ({amount_clt} CLT) has been 'submitted' for over \
+             {SUBMITTED_TIMEOUT_SECS}s with no confirmation — re-queuing for submission"
+        );
+        sqlx::query(
+            "UPDATE chain_outbox
+                SET status = 'pending', attempts = $2, next_attempt_at = now(),
+                    last_error = 'no confirmation within the submission timeout; re-queued'
+              WHERE id = $1 AND status = 'submitted'",
+        )
+        .bind(outbox_id)
+        .bind(attempts + 1)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        requeued += 1;
+    }
+    Ok(requeued)
+}
+
 pub async fn drain_once(
     pool: &PgPool,
     node: &Arc<NodeClient>,
@@ -49,6 +128,16 @@ pub async fn drain_once(
     signer: &dyn ChainSigner,
     config: &AppConfig,
 ) -> Result<u32, String> {
+    // Before picking up new work, rescue anything that was submitted and never confirmed. Runs on
+    // the same 2s cadence as the drain: the query is a narrow index scan over a table that holds
+    // one row per mint, and the alternative — a separate loop — is a second place to forget.
+    //
+    // A failure here must not stop the drain. Being unable to rescue a stuck row is worse than
+    // doing nothing only if it also blocks the mints that are fine.
+    if let Err(e) = requeue_stuck_submissions(pool).await {
+        tracing::error!("outbox: could not check for stuck submissions: {e}");
+    }
+
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let rows: Vec<OutboxRow> = sqlx::query_as::<_, (i64, Uuid, i32, String, i64, String, Option<String>)>(
         "SELECT o.id, o.intent_id, o.attempts, i.beneficiary, i.amount_clt, i.credit_ref, i.client_ref
