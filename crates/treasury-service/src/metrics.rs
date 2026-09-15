@@ -114,6 +114,24 @@ pub async fn render(pool: &PgPool) -> String {
     );
     out.push_str(&format!("clutch_treasury_unswept_deposit_addresses {unswept}\n"));
 
+    // Published so it can be compared against the chain head, which is the only way this number
+    // means anything. The cursor lives in Postgres and outlives the chain it was counting, so a
+    // reset or a deep reorg strands it ABOVE the head — and `process_range` then returns None
+    // while `bound <= cursor`, silently and for ever. Observed on stage 2026-09-15: cursor 4083
+    // against a head of 3993, the watcher crediting nothing for hours, and it healed by accident
+    // when the chain grew past it, having skipped every block below. Nothing alerted.
+    let cursor: i64 = sqlx::query_scalar("SELECT last_processed_height FROM chain_cursor LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    header(
+        &mut out,
+        "clutch_treasury_chain_cursor_height",
+        "Height the deposit watcher has processed to. Above the chain head it is stranded and crediting nothing.",
+        "gauge",
+    );
+    out.push_str(&format!("clutch_treasury_chain_cursor_height {cursor}\n"));
+
     if let Ok(b) = crate::ledger::balances(pool).await {
         header(&mut out, "clutch_treasury_clt_liability", "CLT in circulation, base units.", "gauge");
         out.push_str(&format!("clutch_treasury_clt_liability {}\n", b.clt_liability));
