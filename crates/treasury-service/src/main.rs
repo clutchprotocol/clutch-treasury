@@ -24,6 +24,44 @@ async fn main() {
     sqlx::migrate!("./migrations").run(&pool).await.expect("migrations");
 
     let node = clutch_chain::node_client::NodeClient::new(config.node_ws_url.clone());
+
+    // `--reconcile-once`: run exactly one reconciliation, print the status, exit. No workers, no
+    // HTTP server, nothing spawned.
+    //
+    // This exists for the D1 restore rehearsal, where reconciliation has to run against a
+    // RESTORED COPY of the ledger — and where booting an ordinary instance would be dangerous
+    // rather than merely wasteful. The sweeper, the chain outbox and the payout workers all act
+    // on chain, so a second service reading a copy of `chain_outbox` would re-broadcast
+    // transactions already submitted and re-sweep addresses already swept. Verifying a backup
+    // must not be able to move money, so the verification path starts nothing that can.
+    //
+    // Reads are unaffected: this still queries the node and TronGrid, which is the point — the
+    // question being answered is whether the RESTORED ledger reconciles against the real chain
+    // and real custody, not whether it reconciles against itself.
+    //
+    // Exit codes are the result: 0 reconciled, 1 mismatch, 2 the run could not be made at all.
+    // A mismatch and an unreachable TronGrid are different answers and a caller must not have to
+    // parse text to tell them apart.
+    if std::env::args().any(|a| a == "--reconcile-once") {
+        match treasury_service::reconciliation::run_once(
+            &pool,
+            &node,
+            config.genesis_allocation as u64,
+            &config,
+        )
+        .await
+        {
+            Ok(status) => {
+                println!("reconciliation status: {status}");
+                std::process::exit(if status == "mismatch" { 1 } else { 0 });
+            }
+            Err(e) => {
+                eprintln!("reconciliation did not run: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let peers = treasury_service::chain_sync::peer_clients(&config.node_peer_ws_urls);
     {
         let pool = pool.clone();
