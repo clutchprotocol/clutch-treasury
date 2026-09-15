@@ -51,7 +51,8 @@ Five things must all be true before any mainnet address is handed to a user:
 2. A real mainnet payout receipt has been read, and the energy and fee model matches it.
 3. The genesis is a fresh mainnet genesis, with a validator set that is not three containers on
    one host.
-4. The treasury ledger has an off-host backup and a restore that has actually been performed.
+4. ~~The treasury ledger has an off-host backup and a restore that has actually been performed.~~
+   **Met 2026-09-15** — see D1. The remaining four are unchanged.
 5. Someone other than the maintainer can halt minting and knows how.
 
 Everything below expands these, plus the product and legal work that sits outside them.
@@ -62,12 +63,15 @@ Several of these block each other, so the order is not a preference. Everything 
 person, an account, a host, a firm or a lawyer — the engineering side of each item is done and
 recorded in its own section.
 
-**Start here, because nothing depends on it and its failure mode is the worst.**
+~~**Start here, because nothing depends on it and its failure mode is the worst.**~~
 
-1. **Perform the D1 restore rehearsal.** Cheapest item on this list, and the only blocker whose
-   failure mode is losing the record of who is owed money. Set `BACKUP_REMOTE`, put
-   `BACKUP_PASSPHRASE` somewhere that is not the host, run the two scripts, and get reconciliation
-   green against the restored database.
+1. ~~**Perform the D1 restore rehearsal.**~~ **Done 2026-09-15.** Off-host backups run to
+   Cloudflare R2 nightly, and a dump fetched back out of the remote restores and reconciles `ok`.
+   Re-run `rehearse-restore.yml` with `source: remote` after anything that touches that path.
+
+   It also found a real 10,000,000 CLT discrepancy that had been raising a p1 since 2026-09-14 —
+   a mint stuck in `submitted` that nothing re-drives — which is the argument for the item rather
+   than an aside. See D1.
 2. **Wire an alert destination and force a failure (D3).** The rules exist and are loaded. Stopping
    `treasury-service` for four minutes and confirming `TreasuryServiceDown` reaches you is the
    whole test. Do it before the caps decision below, because the daily mint cap's exposure depends
@@ -540,7 +544,7 @@ document. Writing it down is not the same as having done it once.
 
 ## D. Data durability and recovery
 
-### D1. Off-host ledger backup — **Blocker** (tooling rehearsed against stage 2026-09-12)
+### D1. Off-host ledger backup — **Closed 2026-09-15**
 
 Both databases sit on named local Docker volumes with `restart: unless-stopped`, so data survives
 container recreation. It does not survive disk loss, host loss, or `docker compose down -v`. The
@@ -589,20 +593,78 @@ The second run succeeded end to end against real data:
 
 Both throwaway copies were dropped. Nothing touched a live database.
 
-**Still open, and this is the whole point of the item:**
+#### Closed 2026-09-15
 
-1. **`BACKUP_PASSPHRASE` is not set**, so no real backup exists yet — the scheduled job still
-   aborts, now with a clear message. Generate one and store it somewhere that is **not** this host.
-   A passphrase next to the dump it protects is decoration.
-2. **`BACKUP_REMOTE` is not set**, so when dumps do start they share a disk with the databases they
-   came from. The script warns on every run.
-3. **Reconciliation has not been run against a restored ledger.** Row counts prove the restore is
-   not empty; they do not prove the ledger is coherent. That is the verification below, and it is
-   the only one that actually closes this item.
+All three open conditions are met.
 
-**Verification:** the rehearsal in the runbook, performed — restore into a clean database, then
-point a `treasury-service` instance at it and get reconciliation green *against the restored
-ledger*. That is the verification; a loadable dump is not. Record the date here when done.
+1. **`BACKUP_PASSPHRASE` is set**, generated off-host and held in a password manager. The nightly
+   job had been aborting every night since 2026-09-11 for want of it.
+2. **`BACKUP_REMOTE` is set** to Cloudflare R2 (`r2:clutch-treasury-backups`), an account API token
+   scoped to that one bucket.
+3. **Reconciliation ran green against a restored ledger**, which is the verification:
+   `treasury-20260915T195834Z.dump.enc` was fetched **from R2**, decrypted with the passphrase in
+   `.env`, restored into a throwaway database, and reconciled `ok` against the real chain and real
+   custody. Both copies were dropped; nothing touched a live database.
+
+`.github/workflows/rehearse-restore.yml` with `source: remote` performs the whole loop
+(`scripts/verify-restored-ledger.sh`). Re-run it after anything that touches the backup path. It
+reads the dumps back out of the remote deliberately — restoring the local copies tests nothing
+about surviving the loss of the host, which is the only failure this item is about.
+
+Reconciliation runs as `treasury-service --reconcile-once`, which starts no workers and no HTTP
+server. An ordinary instance would start the sweeper, the chain outbox and the payout workers, all
+of which act on chain, so a service reading a **copy** of `chain_outbox` would re-broadcast
+transactions already submitted and re-sweep addresses already swept. Verifying a backup must not be
+able to move money.
+
+:::warning What the first green run took
+Three things had to be fixed first, and each was invisible until something tried to use it.
+
+**The off-host copy failed with `403 AccessDenied` on `CreateBucket`.** rclone verifies a bucket
+exists before uploading; a token scoped to one bucket cannot list buckets account-wide, so rclone
+read that as "bucket missing" and tried to create it. The error names authentication and the cause
+is a permission nobody should grant. Fixed with `no_check_bucket` on the remote — not a flag in the
+script, because it is an S3 backend option and the backend is deliberately the operator's choice.
+
+**`--reconcile-once` could not run at all.** `NodeClient` connects on a spawned task, so the
+one-shot call lost the race every time and reported "WebSocket connection not established". The
+long-running service absorbs this with a 30s retry; a single run had nothing to absorb it.
+
+**The verdict was too generous.** It exited 0 on `over_backed_drift` and printed "RECONCILED" over
+a p1 reading *"a mint the ledger recorded is missing on chain"*. The mint gate accepts any status
+that is not `mismatch` — correct for minting, wrong for an operator asking whether a backup is
+trustworthy, where only `ok` is yes. Exit codes now distinguish clean, mismatch, ran-but-not-clean
+and could-not-run.
+
+That third one is the one to remember: the verification would have reported success over a ledger
+that did not balance, and the item would have been recorded as closed on it.
+:::
+
+:::note The drift it found was real, and was not the backup
+The first verification run returned `over_backed_drift` — and so did live, with identical numbers,
+which is what proved the restore faithful rather than broken.
+
+The gap was 10,000,000 CLT: one mint intent stuck in `submitted` since 2026-09-14, three identical
+intents created 26ms apart, which is the signature of the stale-nonce defect fixed in clutch-node
+the same day (`get_next_nonce` answered `confirmed + 1` while ignoring the pool, so an outbox pass
+handed every mint the same nonce). Two landed. The third could not.
+
+It stayed stuck because **`submitted` is terminal in practice**: the outbox retries `pending` and
+`failed`, nothing re-drives `submitted`, nothing times it out, and nothing checks whether the
+transaction landed. Only the watcher writes `confirmed` — and the watcher's cursor was itself
+stranded at 4083 against a chain head of 3993, left there by a testnet reset, crediting nothing
+silently until the chain grew past it and resumed having skipped every block below.
+
+Re-driven with `redrive-mint.yml`; it confirmed in 11 seconds and reconciliation went `ok`. The
+re-drive cannot double-mint: `credit_ref` is UNIQUE and the chain holds `processed_ref_<credit_ref>`
+as an exactly-once marker, so resubmitting a mint that really did land is rejected rather than
+minted twice.
+
+**Two defects remain open from this, and both matter more on mainnet than here:** the outbox needs
+to time a `submitted` row out, check `chain_tx_hash` against the chain, and re-drive or park with
+an alert; and a watcher cursor above the chain head needs to alert rather than heal by accident.
+Today a stuck mint needs a human to notice, which does not scale.
+:::
 
 ### D2. Plaintext mnemonic copies on the host — **Blocker** (mitigated 2026-09-10)
 
