@@ -43,23 +43,37 @@ async fn main() {
     // A mismatch and an unreachable TronGrid are different answers and a caller must not have to
     // parse text to tell them apart.
     if std::env::args().any(|a| a == "--reconcile-once") {
-        match treasury_service::reconciliation::run_once(
-            &pool,
-            &node,
-            config.genesis_allocation as u64,
-            &config,
-        )
-        .await
-        {
-            Ok(status) => {
-                println!("reconciliation status: {status}");
-                std::process::exit(if status == "mismatch" { 1 } else { 0 });
-            }
-            Err(e) => {
-                eprintln!("reconciliation did not run: {e}");
-                std::process::exit(2);
+        // Retried, for the same reason the loop below retries at 30s rather than waiting a full
+        // interval: `NodeClient::new` connects on a spawned task, so the first call after
+        // constructing it loses the race and returns "WebSocket connection not established". The
+        // long-running service absorbs that invisibly. A one-shot run has nothing to absorb it and
+        // failed on every attempt until this loop existed.
+        //
+        // A genuine outage costs 30 seconds before reporting, which is the right trade: the answer
+        // "could not run" is only useful if it means the node is really unreachable.
+        let mut last = String::new();
+        for attempt in 1..=10 {
+            match treasury_service::reconciliation::run_once(
+                &pool,
+                &node,
+                config.genesis_allocation as u64,
+                &config,
+            )
+            .await
+            {
+                Ok(status) => {
+                    println!("reconciliation status: {status}");
+                    std::process::exit(if status == "mismatch" { 1 } else { 0 });
+                }
+                Err(e) => {
+                    last = e;
+                    eprintln!("attempt {attempt}/10: {last}");
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
             }
         }
+        eprintln!("reconciliation did not run after 10 attempts: {last}");
+        std::process::exit(2);
     }
 
     let peers = treasury_service::chain_sync::peer_clients(&config.node_peer_ws_urls);
