@@ -39,9 +39,16 @@ async fn main() {
     // question being answered is whether the RESTORED ledger reconciles against the real chain
     // and real custody, not whether it reconciles against itself.
     //
-    // Exit codes are the result: 0 reconciled, 1 mismatch, 2 the run could not be made at all.
-    // A mismatch and an unreachable TronGrid are different answers and a caller must not have to
-    // parse text to tell them apart.
+    // Exit codes are the result: 0 clean, 1 mismatch, 3 ran but NOT clean, 2 the run could not be
+    // made at all. Four answers because they call for four different things, and a caller must not
+    // have to parse text to tell them apart.
+    //
+    // 3 exists because `ok` is not the only status the mint gate tolerates. `over_backed_drift`
+    // lets minting continue — correctly, it means the ledger counts more as issued than the chain
+    // holds, which is the safe direction — but it is raised as a p1 and it is not a clean reserve.
+    // Treating anything-but-mismatch as success let a verification run report "reconciled" over a
+    // persistent under-issuance alert. For an operator asking "is my backup trustworthy", only
+    // `ok` is yes.
     if std::env::args().any(|a| a == "--reconcile-once") {
         // Retried, for the same reason the loop below retries at 30s rather than waiting a full
         // interval: `NodeClient::new` connects on a spawned task, so the first call after
@@ -63,7 +70,11 @@ async fn main() {
             {
                 Ok(status) => {
                     println!("reconciliation status: {status}");
-                    std::process::exit(if status == "mismatch" { 1 } else { 0 });
+                    std::process::exit(match status.as_str() {
+                        "ok" => 0,
+                        "mismatch" => 1,
+                        _ => 3,
+                    });
                 }
                 Err(e) => {
                     last = e;
