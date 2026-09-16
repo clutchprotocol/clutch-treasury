@@ -72,10 +72,11 @@ recorded in its own section.
    It also found a real 10,000,000 CLT discrepancy that had been raising a p1 since 2026-09-14 —
    a mint stuck in `submitted` that nothing re-drives — which is the argument for the item rather
    than an aside. See D1.
-2. **Wire an alert destination and force a failure (D3).** The rules exist and are loaded. Stopping
-   `treasury-service` for four minutes and confirming `TreasuryServiceDown` reaches you is the
-   whole test. Do it before the caps decision below, because the daily mint cap's exposure depends
-   on how fast anyone finds out.
+2. **Force a failure (D3).** The destination is wired and proven: Alertmanager delivers to Telegram,
+   and a synthetic alert arrived FIRING and RESOLVED on 2026-09-16. What is left is a **real**
+   firing rule — stop `treasury-service` for four minutes and confirm `TreasuryServiceDown`
+   arrives. Do it before the caps decision below, because the daily mint cap's exposure is that cap
+   multiplied by how fast anyone finds out.
 3. **Name a second operator and rehearse a halt (G3).** One person knowing the breaker exists is
    not a control. Everything they need now exists — a halt workflow and `docs/ON-CALL.md` — so what
    is left is a conversation and one rehearsal, not a task.
@@ -726,7 +727,7 @@ itself. Encrypting the backup only moves the problem while the source file is re
 **Verification:** A1 and A2 land and the mnemonic is not in `.env` at all. Until then, confirm with
 `inspect-stage.yml` that exactly one `.env.bak` exists on the host and no timestamped copies remain.
 
-### D3. Reconciliation runs unattended and alerts — **Required** (rules done 2026-09-11)
+### D3. Reconciliation runs unattended and alerts — **Required** (delivery proven 2026-09-16)
 
 Reconciliation already ran unattended: a worker loop on `reconciliation_interval_secs`, with a
 short retry on failure rather than the full interval, and a mismatch already called
@@ -738,13 +739,29 @@ mismatch and staleness, a latched breaker, p1s from either service, either servi
 sweeping stalled, a stuck chain outbox, and deposit polling stalled or never having run. Verified
 loaded on stage — all ten report `health: ok` — via the `metrics` probe.
 
-**Still open, and it is the part that matters:** nothing delivers them. The rules fire into
-Prometheus and Grafana and stop there. `clutch-deploy/docs/ALERTING.md` sets out the two routes
-(Grafana contact points, or Alertmanager) and what closes the item.
+**Delivery exists and is proven, 2026-09-16.** Alertmanager runs in the stack, Prometheus posts to
+it, and the receiver is Telegram. A synthetic alert sent through the real route arrived FIRING and
+then RESOLVED. That covers every silent failure mode in the receiver half — bot reachability, chat
+id, token, message format, file permissions — and `test-alert-route.yml` re-runs it on demand,
+which is worth doing periodically: a route that worked once and has since broken quietly is the
+same as no route.
 
-**Verification:** a delivery route, tested by forcing a failure. Stopping `treasury-service` for
-four minutes and confirming `TreasuryServiceDown` reaches a human is the cheapest forcing function.
-An untested route is in exactly the state the metrics were in before these rules existed.
+It took three attempts, and the point is that **not one of the failures was visible from outside**.
+A placeholder `chat_id: 0` crash-looped the container. A generic webhook receiver could never have
+worked with the platforms it named, because Alertmanager posts its own JSON and Slack wants
+`{"text":…}`. And mode 600 owned by root, against an image that runs as `nobody`, failed every
+notification with `permission denied` — visible only in Alertmanager's own log, which the probe had
+been printing for exactly one commit when it was needed. Each time: alert accepted, alert active,
+nothing delivered, no error anywhere anyone would look.
+
+**Still open:** a real firing rule. The test alert is posted straight to Alertmanager's API, past
+Prometheus's rule evaluation, so it does not prove a POST happens when a rule actually fires. The
+`metrics` probe now lists the alertmanagers Prometheus has discovered, which proves the wiring
+exists but not that it is exercised.
+
+**Verification:** stop `treasury-service` for four minutes and confirm `TreasuryServiceDown` arrives.
+`for: 3m` clears with margin. Two commands on the host, deliberately not a workflow — a tool that
+stops production services would be dangerous shaped for a one-time check.
 
 :::warning Found while verifying this
 Prometheus was in state `created` — created and never started, no logs, no restarts — so **stage
@@ -764,7 +781,7 @@ a dashboard nobody is looking at and a Prometheus that is not running look ident
 
 ---
 
-### D4. The chain is producing blocks — **Rules done 2026-09-14, same delivery gap as D3**
+### D4. The chain is producing blocks — **Rules 2026-09-14; delivery proven 2026-09-16**
 
 D3 covered the money path and nothing covered the chain underneath it. So the single most
 consequential fact a validator set can report — that it has stopped — was the one condition
@@ -807,10 +824,13 @@ for every one of them; the first landed and the rest could never be valid. That 
 node (`Blockchain::next_nonce_for` is pool-aware), which is the only place all callers route
 through — the treasury was not doing anything wrong.
 
-**Verification:** the same delivery gap as D3 — the rules fire into Prometheus and stop there.
-Beyond that, this one is cheap to force honestly: stop all three nodes for six minutes and confirm
-`ChainHeightNotAdvancing` fires. Unlike the treasury rules it needs no synthetic condition, because
-the thing being detected is simply the absence of something.
+**Verification:** delivery is shared with D3 and is proven as of 2026-09-16 — these rules route to
+the same Telegram receiver, and a synthetic alert through it arrived. What remains is the same
+remaining half: a real firing rule, rather than one injected past rule evaluation.
+
+This one is cheap to force honestly: stop all three nodes for six minutes and confirm
+`ChainHeightNotAdvancing` arrives. Unlike the treasury rules it needs no synthetic condition,
+because the thing being detected is simply the absence of something.
 
 ---
 
