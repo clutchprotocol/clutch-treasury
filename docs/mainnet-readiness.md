@@ -450,6 +450,43 @@ worth deciding together rather than separately:
   radius of an amount-computation bug by exactly that much. There is no clever answer; there is only
   a number with a reason attached.
 
+#### A proposed set, for the maintainer to accept or overrule
+
+Numbers, so the decision is an edit rather than a blank page. **Nothing below is decided.** Each
+line names the assumption it rests on; where an assumption is wrong the number should move with it.
+
+| Cap | Stage | Proposed | Why this number |
+|---|---|---|---|
+| `PER_TX_MINT_CAP_CLT` | $50 | **$1,000** | Has to clear the largest deposit anyone legitimately makes, or the rail simply refuses real users. Assumes nobody deposits more than $1,000 in one transfer at launch. A single amount-computation bug mints this much once. |
+| `DAILY_MINT_CAP_CLT` | $500 | **$2,000** | A compromised mint authority, running until someone notices. **Read this as "how much unbacked CLT can I afford to buy back", because that is what it costs to keep the peg honest.** Two days unnoticed is $4,000. |
+| `MAX_REDEMPTION_CLT` | $25 | **$200** | One payout out of the float. Must equal the row below. |
+| `PER_TX_PAYOUT_CAP_USDT` | $25 | **$200** | Enforced independently in `tron-signer`. Equal by necessity, not by preference — a request between the two burns CLT that cannot then be paid. |
+| Payout float balance | — | **~$1,000** | Not a configured cap, and the real bound on a compromised `treasury-service`: it cannot reach custody at all, so the float is the ceiling on theft. Five maximum redemptions deep; top it up rather than raising it. |
+| Rolling 24h payout ceiling | above both | **$1,000** | The float, from the other side. A day that wants more than the float holds is a day to look at by hand. |
+| `MIN_REDEMPTION_CLT` | $5 | **$25** | Set by the fee, not by product preference. At a $2 fee this is 8%, which is defensible; at $5 it would be 20%, which is not. |
+| `REDEMPTION_FEE_USDT` | $1 | **blocked on B2** | Cannot be proposed. Nile sponsors its own energy, so every testnet payout reports zero fee whether or not delegation works. The first mainnet receipt is the first real measurement. |
+
+Checked against the five invariants by hand: `1000 ≤ 2000`; `200 ≤ 200`; a $2 fee is `< 25`;
+`25 ≤ 200`; fee-to-minimum is 8%. Run `check-cap-invariants.sh` against the real `.env` before
+trusting that, because the point of the checker is not to take my word for it.
+
+**Three tensions worth seeing before agreeing:**
+
+The **daily mint cap and the alert route are one decision**, and the route is now wired but
+untested (D3). A $2,000/day cap with a critical arriving in minutes is a very different exposure
+from the same cap with nothing delivering. If the forced failure has not been done, treat $2,000 as
+too high.
+
+The **peg damage and the theft are different numbers.** An attacker who mints unbacked CLT has to
+redeem it to extract value, and every redemption is bounded twice and paid from a float that cannot
+reach custody. So the mint cap bounds what you owe to make the peg whole; the float bounds what
+actually leaves. They are often confused, and conflating them makes the float look less important
+than it is.
+
+**A $25 minimum redemption is high for ride fares**, and that is inherent rather than a choice: the
+on-chain payout cost is fixed regardless of size, so small redemptions are uneconomic. The honest
+options are a higher minimum, a subsidised fee, or batching — not a smaller number.
+
 **Verification:** each mainnet cap recorded here with the worst case it bounds, and
 `check-cap-invariants.sh` passing against the mainnet `.env`.
 ---
