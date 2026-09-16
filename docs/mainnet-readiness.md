@@ -72,11 +72,13 @@ recorded in its own section.
    It also found a real 10,000,000 CLT discrepancy that had been raising a p1 since 2026-09-14 —
    a mint stuck in `submitted` that nothing re-drives — which is the argument for the item rather
    than an aside. See D1.
-2. **Force a failure (D3).** The destination is wired and proven: Alertmanager delivers to Telegram,
-   and a synthetic alert arrived FIRING and RESOLVED on 2026-09-16. What is left is a **real**
-   firing rule — stop `treasury-service` for four minutes and confirm `TreasuryServiceDown`
-   arrives. Do it before the caps decision below, because the daily mint cap's exposure is that cap
-   multiplied by how fast anyone finds out.
+2. ~~**Force a failure (D3).**~~ **Done 2026-09-17.** Alertmanager delivers to Telegram, and
+   `TreasuryServiceDown` was watched firing, routing and arriving during a real four-minute outage.
+   D3 and D4 are both closed.
+
+   This unblocks the caps decision below: the daily mint cap's exposure is that cap multiplied by
+   how long a compromise runs unnoticed, and that is now minutes rather than however long until
+   someone next looked.
 3. **Name a second operator and rehearse a halt (G3).** One person knowing the breaker exists is
    not a control. Everything they need now exists — a halt workflow and `docs/ON-CALL.md` — so what
    is left is a conversation and one rehearsal, not a task.
@@ -727,7 +729,7 @@ itself. Encrypting the backup only moves the problem while the source file is re
 **Verification:** A1 and A2 land and the mnemonic is not in `.env` at all. Until then, confirm with
 `inspect-stage.yml` that exactly one `.env.bak` exists on the host and no timestamped copies remain.
 
-### D3. Reconciliation runs unattended and alerts — **Required** (delivery proven 2026-09-16)
+### D3. Reconciliation runs unattended and alerts — **Closed 2026-09-17**
 
 Reconciliation already ran unattended: a worker loop on `reconciliation_interval_secs`, with a
 short retry on failure rather than the full interval, and a mismatch already called
@@ -754,14 +756,15 @@ notification with `permission denied` — visible only in Alertmanager's own log
 been printing for exactly one commit when it was needed. Each time: alert accepted, alert active,
 nothing delivered, no error anywhere anyone would look.
 
-**Still open:** a real firing rule. The test alert is posted straight to Alertmanager's API, past
-Prometheus's rule evaluation, so it does not prove a POST happens when a rule actually fires. The
-`metrics` probe now lists the alertmanagers Prometheus has discovered, which proves the wiring
-exists but not that it is exercised.
+**Verification met 2026-09-17.** `treasury-service` was stopped for four minutes.
+`TreasuryServiceDown` went to `firing` in Prometheus, routed through Alertmanager, and arrived on
+Telegram — then `RESOLVED` when the service came back. A real rule, evaluated and delivered, which
+is the bar this item sets rather than the one it is easy to settle for.
 
-**Verification:** stop `treasury-service` for four minutes and confirm `TreasuryServiceDown` arrives.
-`for: 3m` clears with margin. Two commands on the host, deliberately not a workflow — a tool that
-stops production services would be dangerous shaped for a one-time check.
+Two things worth keeping from the exercise. The inhibit rules worked: none of the other treasury
+alerts arrived alongside it, so the notification said "the service is down" rather than burying
+that under six consequences of it. And reconciliation returned to `ok` on its own once the service
+was back, without intervention.
 
 :::warning Found while verifying this
 Prometheus was in state `created` — created and never started, no logs, no restarts — so **stage
@@ -781,7 +784,7 @@ a dashboard nobody is looking at and a Prometheus that is not running look ident
 
 ---
 
-### D4. The chain is producing blocks — **Rules 2026-09-14; delivery proven 2026-09-16**
+### D4. The chain is producing blocks — **Closed 2026-09-17**
 
 D3 covered the money path and nothing covered the chain underneath it. So the single most
 consequential fact a validator set can report — that it has stopped — was the one condition
@@ -824,13 +827,18 @@ for every one of them; the first landed and the rest could never be valid. That 
 node (`Blockchain::next_nonce_for` is pool-aware), which is the only place all callers route
 through — the treasury was not doing anything wrong.
 
-**Verification:** delivery is shared with D3 and is proven as of 2026-09-16 — these rules route to
-the same Telegram receiver, and a synthetic alert through it arrived. What remains is the same
-remaining half: a real firing rule, rather than one injected past rule evaluation.
+**Verification met 2026-09-17, by inheritance and by evaluation.** These rules route through the
+same Alertmanager receiver as D3's, and D3's path was proven end to end with a real firing rule.
 
-This one is cheap to force honestly: stop all three nodes for six minutes and confirm
-`ChainHeightNotAdvancing` arrives. Unlike the treasury rules it needs no synthetic condition,
-because the thing being detected is simply the absence of something.
+What that inheritance does NOT cover is whether each chain rule's own expression can ever match —
+a rule loads with `health: ok` whether or not its query is capable of returning anything, and
+`TreasuryWatcherCursorStranded` shipped in exactly that state, comparing a labelled vector against
+a bare aggregate. So the `metrics` probe now evaluates each chain rule's body with the comparison
+stripped, and all four return values: blocks produced in five minutes, the spread between the
+fastest and slowest node, how many nodes publish the hash-labelled series, and how many are down.
+
+Halting the chain to watch `ChainHeightNotAdvancing` fire would add little on top of that and costs
+a deliberate outage. Left undone on purpose.
 
 ---
 
