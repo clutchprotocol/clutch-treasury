@@ -94,15 +94,14 @@ alone makes that more likely, not less.
 
 ## Before the day
 
-- [ ] A vault with **purge protection on**, in its own resource group. A separate *subscription*
-      would be better — a compromise of the application's credentials would then not be a
-      compromise of the signer — but that is not what exists, and A1 records the decision to launch
-      without one. Know which of the two you have before you start, because it changes what a
-      breach of the application account costs you.
-- [ ] **A second App Registration** in the same tenant, with its own client ID and secret. Step 5
-      needs it and it is the step that actually closes A3. App Registrations are free, so this one
-      is not blocked by the cost constraint above — if step 5 gets skipped, it will be for the
-      usual reason instead, which is that it is last.
+- [ ] A vault with **purge protection on**, in a resource group and subscription holding nothing
+      else, so a compromise of the application's credentials is not a compromise of the signer.
+- [ ] **A second App Registration** in the same tenant, with its own client ID and secret, holding
+      the same Key Vault Crypto User role. Step 5 needs it and step 5 is what closes A3. App
+      Registrations are free, so the cost constraint behind A1 does not reach this one.
+- [ ] Check these against the vault's **Access control (IAM)** blade, not against notes. Both
+      service principals should appear there under Key Vault Crypto User. A note saying something
+      does or does not exist is a claim about the past; the IAM blade is the present.
 - [ ] **"Doing this alone" above, read before you start.** There is no second person by decision,
       not by accident, so the independent checks in steps 1 and 3 are done differently rather than
       skipped. Skipping them is not what "doing this alone" means.
