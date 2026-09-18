@@ -210,7 +210,9 @@ async fn main() {
     // Checked once, in the background: the node may not be up yet at boot, so this retries rather
     // than crash-looping the whole service over a dependency that is still starting.
     {
-        use clutch_chain::signer::ChainSigner;
+        // No `use ChainSigner` needed here: `signer` is now `Box<dyn ChainSigner>`, and a trait
+        // object's methods are callable without the trait in scope — unlike calling one on a
+        // concrete type, which is what this line did before signer_kind existed.
         let node = node.clone();
         let pool = pool.clone();
         let ours = signer.address();
@@ -250,7 +252,7 @@ async fn main() {
         let cfg = config.clone();
         tokio::spawn(async move {
             loop {
-                match treasury_service::outbox::drain_once(&pool, &node, &peers, &signer, &cfg).await {
+                match treasury_service::outbox::drain_once(&pool, &node, &peers, &*signer, &cfg).await {
                     Ok(n) if n > 0 => tracing::info!("outbox: submitted {} mint(s)", n),
                     Ok(_) => {}
                     Err(e) => tracing::error!("outbox drain failed: {}", e),
