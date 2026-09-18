@@ -1,0 +1,47 @@
+# KEY-CEREMONY.md step 3, the half that needs no secret.
+#
+# Derives the mint authority's address from the key's PUBLIC coordinates. That address goes into
+# the mainnet genesis as `mint_authority`, where it is committed to the genesis hash and cannot be
+# corrected without starting a new chain -- so it is derived by the same function the node uses
+# (`external_signature::address_from_uncompressed`) rather than by hand or by any website.
+#
+# Public coordinates are public: they are what the vault serves to anyone allowed to read the key,
+# and the whole security property of a KMS key is that knowing them tells you nothing about the
+# private key. So this runs on a normal runner with no secret configured, and its log can be read
+# by anyone without cost.
+#
+# The signing half of the ceremony (step 4) needs the client secret and therefore has to run where
+# that secret is allowed to exist. It is NOT this workflow.
+name: Ceremony — derive the mint address (step 3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      x:
+        description: "JWK x coordinate, base64url (az keyvault key show --query key.x)"
+        required: true
+      y:
+        description: "JWK y coordinate, base64url (az keyvault key show --query key.y)"
+        required: true
+
+jobs:
+  derive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ceremony-${{ hashFiles('**/Cargo.lock') }}
+
+      # Passed through the environment, never interpolated into the script. A `${{ }}` expression
+      # spliced into a run block is executed by the shell, so an input is a command injection.
+      - name: Derive the address
+        env:
+          X: ${{ inputs.x }}
+          Y: ${{ inputs.y }}
+        run: cargo run --quiet -p clutch-chain --bin ceremony-check -- jwk "$X" "$Y"
