@@ -8,17 +8,17 @@ been *performed* and the record exists.
 ## What is different about a KMS key, and why it changes the ceremony
 
 A traditional key ceremony exists because there is key material to generate, witness, split and
-escrow. **With AWS KMS there is no key material to hold.** The key is generated inside the HSM and
-cannot be exported — that is the entire reason for using it. So the usual centre of a ceremony,
-splitting a seed among custodians, does not apply and should not be simulated.
+escrow. **With a cloud KMS key there is no key material to hold.** The key is generated inside the
+vault and cannot be exported — that is the entire reason for using it. So the usual centre of a
+ceremony, splitting a seed among custodians, does not apply and should not be simulated.
 
 What replaces it is narrower and easier to get wrong:
 
 | Traditional ceremony | Here |
 |---|---|
-| Generate and witness key material | Witness that the key was created with the **right configuration**, since a wrong `KeySpec` produces signatures the node cannot verify |
-| Split and escrow the seed | Nothing to split. Instead: record the key's **identity** (ARN, and the address derived from its public key) |
-| Test that the seed reconstructs | Test that **access** recovers — because losing the account or the IAM path loses the key just as completely as losing a seed |
+| Generate and witness key material | Witness that the key was created with the **right configuration**, since a wrong key type or curve produces signatures the node cannot verify |
+| Split and escrow the seed | Nothing to split. Instead: record the key's **identity** (its key identifier, and the address derived from its public key) |
+| Test that the seed reconstructs | Test that **access** recovers — because losing the account or the permission path loses the key just as completely as losing a seed |
 
 The third row is the one people skip. A KMS key with no tested access-recovery path is exactly as
 lost-able as a seed phrase in one person's drawer; the failure just arrives as an IAM misconfiguration
@@ -48,7 +48,7 @@ be changed afterwards without a new chain.
 What that buys, precisely: a single compromised key mints nothing. The attacker needs two, and the
 whole point of the placement below is that no single breach yields two.
 
-**Put the three keys in three different places.** Three keys in one AWS account is a 2-of-3 on
+**Put the three keys in three different places.** Three keys in one cloud account is a 2-of-3 on
 paper and a 1-of-1 in practice, because one compromised account holds all of them.
 
 | Key | Where | Why there |
@@ -101,13 +101,16 @@ alone makes that more likely, not less.
 
 ## Before the day
 
-- [ ] An AWS account that is **not** the one running anything else, so a compromise of the
-      application's credentials is not a compromise of the signer.
+- [ ] A cloud subscription or account that is **not** the one running anything else, so a
+      compromise of the application's credentials is not a compromise of the signer. (Azure: a
+      separate subscription and resource group. AWS: a separate account.)
 - [ ] **"Doing this alone" above, read before you start.** There is no second person by decision,
       not by accident, so the independent checks in steps 1 and 3 are done differently rather than
       skipped. Skipping them is not what "doing this alone" means.
-- [ ] CloudTrail on, in that account, with its log destination outside it. The ceremony's own
-      audit trail should not be deletable by the credentials used during the ceremony.
+- [ ] Audit logging on for the vault, with its log destination outside it — Azure: a diagnostic
+      setting sending to a Log Analytics workspace or storage account in a *different* resource
+      group; AWS: CloudTrail. The ceremony's own audit trail should not be deletable by the
+      credentials used during the ceremony.
 - [ ] This document read in full beforehand, not during.
 
 ## The ceremony
@@ -121,22 +124,40 @@ creations and then doing three recovery tests at the end is how the third recove
 happen. Record which of A, B or C each register entry is for, because an address on its own does
 not say where its key lives, and that placement is the entire security property.
 
-1. **Create the key.**
-   `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, origin `AWS_KMS`.
-   **[record]** the key ARN and the creation timestamp.
-   Read both fields back with the CLI or API — not from the console page you created the key on,
-   which can show you what you typed rather than what was stored. A key created as `ECC_NIST_P256`
-   will sign happily and produce signatures the node cannot verify, and the failure surfaces as a
-   rejected mint, not as an error at creation.
+1. **Create the key — generated inside the vault, never imported.** Importing means the private
+   key existed somewhere else at some point, which is exactly what this exists to avoid.
+   - **Azure Key Vault:** Key type **EC**, curve **P-256K (SECP256K1)**, allowed operations
+     **Sign** and **Verify**.
+   - **AWS KMS:** `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, origin `AWS_KMS`.
 
-2. **Disable deletion.** The key policy must **not** grant `kms:ScheduleKeyDeletion` to any
-   principal that the application uses, and preferably to nobody. A key scheduled for deletion is a
-   treasury that stops being able to mint after a waiting period nobody was watching.
-   **[record]** which principals hold which `kms:*` actions.
+   **[record]** the key identifier and the creation timestamp — Azure: the key's vault URL, name
+   and version (e.g. `https://<vault>.vault.azure.net/keys/<name>/<version>`); AWS: the ARN.
+   Read the curve and key type back from the portal or API **after** creation, not from memory of
+   what you selected — the selection screen can show you what you clicked rather than what was
+   actually stored. A key created with the wrong curve (Azure: plain **P-256**, not **P-256K**; AWS:
+   `ECC_NIST_P256`) will sign happily and produce signatures the node cannot verify, and the failure
+   surfaces as a rejected mint, not as an error at creation.
+
+2. **Confirm nothing that signs can also delete.** The application's own principal must hold a role
+   or policy that can sign and read the public key, and **nothing more**.
+   - **Azure Key Vault:** the signing principal's only role on this vault is **Key Vault Crypto
+     User** — that role has no delete permission. Not Crypto Officer, Administrator, Contributor, or
+     Owner. Purge protection (turned on when the vault was created) is what makes this hold even
+     against an account that *could* delete the vault itself: a deleted key still waits out the
+     retention period before it is gone for good, which is time to notice and stop it.
+   - **AWS KMS:** the key policy must not grant `kms:ScheduleKeyDeletion` to any principal the
+     application uses, and preferably to nobody.
+
+   **[record]** the exact role or policy assignment you checked, and that it excludes deletion.
 
 3. **Derive and record the identity.**
-   `GetPublicKey` → DER SPKI → the 65-byte uncompressed point →
+   Fetch the public key and turn it into the 65-byte uncompressed point, then
    `clutch_chain::external_signature::address_from_uncompressed`.
+   - **Azure Key Vault:** GetKey returns a JWK with separate `x` and `y` fields — the point is
+     `0x04` followed by `x` then `y`, no unwrapping needed. See `azure_kms_signer.rs`'s
+     `fetch_public_key` for the exact steps this project's own code takes.
+   - **AWS KMS:** `GetPublicKey` returns a DER SPKI blob that has to be unwrapped to find the point.
+
    **[record]** the public key and the derived 0x address.
    Do not re-derive this by hand as a check — step 4 does it properly, through a different code
    path. Do not start step 4 for a different key before finishing it for this one.
@@ -144,16 +165,21 @@ not say where its key lives, and that placement is the entire security property.
    is baked into the genesis hash and cannot be corrected without a new chain.
 
 4. **Sign a known value and verify it end to end.**
-   Sign the digest for a throwaway transaction hash through the same code path production will use,
-   and confirm the signature recovers to the address from step 3.
+   Sign the digest for a throwaway transaction hash through the same code path production will use
+   — `AzureKmsSigner` (`crates/clutch-chain/src/azure_kms_signer.rs`) for Azure, a `KmsSigner`
+   built to the `KMS_SIGNER_SHAPE` in `external_signature.rs` for AWS — and confirm the signature
+   recovers to the address from step 3.
    `external_signature.rs` already tests this logic against the in-process signer, so what this step
    adds is proof that *this key, through this account,* behaves the same way.
    **[record]** the hash used, the resulting `(r, s, v)`, and that recovery matched.
 
 5. **Test recovery — the step that is actually A3.**
    Losing access is losing the key. Establish and then *exercise* the path back:
-   - a second principal, in a separate identity, that can sign with this key
-   - and a written break-glass procedure for regaining administrative access to the account itself
+   - a second principal, in a separate identity, that can sign with this key — Azure: a second App
+     Registration, its own client ID and secret, granted the same Key Vault Crypto User role on
+     this vault
+   - and a written break-glass procedure for regaining administrative access to the subscription
+     or account itself
    Then **use** the second principal to sign, from a machine that has never held the first one's
    credentials. **[record]** that it worked, and the date.
    A recovery path that has been designed but not exercised is not a recovery path. This is the
@@ -168,9 +194,10 @@ not say where its key lives, and that placement is the entire security property.
 
 ## The register
 
-One document, stored outside the AWS account, holding for each key: the ARN, the public key, the
-derived address, the date, who was present, the policy summary, the test signature, and the date
-recovery was last exercised.
+One document, stored outside the cloud account or subscription the key lives in, holding for each
+key: the key identifier (Azure: vault URL, name and version; AWS: the ARN), the public key, the
+derived address, the date, who was present, the role or policy summary, the test signature, and the
+date recovery was last exercised.
 
 **"Who was present" is not optional when the answer is "nobody".** Write the operator's name and
 `no witness — sole operator, G3 open`. A record with one name in it and no explanation reads, later,
