@@ -32,6 +32,15 @@ fn default_metrics_addr() -> String {
     "0.0.0.0:9101".to_string()
 }
 
+/// "env" -- `EnvKeySigner` off `mint_authority_secret`, exactly as before. This is what every CI
+/// run uses, since CI has no live KMS to call and never will. "azure_kms" switches to
+/// `AzureKmsSigner` off the `azure_*` fields below and refuses to start if a plaintext secret is
+/// still present -- readiness A1. Nothing sets this in `test.yml`, so CI is unaffected by its
+/// existence.
+fn default_signer_kind() -> String {
+    "env".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub http_addr: String,
@@ -51,7 +60,30 @@ pub struct AppConfig {
     #[serde(default = "default_max_node_lag_blocks")]
     pub max_node_lag_blocks: u64,
     pub chain_id: u64,
+    /// Which `ChainSigner` to construct — see `default_signer_kind` above.
+    #[serde(default = "default_signer_kind")]
+    pub signer_kind: String,
+    /// Required only when `signer_kind = "env"` (the default). Must be EMPTY when
+    /// `signer_kind = "azure_kms"` — `load()` panics otherwise, deliberately: a plaintext mint
+    /// key must not sit in `.env` once KMS custody is live.
+    #[serde(default)]
     pub mint_authority_secret: String,
+    /// The six below are required only when `signer_kind = "azure_kms"`, and ignored otherwise.
+    /// See `crates/clutch-chain/src/azure_kms_signer.rs` for what each becomes.
+    #[serde(default)]
+    pub azure_tenant_id: String,
+    #[serde(default)]
+    pub azure_client_id: String,
+    #[serde(default)]
+    pub azure_client_secret: String,
+    /// e.g. `https://clutch-mint-vault-1.vault.azure.net` — no trailing slash.
+    #[serde(default)]
+    pub azure_vault_url: String,
+    #[serde(default)]
+    pub azure_key_name: String,
+    /// Pinned, never "current" — see azure_kms_signer.rs on why floating to latest is refused.
+    #[serde(default)]
+    pub azure_key_version: String,
     /// Addresses whose approval signatures this service will accept and relay, comma-separated.
     ///
     /// Verification convenience only: the node is authoritative and re-checks every signature
@@ -155,7 +187,6 @@ impl AppConfig {
             .try_deserialize()?;
         // Secrets are env-only; fail loudly, never run half-configured (spec §5).
         for (name, v) in [
-            ("APP_MINT_AUTHORITY_SECRET", &cfg.mint_authority_secret),
             ("APP_INITIATOR_TOKEN", &cfg.initiator_token),
             ("APP_APPROVER_TOKEN", &cfg.approver_token),
             ("APP_READONLY_TOKEN", &cfg.readonly_token),
@@ -163,6 +194,45 @@ impl AppConfig {
             if v.trim().is_empty() {
                 panic!("{name} is empty — set it in the environment (.env), never in TOML");
             }
+        }
+        // Which signer gets built, and the one check that makes readiness A1 a real property
+        // rather than a suggestion: once a deployment declares azure_kms, it is refused outright
+        // if the old plaintext secret is still sitting in .env, rather than silently ignoring it.
+        match cfg.signer_kind.as_str() {
+            "env" => {
+                if cfg.mint_authority_secret.trim().is_empty() {
+                    panic!(
+                        "APP_MINT_AUTHORITY_SECRET is empty — set it in the environment (.env), \
+                         never in TOML. (signer_kind=env, the default — set APP_SIGNER_KIND=azure_kms \
+                         to use KMS custody instead.)"
+                    );
+                }
+            }
+            "azure_kms" => {
+                for (name, v) in [
+                    ("APP_AZURE_TENANT_ID", &cfg.azure_tenant_id),
+                    ("APP_AZURE_CLIENT_ID", &cfg.azure_client_id),
+                    ("APP_AZURE_CLIENT_SECRET", &cfg.azure_client_secret),
+                    ("APP_AZURE_VAULT_URL", &cfg.azure_vault_url),
+                    ("APP_AZURE_KEY_NAME", &cfg.azure_key_name),
+                    ("APP_AZURE_KEY_VERSION", &cfg.azure_key_version),
+                ] {
+                    if v.trim().is_empty() {
+                        panic!("{name} is empty — required when APP_SIGNER_KIND=azure_kms");
+                    }
+                }
+                if !cfg.mint_authority_secret.trim().is_empty() {
+                    panic!(
+                        "APP_MINT_AUTHORITY_SECRET is set but APP_SIGNER_KIND=azure_kms — remove \
+                         it from .env. A plaintext mint key must not remain on the host once KMS \
+                         custody is live (readiness A1); this refusal is what makes that true \
+                         rather than merely intended."
+                    );
+                }
+            }
+            other => panic!(
+                "APP_SIGNER_KIND must be \"env\" or \"azure_kms\", got \"{other}\""
+            ),
         }
         // The TronGrid key is deliberately NOT in the list above. TronGrid serves the endpoints
         // this service reads without any key, just at a lower rate limit — so demanding one makes

@@ -159,8 +159,45 @@ async fn main() {
     // Serial single worker: node enforces one tx per sender per block, so one mint per
     // block cadence is the ceiling anyway — fine at pilot volume.
     // ponytail: batch Mint tx submission if volume ever demands more than one per block.
-    let signer = clutch_chain::signer::EnvKeySigner::from_secret_hex(&config.mint_authority_secret)
-        .expect("mint authority secret must decode to a valid secp256k1 key");
+    //
+    // Boxed as the trait object drain_once already expects (&dyn ChainSigner), so this is the
+    // only place a deployment's choice of signer_kind matters — everything downstream is
+    // unchanged either way. configuration.rs's load() already refused to reach here on a
+    // misconfigured combination (missing Azure fields, or a plaintext secret left in .env
+    // alongside azure_kms), so both arms below can assume their own inputs are present and valid.
+    let signer: Box<dyn clutch_chain::signer::ChainSigner> = match config.signer_kind.as_str() {
+        "azure_kms" => {
+            tracing::info!(
+                "mint authority: Azure Key Vault ({}/{}) — readiness A1",
+                config.azure_vault_url, config.azure_key_name
+            );
+            Box::new(
+                clutch_chain::azure_kms_signer::AzureKmsSigner::new(
+                    config.azure_tenant_id.clone(),
+                    config.azure_client_id.clone(),
+                    config.azure_client_secret.clone(),
+                    config.azure_vault_url.clone(),
+                    config.azure_key_name.clone(),
+                    config.azure_key_version.clone(),
+                )
+                .await
+                .expect(
+                    "AzureKmsSigner::new failed — check the vault URL, key name/version, and that \
+                     this app registration has been granted Key Vault Crypto User on the vault",
+                ),
+            )
+        }
+        _ => {
+            tracing::warn!(
+                "mint authority: plaintext env secret (APP_MINT_AUTHORITY_SECRET) — set \
+                 APP_SIGNER_KIND=azure_kms before this handles real money (readiness A1)"
+            );
+            Box::new(
+                clutch_chain::signer::EnvKeySigner::from_secret_hex(&config.mint_authority_secret)
+                    .expect("mint authority secret must decode to a valid secp256k1 key"),
+            )
+        }
+    };
 
     // Does the chain agree that we are the mint authority?
     //
