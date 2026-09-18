@@ -569,13 +569,19 @@ where one `tx_fee` differs and on the testnet config under `MAINNET=1`.
 | `faucet_allocation` | **0** | Enforced by `MAINNET=1 check-genesis.sh`. |
 | `ride_auto_release_secs` | **7200** | Enforced by `MAINNET=1 check-genesis.sh`. The testnet's 300 is a development value. |
 | `mint_cosigners` / `mint_threshold` | **unset**, per A1 | Single-signer. Both are `#[serde(default)]`; empty cosigners with `effective_mint_threshold()` returning `mint_threshold.max(1)` encodes byte-identically to a genesis from before the fields existed. |
+| `faucet_address` | **`0x0000000000000000000000000000000000000000`**, 2026-09-19 | Inert by construction: `initial_supply` is `if is_testnet { faucet_allocation } else { 0 }`, so a mainnet genesis credits it nothing whatever the allocation says. Chosen over carrying the testnet's `0x88f9c89f…` across, which is an address somebody holds the key to. The zero address is nobody's key and cannot later be mistaken for a real account. `check-genesis.sh` compares it across nodes and nothing validates its form — the node's own fixtures already use it. |
+
+All three defaulted genesis fields — `mint_cosigners`, `mint_threshold` and
+`ride_auto_release_secs` — are compared across nodes by `check-genesis.sh`'s `OPTIONAL_GENESIS_FIELDS`,
+which matters because `ride_auto_release_secs > 0` changes the `ChainInit` RLP from 8 items to 11.
+A node that omits it and one that sets it are two different chains, and the omission is the kind a
+plain "is the field present" check cannot see.
 
 **Still open:**
 
 | Value | Blocked on |
 |---|---|
-| `mint_authority` | **A3, the key ceremony.** It must be the KMS key's address and that key does not exist yet. This is the one value that stops a mainnet genesis being written today. |
-| `faucet_address` | Nothing but a decision. Inert once the allocation is zero, but still a committed field, so pick deliberately rather than carrying the testnet's over. |
+| `mint_authority` | **A3, the key ceremony.** The key now exists — `clutch-mint-vault-1`, key `clutch-mint-key-1`, EC / P-256K, ops `sign` and `verify` only, created 2026-09-19 (step 1 done, step 2 satisfied by the vault's IAM). What remains is step 3, deriving its address, which `ceremony-check jwk` does from the public coordinates. This is the last value blocking a mainnet genesis. |
 | `authorities` | C2 is decided (stage host), but the mainnet validator keys do not exist. They must NOT be the testnet keys, which are committed to this repo and therefore public. Generate them on the host and supply them as `APP_AUTHOR_SECRET_KEY`; `clutch-node` reads `Environment::with_prefix("APP")`, so the secret never needs to enter a committed file. |
 
 **Verification:** the mainnet genesis parameters recorded here, `MAINNET=1 check-genesis.sh` passing
