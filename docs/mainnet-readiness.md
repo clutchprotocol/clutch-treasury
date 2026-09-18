@@ -572,11 +572,29 @@ where one `tx_fee` differs and on the testnet config under `MAINNET=1`.
 against them, every node reporting the same genesis hash after first boot, and a node configured
 with a nonzero faucet allocation refusing to start.
 
-### C2. Validator set — **Blocker**
+### C2. Validator set — **Open by choice, 2026-09-18**
 
 Aura is an authority round-robin, so the validator set is permissioned by construction. Stage runs
 three authorities that are three containers in one compose project on one VPS. That is a single
 point of failure and a single point of control.
+
+**Decided 2026-09-18: mainnet launches on that same single VPS.** The maintainer cannot fund
+independent servers before the project has income, and moving validators later is real, ordinary
+operational work — see C3 — not a new genesis. So the plan is to launch centralized and
+decentralize once there is income to do it properly, rather than wait with nothing running.
+
+**What this costs, stated plainly, the same shape as G3 and A1.** Three authorities on one machine
+are three-of-three on paper and one-of-one in practice: if that VPS goes down or is compromised,
+mainnet halts or is controlled by whoever holds it, at the same moment testnet does. This is
+readiness item **G2** ("consensus, custody, and both databases share one host") applied to mainnet
+specifically, not a new risk. The two chains cannot cross-contaminate by accident — different
+`chain_id`, and a node refuses to peer on a genesis hash mismatch — but they do share the one
+host's uptime, resources, and blast radius.
+
+**Before moving validators for real, rehearse it once — C3, on a throwaway network, not on stage.**
+`clutch-deploy/docs/AUTHORITY-ROTATION.md` has the steps. Rehearsing it while nothing of value is
+running is what makes the real move — whenever income allows the real hardware — a known
+operation instead of a first attempt.
 
 Two couplings found while reviewing this on 2026-09-11, neither of them documented anywhere before:
 
