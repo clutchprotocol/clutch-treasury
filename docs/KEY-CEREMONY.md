@@ -26,53 +26,46 @@ rather than a house fire.
 
 ## Which keys
 
-`keys.md` requires three roles, none interchangeable. The mint role is now **three keys, not one**
-— see the next section.
+`keys.md` requires three roles, none interchangeable. The mint role is **one key** — see the next
+section, and note that an earlier version of this document said three.
 
 | Key | State today | Ceremony needed |
 |---|---|---|
-| **Mint**, x3 | Environment variable (`EnvKeySigner`), single | Yes — these first. Together they are the only thing that can create CLT. |
+| **Mint** | Environment variable (`EnvKeySigner`) | Yes — this one first. It is the only thing that can create CLT. |
 | **Payout initiation** | Derived from the deposit mnemonic at `m/44'/195'/0'/2/0`, held by `tron-signer` | Yes, after the mint keys. Bounded by the float balance and a per-transaction cap, which is why it is second rather than first. |
 | **Reserve custody** | Does not exist in this stack, deliberately — nothing here can spend `APP_TREASURY_ADDRESS` | No KMS ceremony. It is a wallet a human holds, and what it needs is the two-person top-up procedure in A4, not this. |
 
-Do the mint keys end to end, including the recovery test, before starting the payout key. Two
+Do the mint key end to end, including the recovery test, before starting the payout key. Two
 ceremonies on one afternoon is how a step gets skipped on the second.
 
-## The mint role is a 2-of-3
+## The mint role is a single key
 
-Decided 2026-09-12. The chain has supported M-of-N minting since 2026-09-11, and the configuration
-chosen is **three authorities, any two of which must sign**. `mint_cosigners` and `mint_threshold`
-are committed into the genesis hash, so this is settled before the mainnet chain boots and cannot
-be changed afterwards without a new chain.
+**Decided 2026-09-18, readiness item A1.** An earlier plan was 2-of-3, and the chain does support
+M-of-N. It is not what launches, because a real 2-of-3 needs the keys in separate places with
+separate credentials, and funding a second cloud account is not possible before the project earns
+anything. Three keys in one account is a 2-of-3 on paper and a 1-of-1 in practice.
 
-What that buys, precisely: a single compromised key mints nothing. The attacker needs two, and the
-whole point of the placement below is that no single breach yields two.
+**There is no upgrade path from one key to two on a live chain.** `mint_authority`,
+`mint_cosigners` and `mint_threshold` are all committed into the genesis hash. Adding a cosigner
+later is a new chain, not a configuration change. So this is not "start simple and harden later" —
+it is launching once with one key, and starting over from block zero if that ever changes.
 
-**Put the three keys in three different places.** Three keys in one cloud account is a 2-of-3 on
-paper and a 1-of-1 in practice, because one compromised account holds all of them.
+**What that costs, stated plainly:** whoever holds this key can mint CLT. There is no second
+signature to stop them, and nothing else in the stack can. The mitigations that do exist are
+elsewhere and are real but narrower: the four-eyes mint ledger, the mint caps, and the breaker.
 
-| Key | Where | Why there |
-|---|---|---|
-| **A**, the submitter | Cloud KMS, the account `treasury-service` can reach | This is the one that signs the transaction envelope and needs to be callable by the running service. |
-| **B** | A *different* provider or a different account with separate credentials | An attacker who takes the service's cloud account still has one key, not two. |
-| **C**, the cold spare | Offline: paper or a hardware device in a safe, never on a networked machine | Not for routine minting. It exists so that losing A or B loses availability rather than the chain, since any two of three can still sign. |
-
-Routine minting is therefore A plus B. C is the recovery path.
-
-**A note on what this is and is not.** If one person holds all three, this is multi-*place*
-control: an attacker must breach two separate stores rather than read one file, which is a real
-and worthwhile gain. It is not multi-*person* control, and a compromised operator still mints.
-That is readiness item G3.
+**For the genesis (C1), that means:** set `mint_authority` to this key's address, and leave
+`mint_cosigners` and `mint_threshold` unset. Both are `#[serde(default)]`, empty cosigners is
+single-signer, and `effective_mint_threshold()` returns `mint_threshold.max(1)` so `0` and `1` both
+mean one signature. A genesis that omits them encodes byte-identically to one from before the
+fields existed.
 
 **G3 is open by choice.** The maintainer decided on 2026-09-18 to launch without a second operator,
 so this ceremony is written for one person. The two-person steps below have been *replaced*, not
-deleted — the section after next says with what, and what has no replacement. If a second human ever
-holds one of these keys, give them **B** and restore the witness steps at the same time.
+deleted — the next section says with what, and what has no replacement.
 
-**Generate and test all three before the genesis.** Each key's address goes into the genesis
-configuration, and a wrong or missing address there cannot be corrected later. Run the
-`check_authorisation` path against a throwaway chain with the three real addresses before
-committing the mainnet genesis.
+**Test the key before the genesis.** Its address goes into the genesis configuration, and a wrong
+address there cannot be corrected later. Steps 3 and 4 are what prove it.
 
 ## Doing this alone
 
@@ -101,9 +94,15 @@ alone makes that more likely, not less.
 
 ## Before the day
 
-- [ ] A cloud subscription or account that is **not** the one running anything else, so a
-      compromise of the application's credentials is not a compromise of the signer. (Azure: a
-      separate subscription and resource group. AWS: a separate account.)
+- [ ] A vault with **purge protection on**, in its own resource group. A separate *subscription*
+      would be better — a compromise of the application's credentials would then not be a
+      compromise of the signer — but that is not what exists, and A1 records the decision to launch
+      without one. Know which of the two you have before you start, because it changes what a
+      breach of the application account costs you.
+- [ ] **A second App Registration** in the same tenant, with its own client ID and secret. Step 5
+      needs it and it is the step that actually closes A3. App Registrations are free, so this one
+      is not blocked by the cost constraint above — if step 5 gets skipped, it will be for the
+      usual reason instead, which is that it is last.
 - [ ] **"Doing this alone" above, read before you start.** There is no second person by decision,
       not by accident, so the independent checks in steps 1 and 3 are done differently rather than
       skipped. Skipping them is not what "doing this alone" means.
@@ -118,11 +117,9 @@ alone makes that more likely, not less.
 Record every value marked **[record]** as you go, in the register described below. Do not
 reconstruct it afterwards from memory or from the console.
 
-**Run steps 1 to 4 three times, once per mint key, in the three locations named above.** Finish
-each key completely, including the recovery test, before starting the next. Batching the three
-creations and then doing three recovery tests at the end is how the third recovery test does not
-happen. Record which of A, B or C each register entry is for, because an address on its own does
-not say where its key lives, and that placement is the entire security property.
+**Steps 1 to 6, once, for the mint key.** Finish it completely, including the recovery test in
+step 5, before starting the payout key's ceremony. Step 6 is the only irreversible step and is
+deliberately last.
 
 1. **Create the key — generated inside the vault, never imported.** Importing means the private
    key existed somewhere else at some point, which is exactly what this exists to avoid.
@@ -198,6 +195,10 @@ One document, stored outside the cloud account or subscription the key lives in,
 key: the key identifier (Azure: vault URL, name and version; AWS: the ARN), the public key, the
 derived address, the date, who was present, the role or policy summary, the test signature, and the
 date recovery was last exercised.
+
+For the mint key there is exactly one such entry, because the mint role is one key. Write down that
+this is by decision (A1) and not an unfinished list, for the same reason the witness line says
+"nobody" rather than being left blank.
 
 **"Who was present" is not optional when the answer is "nobody".** Write the operator's name and
 `no witness — sole operator, G3 open`. A record with one name in it and no explanation reads, later,

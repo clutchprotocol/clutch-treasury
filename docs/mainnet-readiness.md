@@ -559,14 +559,24 @@ where one `tx_fee` differs and on the testnet config under `MAINNET=1`.
 
 **What is still needed, and each is a decision rather than a task:**
 
-| Value | Who decides, and on what |
+| Value | Decided | Note |
+|---|---|---|
+| `chain_id` | **1000**, 2026-09-19 | Not 2077, and not one digit from it — a near-miss id would let a typo produce testnet config silently. |
+| `tx_fee` | **1000** (unchanged), 2026-09-19 | About $0.001 per transaction, paid to validators. Kept because it has run on the testnet; changing it later is a new chain. |
+| `ride_request_referrer_fee_bps` | **200** (unchanged), 2026-09-19 | |
+| `ride_offer_referrer_fee_bps` | **200** (unchanged), 2026-09-19 | |
+| `is_testnet` | **false** | Enforced by `MAINNET=1 check-genesis.sh`. |
+| `faucet_allocation` | **0** | Enforced by `MAINNET=1 check-genesis.sh`. |
+| `ride_auto_release_secs` | **7200** | Enforced by `MAINNET=1 check-genesis.sh`. The testnet's 300 is a development value. |
+| `mint_cosigners` / `mint_threshold` | **unset**, per A1 | Single-signer. Both are `#[serde(default)]`; empty cosigners with `effective_mint_threshold()` returning `mint_threshold.max(1)` encodes byte-identically to a genesis from before the fields existed. |
+
+**Still open:**
+
+| Value | Blocked on |
 |---|---|
-| `chain_id` | Yours. Any value that is not 2077 and not another live chain's. |
-| `mint_authority` | Blocked on A1 — it must be the KMS key's address, so this cannot be filled before that key exists. |
-| `tx_fee` | Currently 1,000 CLT ($0.001). Validator compensation, so it depends on what running an authority costs. |
-| Referrer bps | Currently 200 + 200. An economic choice about app-builder incentive, not a safety one. |
-| `faucet_address` | Inert once the allocation is zero, but it stays a committed field, so pick something deliberately rather than carrying the testnet's over. |
-| `authorities` | Blocked on C2 — the mainnet set, whose size also picks the block cadence at `60 / len`. |
+| `mint_authority` | **A3, the key ceremony.** It must be the KMS key's address and that key does not exist yet. This is the one value that stops a mainnet genesis being written today. |
+| `faucet_address` | Nothing but a decision. Inert once the allocation is zero, but still a committed field, so pick deliberately rather than carrying the testnet's over. |
+| `authorities` | C2 is decided (stage host), but the mainnet validator keys do not exist. They must NOT be the testnet keys, which are committed to this repo and therefore public. Generate them on the host and supply them as `APP_AUTHOR_SECRET_KEY`; `clutch-node` reads `Environment::with_prefix("APP")`, so the secret never needs to enter a committed file. |
 
 **Verification:** the mainnet genesis parameters recorded here, `MAINNET=1 check-genesis.sh` passing
 against them, every node reporting the same genesis hash after first boot, and a node configured
