@@ -85,24 +85,18 @@ recorded in its own section.
 
 **Then the chain of things that unblock each other.**
 
-4. **Provision key custody for the three mint keys** (A, B and C — see 12b and
-   `docs/KEY-CEREMONY.md`). AWS is declined as a provider (maintainer, 2026-09-11), so the
-   requirement is stated by property rather than by vendor: a key that signs **secp256k1**, whose
-   material cannot be exported, and whose deletion is not grantable to the principal that signs
-   with it.
+4. ~~Provision key custody for the three mint keys.~~ **Done 2026-09-18 for the mint authority,
+   as one key rather than three.** AWS was declined as a provider (maintainer, 2026-09-11); Azure
+   Key Vault was chosen instead of waiting for a second account, per A1 above. Curve `P-256K`,
+   `exportable: false`, confirmed two ways, not one.
 
-   Options that meet it, cheapest first. Azure Key Vault software-protected keys use curve
-   `P-256K` with algorithm `ES256K`, no per-key monthly charge and transaction-priced. Google Cloud
-   KMS software keys use `EC_SIGN_SECP256K1_SHA256` at roughly $0.06 per key per month. Verify
-   curve support and pricing before committing; both were quoted from memory. A self-hosted signer
-   on a host that is not the application host is the no-vendor option — weaker, since it does not
-   give non-exportability, but it still means compromising the web stack does not yield the key.
+   **Still open: the payout signer (A2).** Same plumbing (`AzureKmsSigner`, already written) would
+   cover it, but it has not been provisioned — `tron-signer` still holds the payout key derived
+   from the deposit mnemonic as a plain environment variable. A second vault, or a second key in
+   the same vault, and the same ceremony, close it whenever it is prioritised.
 
-   Key C is offline and needs no provider at all.
-
-   This unblocks the signer API call (A1, A2), which unblocks the key ceremony (A3 — it needs two
-   people, so it also needs step 3), which unblocks the mainnet genesis (C1), and it is what
-   finally closes D2 by taking the mnemonic out of `.env` entirely.
+   This closing A1 is also most of what closes D2: the mint secret is what has left `.env` so far.
+   The deposit mnemonic, which D2 also names, stays until A2 is done.
 
    `external_signature.rs` is deliberately vendor-neutral: it turns a DER `(r, s)` from any
    external signer into the `(r, s, v)` the node needs, so only the API call itself changes with
@@ -164,12 +158,15 @@ API call, a dispute mechanism — that is named in its own section along with wh
 
 The named blocker, already tracked in [`keys.md`](keys.md).
 
-### A1. Mint authority custody — **Blocker** (M-of-N shipped 2026-09-11; KMS hard half done)
+### A1. Mint authority custody — **Closed 2026-09-18, single-key** (M-of-N shipped 2026-09-11)
 
-The mint authority is an environment variable (`ChainSigner` / `EnvKeySigner`,
-`crates/clutch-chain/src/signer.rs`). It is the only key that can create CLT, so a host compromise
-is unbounded issuance against a fixed reserve. `keys.md` names the replacement: a `KmsSigner` on
-AWS KMS `ECC_SECG_P256K1`, following the `alloy-signer-aws` pattern.
+The mint authority was an environment variable (`ChainSigner` / `EnvKeySigner`,
+`crates/clutch-chain/src/signer.rs`). It was the only key that could create CLT, so a host
+compromise was unbounded issuance against a fixed reserve. `keys.md` named the replacement: a
+`KmsSigner`, originally scoped against AWS KMS `ECC_SECG_P256K1` following the `alloy-signer-aws`
+pattern — before AWS was declined as a provider (2026-09-11) and Azure Key Vault chosen instead
+(2026-09-18). The design below predates that choice and is written AWS-first because it was; the
+code that actually shipped is Azure's, in `crates/clutch-chain/src/azure_kms_signer.rs`.
 
 **The part that was hard is now done and verified**: `crates/clutch-chain/src/external_signature.rs`,
 eight tests, no AWS dependency. An external signer returns a DER `(r, s)` and nothing else, while
@@ -211,6 +208,13 @@ signatures from distinct other members. Design:
   nothing. Migration 0013 enforces one signature per signer per intent by primary key, the same rule
   the node enforces, in both places.
 
+**Superseded for this launch, 2026-09-18 — see the decision below.** The design in this
+subsection is what a 2-of-3 mint authority looks like, and it is still the reference for anyone
+who later adds a second or third key. It is not what shipped. What shipped is a single key,
+because a second Azure account needs a card the maintainer does not want to commit before the
+project earns anything — and because, for a decision this permanent, waiting until it can be done
+properly beats doing it wrong now. See below the table.
+
 **Decided 2026-09-12: a 2-of-3.** Three authorities, any two of which must sign. Recorded in
 `docs/KEY-CEREMONY.md`, which now runs three times rather than once.
 
@@ -225,46 +229,68 @@ on paper and a 1-of-1 in practice:
 
 Routine minting is A plus B. C is the recovery path.
 
-**Still open:** generating the three keys, which happens in the ceremony and needs two people, so
-it depends on G3. Each address goes into the genesis configuration and cannot be corrected
-afterwards, so all three must exist and be tested against a throwaway chain before the mainnet
-genesis is committed.
+**One honest limit, true of the 2-of-3 design above and even more true of what actually shipped.**
+Three keys in three places is multi-*place* control, not multi-*person*: an attacker must breach
+two separate stores rather than read one file, which is real, but a compromised operator still
+mints. With a single key, there is no multi-place protection either — this is architecturally the
+same shape of risk as G3, one level down: not a compromised operator, but a compromised custody
+path. Both stay open by the same choice, for the same reason: made deliberately, not by accident,
+and written down rather than left implicit.
 
-One honest limit. If one person holds all three, this is multi-*place* control, not
-multi-*person*: an attacker must breach two separate stores rather than read one file, which is
-real, but a compromised operator still mints. G3 and the public disclosure stay necessary until a
-second human holds one of these keys — and when one does, it should be B.
+## The decision, and what actually exists
 
-The strongest test is the equivalence — same key, same transaction hash, byte-identical `r`, `s`
-and `v` to the in-process signer — plus a high-s input constructed as `n - s`, because KMS makes no
-low-s promise and normalising flips which recovery id is correct.
+**A single key, chosen 2026-09-18.** The maintainer cannot fund a second Azure account before the
+project has income, and `mint_authority` is genesis-committed — see
+`clutch-deploy/docs/AUTHORITY-ROTATION.md`: *"The mint authority... IS genesis-committed, so
+rotating it is a new genesis, not a restart."* There is no upgrade path from one key to two on a
+live chain; there is only launching once with what exists, or launching again from zero. Given
+that, launching with one key now and adding a second and third later — on a **new** chain, if that
+is ever worth doing — is the honest description. It is not "start simple, harden later" on the
+same chain, because that option does not exist.
 
-**What remains is the API call, and only that.** `KMS_SIGNER_SHAPE` in that file documents it beside
-the code it depends on, including the detail most likely to be got wrong: `MessageType` must be
-`DIGEST`, not `RAW`, or KMS hashes the digest again and signs the wrong preimage. It cannot be
-written here because there is no KMS to call, and an unexercised AWS code path in the mint flow is
-worse than an absent one.
+**Azure Key Vault, not AWS.** `crates/clutch-chain/src/azure_kms_signer.rs` (merged
+[#30](https://github.com/clutchprotocol/clutch-treasury/pull/30)) is the real, shipped
+`KmsSigner` — not `KMS_SIGNER_SHAPE`'s AWS pseudocode, which remains in `external_signature.rs` as
+a shape reference for whoever eventually builds the AWS one, if that ever happens.
+`recoverable_from_compact` sits beside `recoverable_from_der` in the same file for the same reason:
+Azure's `sign` operation returns raw `(r, s)`, not DER.
 
-**Verification:** signing through a `KmsSigner` in the mainnet configuration, key material that has
-never existed outside KMS, and `EnvKeySigner` unreachable in that configuration — a config that
-would select it refuses to boot.
+**A real key exists, ceremonied solo per `docs/KEY-CEREMONY.md`'s "Doing this alone" section.**
+`mint-key-a`, EC, curve P-256K, `exportable: false`, in `clutch-mint-vault-1`. Its signing
+principal holds only **Key Vault Crypto User** on that vault — confirmed both from the Azure
+portal and independently via `az keyvault key show`, per the ceremony's own rule against checking
+a value only one way. Step 5, tested recovery, passed twice against two separate App
+Registrations, each producing a signature that correctly recovered to the key's own derived
+address, `0x382d2f744ecefd536ce1cf4aeaeb36434d329dde` — this becomes mainnet `mint_authority` in
+C1.
 
-**Needed from the operator before that can be built:** an AWS account, a key created with
-`KeySpec = ECC_SECG_P256K1` and `KeyUsage = SIGN_VERIFY`, and a key policy that does **not** grant
-`kms:ScheduleKeyDeletion` to the signing principal.
+**Verification, met:** signing through `AzureKmsSigner`, key material that has never existed
+outside the vault (`exportable: false`, checked, not assumed), and `EnvKeySigner` refused at
+startup when `APP_SIGNER_KIND=azure_kms` is set and `APP_MINT_AUTHORITY_SECRET` is not
+empty — a real `panic!` in `configuration.rs`
+([#32](https://github.com/clutchprotocol/clutch-treasury/pull/32)), not a documented intention.
 
-**A real key is unavoidable — the emulator route is closed.** Checked on 2026-09-11: LocalStack's
-KMS cannot create an `ECC_SECG_P256K1` key at all. `CreateKey` fails with
+**Not yet done:** wiring this into the actual mainnet node configs. `mint_authority` above is a
+genesis parameter (C1), and mainnet's node configs do not exist yet — this happens at the
+runbook's later step, against the real genesis, not against testnet's already-running one.
+
+**The AWS emulator finding below is kept as history.** It was true for AWS and is not why Azure
+was chosen — that was the maintainer's own account access, not a technical finding about either
+provider.
+
+**A real key is unavoidable for AWS specifically — the emulator route is closed there.** Checked on
+2026-09-11: LocalStack's KMS cannot create an `ECC_SECG_P256K1` key at all. `CreateKey` fails with
 `Failed to generate key material: Curve not supported: secp256k1`
 ([localstack#11678](https://github.com/localstack/localstack/issues/11678)), and a related report
 shows its `Sign` and `GetPublicKey` returning values that do not match for that curve even with
-custom key material. So there is no way to exercise the AWS integration in CI, and writing it
+custom key material. So there is no way to exercise an AWS integration in CI, and writing one
 against an emulator would in any case prove the wrong thing: an emulator-verified signer in the
 mint path is precisely the false confidence this whole module was factored to avoid.
 
-Recorded so nobody spends a day rediscovering it. The pure logic in
-`external_signature.rs` is the answer to that constraint — it is the part that *can* be tested
-without AWS, and it is tested.
+Recorded so nobody spends a day rediscovering it. The pure logic in `external_signature.rs` is the
+answer to that constraint regardless of provider — it is the part that *can* be tested without a
+real cloud account, and it is tested; `azure_kms_signer.rs`'s own tests are wiremock-only for the
+same reason, and were checked against the real vault by hand, once, tonight, rather than in CI.
 
 ### A2. KMS-backed payout signer — **Blocker** (same plumbing applies)
 
@@ -1680,7 +1706,8 @@ that were designed for this and appear sound:
 
 1. **What does mainnet mean here** — a persistent public testnet that stops being reset, a bounded
    pilot in one city with low caps, or a public launch? The blockers differ enormously.
-2. **Who is the second operator?** G3 cannot be closed alone.
+2. ~~Who is the second operator?~~ **Answered 2026-09-18: there is none, by choice.** G3 stays
+   open — see the note under it and under A1's single-key decision, both dated the same day.
 3. **Which jurisdiction** is the operating one, for J1.
 4. **Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
    points at something else? F1 depends entirely on the answer.
