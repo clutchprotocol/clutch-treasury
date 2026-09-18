@@ -15,6 +15,10 @@
 //!                 confirms the signature recovers to that same address. Needs the client secret,
 //!                 so it must run where that secret is allowed to exist.
 //!
+//!   validator-keys <n> <file>
+//!                 Fresh authority keypairs for a new chain. Addresses to stdout, secrets to the
+//!                 file — a caller that logs stdout leaks nothing.
+//!
 //! Run `jwk` first and `azure` second, then check that the two addresses match. They come from
 //! different inputs -- one from coordinates you read out of the portal, one from what the vault
 //! serves the service -- so agreement means the thing you wrote down is the thing that will sign.
@@ -96,10 +100,19 @@ async fn main() {
 
         "azure" => run_azure().await,
 
+        "validator-keys" => match (args.get(2), args.get(3)) {
+            (Some(n), Some(out)) => n
+                .parse::<usize>()
+                .map_err(|_| format!("'{n}' is not a count"))
+                .and_then(|n| validator_keys(n, out)),
+            _ => Err("usage: ceremony-check validator-keys <count> <secrets-file>".to_string()),
+        },
+
         _ => Err(concat!(
             "usage:\n",
-            "  ceremony-check jwk <x> <y>   address from the public coordinates (no secret)\n",
-            "  ceremony-check azure         address + test signature via the real signer\n",
+            "  ceremony-check jwk <x> <y>                    address from public coordinates\n",
+            "  ceremony-check azure                          address + test signature via the signer\n",
+            "  ceremony-check validator-keys <n> <out-file>  fresh authority keypairs\n",
             "\n",
             "azure mode reads AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,\n",
             "AZURE_VAULT_URL, AZURE_KEY_NAME, AZURE_KEY_VERSION."
@@ -111,6 +124,54 @@ async fn main() {
         eprintln!("FAILED: {e}");
         std::process::exit(1);
     }
+}
+
+/// Fresh authority keypairs for a new chain.
+///
+/// The addresses go to stdout and the secrets go to a file, never the other way round and never
+/// both to the same place. The testnet's validator secrets are committed in `clutch-deploy` and
+/// therefore public, which is fine for a throwaway chain and unacceptable for one holding real
+/// value — so mainnet needs keys that have never been anywhere, and the generating step is the
+/// easiest place to accidentally publish them. A caller that pipes stdout to a log, or pastes it
+/// into a chat window, leaks nothing.
+fn validator_keys(count: usize, out_path: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    if count == 0 || count > 60 {
+        return Err(format!(
+            "count must be 1..=60, got {count} — 60 is the node's own authority ceiling"
+        ));
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // create_new above refuses to overwrite: silently replacing a secrets file whose keys are
+    // already in a genesis would strand the chain with authorities nobody can sign for.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut out = opts
+        .open(out_path)
+        .map_err(|e| format!("could not create {out_path}: {e}"))?;
+
+    let secp = secp256k1::Secp256k1::new();
+    let mut rng = secp256k1::rand::rngs::OsRng;
+
+    println!("=== fresh authority keypairs ===");
+    for i in 1..=count {
+        let (secret, public) = secp.generate_keypair(&mut rng);
+        let address = address_from_uncompressed(&public.serialize_uncompressed())?;
+        writeln!(out, "{i} {address} {}", hex::encode(secret.secret_bytes()))
+            .map_err(|e| format!("could not write {out_path}: {e}"))?;
+        println!("node{i}: {address}");
+    }
+    println!();
+    println!("Addresses above are public and belong in the committed `authorities` list, in this");
+    println!("order, identical in every node's config. The secrets are in {out_path} and belong");
+    println!("only in the host's .env — never in a config file, which is committed.");
+    Ok(())
 }
 
 async fn run_azure() -> Result<(), String> {
