@@ -94,8 +94,6 @@ suffixes its own name.
   [public version](https://docs.clutchprotocol.io/reference/mainnet-readiness) is published with six
   items generalised, and which six and why is recorded at the top of the canonical file.
 - [`docs/KEY-CEREMONY.md`](docs/KEY-CEREMONY.md) — generating and recovering the mint authority.
-- [`docs/AUDIT-BRIEF.md`](docs/AUDIT-BRIEF.md), [`docs/LEGAL-BRIEF.md`](docs/LEGAL-BRIEF.md) — what
-  an external reviewer would need.
 - [`docs/keys.md`](docs/keys.md) — what key exists where, and what each one can do.
 
 ## Status
