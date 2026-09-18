@@ -46,8 +46,7 @@ Any design that only adds rider protection makes the actual imbalance worse.
 **1. Who decides?**
 
 - An operator role is a trusted third party, which is the thing this architecture removed. It also
-  makes the operator liable for outcomes in a way that changes the legal picture (see
-  `docs/LEGAL-BRIEF.md`).
+  makes the operator liable for outcomes in a way that changes the legal picture.
 - A staked juror set is a second protocol: staking, selection, incentives, appeals, and a token to
   stake. CLT is fully reserved and non-speculative, so staking it means locking backed value in a
   bond — not obviously acceptable.

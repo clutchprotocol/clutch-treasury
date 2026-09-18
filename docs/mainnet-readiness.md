@@ -12,7 +12,7 @@ its own. It lives here because this is the repo that holds funds.
 A public version is published at
 [docs.clutchprotocol.io/reference/mainnet-readiness](https://docs.clutchprotocol.io/reference/mainnet-readiness)
 (`clutch-docs/docs/reference/mainnet-readiness.md`). It shares this structure and severities, but
-seven items are generalized or omitted there because publishing them verbatim would be targeting
+six items are generalized or omitted there because publishing them verbatim would be targeting
 information rather than honest disclosure:
 
 | Item | Why it is not public verbatim |
