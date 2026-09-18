@@ -13,6 +13,12 @@
 //! This module has no AWS dependency, on purpose. Everything difficult is here and tested against
 //! the in-process signer, so the remaining `KmsSigner` is the API call and nothing else — see
 //! `KMS_SIGNER_SHAPE` at the bottom for exactly what that call must ask for.
+//!
+//! **Not every provider answers in DER.** AWS KMS does. Azure Key Vault does not: its `sign`
+//! operation returns the raw `(r, s)` pair concatenated as 64 bytes (the JOSE/JWS convention its
+//! `ES256K` algorithm name comes from — RFC 7518 §3.4), never wrapped in a DER `SEQUENCE`. Feeding
+//! that straight into [`recoverable_from_der`] fails to parse. [`recoverable_from_compact`] is the
+//! same function with a different first step, for exactly that shape.
 
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId, Signature};
 use secp256k1::{Message, PublicKey, Secp256k1};
@@ -100,6 +106,49 @@ pub fn recoverable_from_der(
         .to_string())
 }
 
+/// The same conversion as [`recoverable_from_der`], for a signer that returns raw `(r, s)` as 64
+/// concatenated bytes instead of DER — Azure Key Vault's `sign` operation, and any other service
+/// following the JOSE/JWS ECDSA signature encoding (RFC 7518 §3.4).
+///
+/// Everything past the decode step is identical on purpose: the normalisation and the
+/// recovery-id search are the parts that are easy to get wrong, and they do not depend on which
+/// wire format the signature arrived in.
+pub fn recoverable_from_compact(
+    compact_sig: &[u8; 64],
+    digest: &[u8; 32],
+    expected_pubkey: &[u8],
+) -> Result<(String, String, u64), String> {
+    let expected = PublicKey::from_slice(expected_pubkey)
+        .map_err(|e| format!("expected_pubkey is not a valid public key: {e}"))?;
+
+    let mut sig = Signature::from_compact(compact_sig)
+        .map_err(|e| format!("signer returned invalid compact (r, s): {e}"))?;
+    sig.normalize_s();
+    let compact = sig.serialize_compact();
+
+    let msg = Message::from_digest_slice(digest).map_err(|e| e.to_string())?;
+    let secp = Secp256k1::new();
+
+    for candidate in 0..=1i32 {
+        let rec_id = RecoveryId::from_i32(candidate).map_err(|e| e.to_string())?;
+        let recoverable = RecoverableSignature::from_compact(&compact, rec_id)
+            .map_err(|e| format!("could not build a recoverable signature: {e}"))?;
+        if let Ok(recovered) = secp.recover_ecdsa(&msg, &recoverable) {
+            if recovered == expected {
+                return Ok((
+                    hex::encode(&compact[..32]),
+                    hex::encode(&compact[32..]),
+                    candidate as u64 + 27,
+                ));
+            }
+        }
+    }
+
+    Err("no recovery id recovers this signature to the expected public key — the signature is \
+         from a different key, or the digest signed was not the one supplied"
+        .to_string())
+}
+
 /// What a `KmsSigner` still has to do, kept next to the code it depends on so the two cannot
 /// drift. Not implemented here because it cannot be tested here: there is no KMS to call.
 ///
@@ -126,6 +175,21 @@ pub fn recoverable_from_der(
 ///
 /// The key must be created with KeySpec = ECC_SECG_P256K1 and KeyUsage = SIGN_VERIFY, and
 /// its policy must NOT grant kms:ScheduleKeyDeletion to the signing principal.
+/// ```
+///
+/// **Azure Key Vault differs in three ways** — see `azure_kms_signer.rs` for the implementation:
+///
+/// ```text
+/// address(): GetKey returns a JWK, not a DER SPKI. `x` and `y` are separate base64url fields,
+///            each 32 bytes for P-256K; the uncompressed point is 0x04 ++ x ++ y, no unwrapping.
+///
+/// sign_hash_hex(): the `sign` operation takes {"alg": "ES256K", "value": <base64url digest>}
+///                  and needs no MessageType-style flag — Key Vault never re-hashes what you send.
+///                  Its response is `recoverable_from_compact`, not `recoverable_from_der` — see
+///                  the module doc above.
+///
+/// The key must be created with kty = EC, crv = P-256K, and the signing principal's role must be
+/// Key Vault Crypto User — NOT Crypto Officer, which can also delete and manage keys.
 /// ```
 pub const KMS_SIGNER_SHAPE: () = ();
 
@@ -162,6 +226,28 @@ mod tests {
         let der = der_for(&secret, &digest);
 
         let (r, s, v) = recoverable_from_der(&der, &digest, &pubkey).unwrap();
+
+        let env = EnvKeySigner::from_secret_hex(SECRET).unwrap();
+        let (r_env, s_env, v_env) = env.sign_hash_hex(HASH_HEX).unwrap();
+
+        assert_eq!(r, r_env, "r must match the in-process signer");
+        assert_eq!(s, s_env, "s must match the in-process signer");
+        assert_eq!(v, v_env, "v must match the in-process signer");
+        assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");
+    }
+
+    /// Same property as the DER test above, for the wire format Azure Key Vault actually returns.
+    /// Built with `serialize_compact` instead of `serialize_der` so the only thing under test is
+    /// the decode step — everything after it is the same code path as the DER test.
+    #[test]
+    fn the_compact_path_agrees_with_the_in_process_signer() {
+        let (secret, pubkey) = keypair();
+        let digest = digest_for_hash_hex(HASH_HEX);
+        let secp = Secp256k1::new();
+        let msg = Message::from_digest_slice(&digest).unwrap();
+        let compact = secp.sign_ecdsa(&msg, &secret).serialize_compact();
+
+        let (r, s, v) = recoverable_from_compact(&compact, &digest, &pubkey).unwrap();
 
         let env = EnvKeySigner::from_secret_hex(SECRET).unwrap();
         let (r_env, s_env, v_env) = env.sign_hash_hex(HASH_HEX).unwrap();
