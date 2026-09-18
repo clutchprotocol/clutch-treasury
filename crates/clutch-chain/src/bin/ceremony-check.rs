@@ -19,7 +19,6 @@
 //! different inputs -- one from coordinates you read out of the portal, one from what the vault
 //! serves the service -- so agreement means the thing you wrote down is the thing that will sign.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use clutch_chain::external_signature::address_from_uncompressed;
 use clutch_chain::signer::ChainSigner;
@@ -32,16 +31,36 @@ fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
-/// Matches `AzureKmsSigner::fetch_public_key` exactly, including the 32-byte length check. A
-/// shorter coordinate means the key is not on a 256-bit curve, which is the P-256 vs P-256K
-/// mistake the ceremony is most concerned with.
+/// Accepts either base64 alphabet, because the two places an operator can get these from disagree:
+/// `az keyvault key show` prints STANDARD base64 (`+`, `/`, `=`), while the Key Vault REST API
+/// returns base64url (`-`, `_`) per the JWK spec — which is what `AzureKmsSigner` decodes.
+///
+/// Being lenient here is deliberate and is confined to this helper. The alternative is an operator
+/// hand-editing `+` to `-` in a value that becomes the genesis hash, and a transcription slip there
+/// cannot be corrected without a new chain. `AzureKmsSigner` stays strict: it reads one source with
+/// one encoding, so it has no such ambiguity to tolerate.
+fn decode_coord(name: &str, s: &str) -> Result<Vec<u8>, String> {
+    let normalised: String = s
+        .trim()
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(normalised)
+        .map_err(|e| format!("{name} did not decode as base64: {e}"))
+}
+
+/// Builds the point exactly as `AzureKmsSigner::fetch_public_key` does, including the 32-byte
+/// length check. A shorter coordinate means the key is not on a 256-bit curve, which is the
+/// P-256 vs P-256K mistake the ceremony is most concerned with.
 fn address_from_jwk(x_b64: &str, y_b64: &str) -> Result<String, String> {
-    let x = URL_SAFE_NO_PAD
-        .decode(x_b64.trim().trim_end_matches('='))
-        .map_err(|e| format!("x did not decode as base64url: {e}"))?;
-    let y = URL_SAFE_NO_PAD
-        .decode(y_b64.trim().trim_end_matches('='))
-        .map_err(|e| format!("y did not decode as base64url: {e}"))?;
+    let x = decode_coord("x", x_b64)?;
+    let y = decode_coord("y", y_b64)?;
     if x.len() != 32 || y.len() != 32 {
         return Err(format!(
             "expected 32-byte x and y for a P-256K key, got {} and {} bytes — wrong curve?",
@@ -126,4 +145,38 @@ async fn run_azure() -> Result<(), String> {
     println!("instead of failing. Record r, s, v and this address in the ceremony register.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A valid secp256k1 point, in the two encodings the two sources produce. The x here contains
+    // a '/' in standard base64 and a '_' in base64url, which is precisely the pair that made the
+    // first version of this tool reject what `az keyvault key show` prints.
+    const X_STD: &str = "7HlxUjXo/ZiIUv+sYMwa9ILIbGrgXxFS9IiDDGNt9zM=";
+    const Y_STD: &str = "hHLMlFOx0dfEYkR/zA7Yblt1IbrjVydJDXpTikzCOjk=";
+    const X_URL: &str = "7HlxUjXo_ZiIUv-sYMwa9ILIbGrgXxFS9IiDDGNt9zM";
+    const Y_URL: &str = "hHLMlFOx0dfEYkR_zA7Yblt1IbrjVydJDXpTikzCOjk";
+
+    #[test]
+    fn both_base64_alphabets_give_the_same_address() {
+        let from_std = address_from_jwk(X_STD, Y_STD).expect("standard base64 must decode");
+        let from_url = address_from_jwk(X_URL, Y_URL).expect("base64url must decode");
+        assert_eq!(
+            from_std, from_url,
+            "the CLI's encoding and the REST API's encoding must agree — if they ever do not, an \
+             operator reading coordinates from one source and a service reading them from the \
+             other would commit different addresses to the genesis hash"
+        );
+    }
+
+    #[test]
+    fn a_wrong_length_coordinate_is_refused() {
+        // 31 bytes: what a non-256-bit curve would give, which is the P-256K mistake arriving as
+        // a length rather than as an obviously wrong address.
+        let short = base64::engine::general_purpose::STANDARD_NO_PAD.encode([0u8; 31]);
+        let err = address_from_jwk(&short, Y_STD).expect_err("a short coordinate must be refused");
+        assert!(err.contains("wrong curve"), "{err}");
+    }
 }
