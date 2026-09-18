@@ -62,24 +62,53 @@ Routine minting is therefore A plus B. C is the recovery path.
 **A note on what this is and is not.** If one person holds all three, this is multi-*place*
 control: an attacker must breach two separate stores rather than read one file, which is a real
 and worthwhile gain. It is not multi-*person* control, and a compromised operator still mints.
-That is readiness item G3, and it stays open until a second human holds one of these keys. When
-one does, hold B.
+That is readiness item G3.
+
+**G3 is open by choice.** The maintainer decided on 2026-09-18 to launch without a second operator,
+so this ceremony is written for one person. The two-person steps below have been *replaced*, not
+deleted — the section after next says with what, and what has no replacement. If a second human ever
+holds one of these keys, give them **B** and restore the witness steps at the same time.
 
 **Generate and test all three before the genesis.** Each key's address goes into the genesis
 configuration, and a wrong or missing address there cannot be corrected later. Run the
 `check_authorisation` path against a throwaway chain with the three real addresses before
 committing the mainnet genesis.
 
+## Doing this alone
+
+A witness did two separate jobs: catching the driver's mistake, and making a false record require
+two people to agree on it. **The second job has no replacement.** The register below becomes your own
+account of what you did, and nothing outside it can corroborate that account. Write that in the
+register rather than leaving a blank where a witness name would go — a reader six months from now
+needs to know the record is single-sourced, and a blank does not tell them.
+
+The first job mostly survives, by making the second look come from a *different route* rather than a
+different person:
+
+| Where a step says "the witness confirms" | Alone, do this |
+|---|---|
+| Step 1, the key configuration | Read `KeySpec` and `KeyUsage` back with the CLI or API, **not** from the console page you created the key on. That page can show you what you typed rather than what was stored. |
+| Step 3, the derived address | Do not re-derive it by hand. Step 4 already checks it, and checks it harder: a signature that recovers to this address proves it through a different code path, which a second person re-reading the same hex string does not. |
+| Step 5, recovery | Unchanged, and now the most important step in this document. It was always about a second *identity*, never a second person. |
+
+**Read each register entry back against the account before you start the next key.** Not from memory,
+and not from the notes you have just typed — from the account itself. It costs five minutes and it is
+where a mistyped address is still cheap to find.
+
+This does not change the rule above about finishing each key end to end, including its recovery test,
+before starting the next. Deferring a recovery test is how the third one never happens, and being
+alone makes that more likely, not less.
+
 ## Before the day
 
 - [ ] An AWS account that is **not** the one running anything else, so a compromise of the
       application's credentials is not a compromise of the signer.
-- [ ] At least **two people present**, and neither of them alone able to complete the ceremony.
-      One drives, one witnesses and records. If you cannot find a second person, stop: readiness
-      item G3 is the same problem and it is not solved by proceeding.
+- [ ] **"Doing this alone" above, read before you start.** There is no second person by decision,
+      not by accident, so the independent checks in steps 1 and 3 are done differently rather than
+      skipped. Skipping them is not what "doing this alone" means.
 - [ ] CloudTrail on, in that account, with its log destination outside it. The ceremony's own
       audit trail should not be deletable by the credentials used during the ceremony.
-- [ ] This document read by both people beforehand, not during.
+- [ ] This document read in full beforehand, not during.
 
 ## The ceremony
 
@@ -95,10 +124,10 @@ not say where its key lives, and that placement is the entire security property.
 1. **Create the key.**
    `KeySpec = ECC_SECG_P256K1`, `KeyUsage = SIGN_VERIFY`, origin `AWS_KMS`.
    **[record]** the key ARN and the creation timestamp.
-   The witness reads the configuration back from the console independently — not from the driver's
-   screen — and confirms both fields. A key created as `ECC_NIST_P256` will sign happily and produce
-   signatures the node cannot verify, and the failure surfaces as a rejected mint, not as an error
-   at creation.
+   Read both fields back with the CLI or API — not from the console page you created the key on,
+   which can show you what you typed rather than what was stored. A key created as `ECC_NIST_P256`
+   will sign happily and produce signatures the node cannot verify, and the failure surfaces as a
+   rejected mint, not as an error at creation.
 
 2. **Disable deletion.** The key policy must **not** grant `kms:ScheduleKeyDeletion` to any
    principal that the application uses, and preferably to nobody. A key scheduled for deletion is a
@@ -109,7 +138,8 @@ not say where its key lives, and that placement is the entire security property.
    `GetPublicKey` → DER SPKI → the 65-byte uncompressed point →
    `clutch_chain::external_signature::address_from_uncompressed`.
    **[record]** the public key and the derived 0x address.
-   The witness derives the address independently from the same public key and confirms it matches.
+   Do not re-derive this by hand as a check — step 4 does it properly, through a different code
+   path. Do not start step 4 for a different key before finishing it for this one.
    This address becomes the mainnet `mint_authority` in the genesis parameters (C1), so an error here
    is baked into the genesis hash and cannot be corrected without a new chain.
 
@@ -141,6 +171,10 @@ not say where its key lives, and that placement is the entire security property.
 One document, stored outside the AWS account, holding for each key: the ARN, the public key, the
 derived address, the date, who was present, the policy summary, the test signature, and the date
 recovery was last exercised.
+
+**"Who was present" is not optional when the answer is "nobody".** Write the operator's name and
+`no witness — sole operator, G3 open`. A record with one name in it and no explanation reads, later,
+like a record where somebody forgot to write the second name down.
 
 It contains no secrets — by construction, since there are none to hold — so it can live wherever
 your other operational records live. Its value is that six months later, when somebody asks whether
