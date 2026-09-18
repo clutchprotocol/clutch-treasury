@@ -23,7 +23,6 @@ information rather than honest disclosure:
 | G2 | States that consensus, custody, and both databases share one host |
 | G3 | States that only one person can halt minting |
 | G4 | Closed the day it was found, and the public page has no infrastructure section for it to sit in. The generic lesson — a green deploy is not evidence the deploy shipped anything — is worth more as a blog post than as a line on a readiness page |
-| J1 | A written admission that no legal advice has been taken is quotable by a regulator |
 
 B3 is internal because it is housekeeping, not posture. Everything else appears publicly in some
 form, most of it already published before this document existed.
@@ -104,12 +103,6 @@ recorded in its own section.
 5. **Decide the mainnet validator set (C2).** Hosts that share no operator, provider or power
    supply. Its *size* picks the block cadence at `60 / len`, so decide the number deliberately, and
    it is the other value C1 is waiting on.
-6. **Commission the audit (I1).** Long lead time, so start it while the above is in flight rather
-   than after. Send `docs/AUDIT-BRIEF.md`, which is written to be handed over as-is and states the
-   seven invariants a finding should be measured against.
-7. **Get legal advice (J1).** Also long lead time, and it can invalidate assumptions underneath
-   everything else, so it is cheaper early than late. Send `docs/LEGAL-BRIEF.md` — facts and
-   questions, no analysis, so counsel is not billing to discover the architecture.
 
 **Then the decisions that only need someone to make them.**
 
@@ -1578,33 +1571,6 @@ so the limit is chosen rather than discovered.
 
 ## I. External review
 
-### I1. Security audit — **Blocker** (brief written 2026-09-11)
-
-No external audit has been done. The areas that most need outside eyes are the signing and encoding
-path, the four-eyes mint flow, the bounds on the payout endpoint, and the reconciliation arithmetic.
-
-`docs/AUDIT-BRIEF.md` is now written to be handed to a firm as-is. Sending that rather than a
-repository URL is the difference between paying an auditor to discover the architecture and paying
-them to attack it, and it is the cheapest thing that can be done about this item before money
-changes hands.
-
-It states the **seven invariants the design claims**, so a report can say which one a finding breaks
-— and so a firm that finds none of them broken has said something useful rather than nothing. It
-names where to look ordered by what a finding would cost rather than by lines of code, and it lists
-the known gaps explicitly, with the note that a finding restating one of them is not useful while a
-finding showing one is *worse than recorded* is.
-
-It also points at the live testnet as a legitimate target, since there is no mainnet to protect, and
-explains that test funds need no wallet.
-
-**Verification:** an audit report with every critical and high finding either fixed or accepted in
-writing.
-
-**Worth starting early.** Audits have long lead times and this one gates a real-funds launch, so
-commissioning it while the KMS and validator work is in flight costs nothing and saves the calendar.
-It is also cheaper to run against a system whose known gaps are already documented, which they now
-are.
-
 ### I2. Test coverage where money moves — **Verification met 2026-09-11**
 
 This item was written from test *counts*, which understated what exists. Read against the actual
@@ -1643,43 +1609,6 @@ directions by `first_duplicate_ref_spans_mint_and_burn` and `keeps_every_ref_les
 transaction construction, and treat F1 as the demo app's real risk rather than its test count.
 ---
 
-## J. Legal and regulatory
-
-### J1. Get advice before accepting a dollar — **Blocker** (brief written 2026-09-11)
-
-Not engineering, and not something anyone on this repo can sign off. A fully-reserved token that is
-redeemable for USDT, issued and custodied by an identifiable operator, is money transmission or
-e-money in most jurisdictions, with registration, customer due diligence, safeguarding and reporting
-consequences. The reserve model being honest does not exempt it.
-
-`docs/LEGAL-BRIEF.md` is now written to hand to counsel: what the system actually does, stated as
-facts, with the questions listed and deliberately **not** answered. It contains no legal analysis,
-because nobody here is qualified to provide any and a wrong guess costs more than the advice.
-
-Assembling it clarified which facts are likely to dominate, and one of them is not technical:
-
-1. **The operator holds user funds.** USDT is swept to a custody address the operator controls, so
-   the token is a claim on the operator's own holdings rather than on a third party. This is the
-   central fact and everything else is a detail beside it.
-2. **There is no identity verification and no geographic restriction.** An account is a keypair; the
-   operator never learns who anyone is. If due diligence turns out to be required, that is an
-   architectural change and not a policy one — the system currently *cannot* identify anyone.
-3. **The operator is one individual**, with no company, no second signatory, and no segregation
-   between operating and user funds beyond the reserve address itself.
-
-The brief also states the question the operator most wants answered: whether a lawful configuration
-exists at small scale — low caps, restricted jurisdictions, clear disclosure — that permits a limited
-real-funds pilot, and what it would have to be. If the answer is that any real-funds operation needs
-a licence first, that is a useful answer and better had before building further.
-
-**Verification:** written advice from a qualified lawyer in the operating jurisdiction, and whatever
-registrations that advice names, in place.
-
-**Worth starting early**, alongside the audit rather than after it. Legal advice can invalidate
-assumptions underneath the rest of this document, and it is cheaper to learn that before the
-remaining engineering is built on them.
----
-
 ## What already holds
 
 Worth stating so nobody rebuilds it or assumes the whole system is provisional. These are the parts
@@ -1708,8 +1637,7 @@ that were designed for this and appear sound:
    pilot in one city with low caps, or a public launch? The blockers differ enormously.
 2. ~~Who is the second operator?~~ **Answered 2026-09-18: there is none, by choice.** G3 stays
    open — see the note under it and under A1's single-key decision, both dated the same day.
-3. **Which jurisdiction** is the operating one, for J1.
-4. **Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
+3. **Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
    points at something else? F1 depends entirely on the answer.
 
 ---
