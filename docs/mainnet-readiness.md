@@ -526,7 +526,35 @@ exist. This item now waits on C1 rather than on a decision.
 
 ## C. Chain and genesis
 
-### C1. Fresh mainnet genesis — **Blocker** (checkable as of 2026-09-11)
+### C1. Fresh mainnet genesis — **Closed 2026-09-19: the chain is running**
+
+**Started 2026-09-19** by `clutch-deploy`'s `mainnet-start.yml` (run 35445134248), from commit
+`9e418eb`. The run log is the permanent record of the committed values. `MAINNET=1 check-genesis.sh`
+passed on the host immediately before `up -d`; all three validators reported the **same block** at
+height 3 — `04fff87f0285a3255aef6ca89ed282483d6e10b4b95f61202211e48e8897be91` — and none logged an
+author-verification rejection.
+
+The eleven committed values, now unchangeable without a new chain: `chain_id` 1000, `is_testnet`
+false, `tx_fee` 1000, referrer rates 200 + 200 bps, `mint_authority`
+`0xe44cda17f55acf4ccc03cab374de1f227cac6621`, `faucet_address` the zero address,
+`faucet_allocation` 0, `mint_cosigners` empty, `mint_threshold` 0, `ride_auto_release_secs` 7200.
+Authorities, in slot order: `0x7948f7aa…`, `0xa65fa93e…`, `0x84f828ff…`.
+
+**What a running chain now needs that a planned one did not:**
+
+- Nothing can mint on it yet. `treasury-service` still serves the testnet with the env key; a
+  mainnet instance with `APP_SIGNER_KIND=azure_kms` has to be stood up before the first deposit.
+- No app can reach it yet. There is no mainnet `clutch-hub-api`, and the mainnet compose project
+  publishes nothing by design — a mainnet Hub API joins the `clutch-mainnet` network rather than
+  a port being opened.
+- **Nothing monitors it.** Prometheus scrapes `node1..3:3001-3003`, which are the testnet's. The
+  `chain` probe reads `clutch-stage-node*`. The mainnet nodes on `3101-3103` are watched by nobody.
+- Three validators on one host (C2, open by choice) means the host is the chain. `down -v` against
+  project `clutch-main` is not a reset; it is the loss of the chain, with no second copy.
+
+---
+
+#### Before the start (kept for the record)
 
 `is_testnet = true` and `chain_id = 2077` are committed into the genesis hash, alongside `tx_fee`,
 `mint_authority`, `faucet_address`, `faucet_allocation` and both referrer bps rates. Mainnet needs a
