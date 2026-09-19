@@ -176,11 +176,67 @@ deliberately last.
      this vault
    - and a written break-glass procedure for regaining administrative access to the subscription
      or account itself
-   Then **use** the second principal to sign, from a machine that has never held the first one's
-   credentials. **[record]** that it worked, and the date.
+
+   **Where the recovery secret lives is the whole design, and it is easy to get backwards.** It
+   must NOT be stored anywhere the primary credential is stored. If it sits in the same host `.env`
+   or the same CI secret store, then whatever event takes the primary takes the recovery with it,
+   and there is no path back — only a second copy of the same single point of failure. Put it
+   somewhere independent, which for a sole operator means a password manager, not a server.
+
+   That is also what decides where this test runs. It runs wherever the recovery secret actually
+   lives — on the operator's own machine, not on the host that mints. Running it on the minting
+   host would be testing a credential that had just been copied to the machine the recovery is
+   meant to survive the loss of.
+
+   Then **use** the second principal to sign. The same tool that did step 4 does this, pointed at
+   the recovery identity's client ID and secret:
+
+   ```
+   docker run --rm --env-file <file> ghcr.io/clutchprotocol/clutch-treasury:latest \
+     ceremony-check azure
+   ```
+
+   The env file holds `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` (the **recovery** registration),
+   `AZURE_CLIENT_SECRET`, `AZURE_VAULT_URL`, `AZURE_KEY_NAME` and `AZURE_KEY_VERSION`, unquoted —
+   Docker's `--env-file` does not strip quote marks. Use a file rather than `-e` flags so the
+   secret never enters shell history, and delete it afterwards.
+
+   It passes when the printed address is the same one step 4 produced. A different address means
+   the recovery identity is pointed at a different key, which is a worse finding than a failure.
+
+   **[record]** that it worked, the date, and which identity signed.
    A recovery path that has been designed but not exercised is not a recovery path. This is the
    distinction `keys.md` means by "tested recovery", and it is the reason this ceremony is not just
    step 1.
+
+
+   **Without Docker, the Azure CLI does this directly** — and for step 5 that is enough, because
+   what is being tested here is *access*, not the signer code. The code path was already proven in
+   step 4 against this same key; what can still fail is the identity, and these are the failures
+   that actually happen: the secret expired, the role was tidied away, or it points at a different
+   key.
+
+   ```
+   $sec = Read-Host "recovery client secret"
+   az login --service-principal -u <recovery-client-id> -p $sec --tenant <tenant> --allow-no-subscriptions
+   az keyvault key show --vault-name <vault> --name <key> --version <version> --query "{kty:key.kty, crv:key.crv, x:key.x, y:key.y}"
+   az keyvault key sign --vault-name <vault> --name <key> --version <version> --algorithm ES256K --digest "ABEiM0RVZneImaq7zN3u/wARIjNEVWZ3iJmqu8zd7v8="
+   az logout
+   ```
+
+   `Read-Host` keeps the secret out of shell history. `--allow-no-subscriptions` is required: a
+   principal holding only a Key Vault data-plane role has no subscription role, and `az login`
+   refuses without it. The digest is the same value `ceremony-check` signs, so the two steps are
+   comparable. **[record]** the `x` and `y` and check them against step 3 — equal coordinates are
+   what proves this identity reaches the SAME key. A valid signature from a different key would
+   look like success.
+
+   `az logout` at the end matters. Leaving the shell authenticated as the recovery principal means
+   the recovery identity is now the ambient one, which is the opposite of holding it in reserve.
+
+   **Re-run this on a schedule.** IAM changes, roles get tidied up, secrets expire — an Azure client
+   secret has an expiry date by default, and a recovery path whose credential quietly expired is
+   indistinguishable from one that works until the day it is needed.
 
 6. **Retire the predecessor.** Only after steps 1–5 are recorded: remove `APP_MINT_AUTHORITY_SECRET`
    from the host `.env`, confirm the service refuses to start in a configuration that would select
