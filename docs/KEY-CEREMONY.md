@@ -176,11 +176,42 @@ deliberately last.
      this vault
    - and a written break-glass procedure for regaining administrative access to the subscription
      or account itself
-   Then **use** the second principal to sign, from a machine that has never held the first one's
-   credentials. **[record]** that it worked, and the date.
+
+   **Where the recovery secret lives is the whole design, and it is easy to get backwards.** It
+   must NOT be stored anywhere the primary credential is stored. If it sits in the same host `.env`
+   or the same CI secret store, then whatever event takes the primary takes the recovery with it,
+   and there is no path back — only a second copy of the same single point of failure. Put it
+   somewhere independent, which for a sole operator means a password manager, not a server.
+
+   That is also what decides where this test runs. It runs wherever the recovery secret actually
+   lives — on the operator's own machine, not on the host that mints. Running it on the minting
+   host would be testing a credential that had just been copied to the machine the recovery is
+   meant to survive the loss of.
+
+   Then **use** the second principal to sign. The same tool that did step 4 does this, pointed at
+   the recovery identity's client ID and secret:
+
+   ```
+   docker run --rm --env-file <file> ghcr.io/clutchprotocol/clutch-treasury:latest \
+     ceremony-check azure
+   ```
+
+   The env file holds `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` (the **recovery** registration),
+   `AZURE_CLIENT_SECRET`, `AZURE_VAULT_URL`, `AZURE_KEY_NAME` and `AZURE_KEY_VERSION`, unquoted —
+   Docker's `--env-file` does not strip quote marks. Use a file rather than `-e` flags so the
+   secret never enters shell history, and delete it afterwards.
+
+   It passes when the printed address is the same one step 4 produced. A different address means
+   the recovery identity is pointed at a different key, which is a worse finding than a failure.
+
+   **[record]** that it worked, the date, and which identity signed.
    A recovery path that has been designed but not exercised is not a recovery path. This is the
    distinction `keys.md` means by "tested recovery", and it is the reason this ceremony is not just
    step 1.
+
+   **Re-run this on a schedule.** IAM changes, roles get tidied up, secrets expire — an Azure client
+   secret has an expiry date by default, and a recovery path whose credential quietly expired is
+   indistinguishable from one that works until the day it is needed.
 
 6. **Retire the predecessor.** Only after steps 1–5 are recorded: remove `APP_MINT_AUTHORITY_SECRET`
    from the host `.env`, confirm the service refuses to start in a configuration that would select
