@@ -244,6 +244,25 @@ deliberately last.
    **[record]** that the old secret is gone from the host. This is also what finally closes readiness
    item D2, since the mnemonic and the mint secret leave `.env` together.
 
+   **First check that no live chain still mints with that key.** This step reads as cleanup and is
+   not: on a host running more than one chain, the "old" secret is not a leftover, it is the key a
+   running chain is using. `mint_authority` is genesis-committed, so a chain accepts signatures from
+   that address and no other — a KMS key created for a different chain cannot take over from it.
+   There is no migration, only a cutover between chains.
+
+   Two things make the mistake easy to walk into here:
+
+   - `docker-compose.treasury.yml` declares `APP_MINT_AUTHORITY_SECRET=${MINT_AUTHORITY_SECRET:?…}`.
+     Removing the value does not degrade anything gracefully; Compose refuses to start the service.
+   - `signer_kind` is `env` by default and `load()` panics when the secret is empty, so the failure
+     arrives at boot rather than at the first mint. That is the intended design, and it means this
+     step takes the service down until something else is in place.
+
+   So the order is: start the new chain, stand up a treasury-service for it with
+   `APP_SIGNER_KIND=azure_kms`, retire or separately configure the service still serving the old
+   chain, and only then remove the secret. Two services on one host cannot share one variable name
+   for two different keys.
+
 ## The register
 
 One document, stored outside the cloud account or subscription the key lives in, holding for each
