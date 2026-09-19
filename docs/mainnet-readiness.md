@@ -303,44 +303,36 @@ this stack's Keccak-over-hex-string convention, so `digest_for_hash_hex` is the 
 per-transaction cap and the float balance stay in place; the KMS boundary is in addition to them,
 not a replacement for them.
 
-### A3. Key ceremony and tested recovery — **Blocker** (procedure written 2026-09-11)
+### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 remains**
 
-`keys.md` requires a real ceremony and tested recovery before any real-funds deployment. Neither
-has happened, and neither could have: there was no written procedure, and you cannot hold a ceremony
-you have not written down.
+The ceremony has been performed against the real key. What is recorded here is the register entry
+this item asks for.
 
-`docs/KEY-CEREMONY.md` is now that procedure. Writing it surfaced something worth stating, because
-it changes what this item actually asks for:
+| Step | Result |
+|---|---|
+| 1. Create the key | `clutch-mint-key-1` in `clutch-mint-vault-1`, **EC / P-256K**, operations exactly `sign` and `verify`. Curve read back with `az keyvault key show`, not from the creation page. |
+| 2. Nothing that signs can delete | `clutch-treasury-signer` holds **Key Vault Crypto User** and nothing else on the vault; purge protection on. Checked on the vault's Access control (IAM) blade. |
+| 3. Derive the identity | `0xe44cda17f55acf4ccc03cab374de1f227cac6621`, derived by `address_from_uncompressed` — the same function the node uses — from the key's public coordinates. |
+| 4. Sign and verify end to end | `ceremony-check azure` on the stage host, through the real `AzureKmsSigner`: the vault signed and the signature **recovered to the address from step 3**. r `1c07f096…`, s `5ebf9772…`, v `28`, over digest `00112233…eeff`. |
+| 5. Test recovery | `clutch-treasury-signer-recovery` (a separate App Registration) read the key and **signed it**, from the operator's own machine via the Azure CLI. Its `x`/`y` were byte-identical to step 3's, so it reaches the same key. Signature 64 bytes raw `r‖s`: r `159838a7…`, s `13ffccf4…`, against the pinned version `a37aaf41…`. |
+| 6. Retire the predecessor | **Not done.** `APP_MINT_AUTHORITY_SECRET` is still on the host. Deliberately last, and the only irreversible step. |
 
-**A KMS key has no key material to hold.** It is generated inside the HSM and cannot be exported —
-that is the whole reason for using it. So the traditional centre of a ceremony, splitting and
-escrowing a seed among custodians, does not apply and should not be simulated. What replaces it is
-narrower and easier to get wrong: witnessing that the key was created with the *right configuration*
-(a wrong `KeySpec` signs happily and produces signatures the node cannot verify, surfacing as a
-rejected mint rather than an error at creation), recording the key's *identity*, and testing that
-*access* recovers.
+**What step 5 proved, and what it did not.** It proved the things that actually fail: the recovery
+secret has not expired, its role assignment is live, it can sign and not merely read, and it reaches
+the same key rather than a different one — a valid signature from a different key would have looked
+like success, which is why the coordinates were compared rather than just the exit code.
 
-That last one is the step people skip and it is the one `keys.md` means by "tested recovery". A KMS
-key with no exercised access-recovery path is exactly as lose-able as a seed phrase in one person's
-drawer; the failure just arrives as an IAM misconfiguration rather than a house fire. The procedure
-requires a second principal, in a separate identity, to actually sign from a machine that has never
-held the first one's credentials — not merely to be configured.
+It did **not** prove machine separation. `KEY-CEREMONY.md` asks for a machine that has never held
+the first credential; the operator's own machine created both secrets, so for a sole operator that
+cannot be fully satisfied. Recorded as a limit rather than glossed, because a register that claims
+more than was done is worse than one that claims less.
 
-Six steps, each with values to record, and deliberately only the last one irreversible: retiring
-`APP_MINT_AUTHORITY_SECRET` from the host happens after everything else is proven. That step is also
-what finally closes D2, since the mint secret and the deposit mnemonic leave `.env` together.
+**The recovery secret must stay out of the host `.env` and out of CI.** It lives in the operator's
+password manager. If it were stored beside the primary, whatever event took the primary would take
+the recovery with it, and there would be no path back — only a second copy of one point of failure.
 
-Two ordering constraints the procedure enforces: the mint key goes first and alone, end to end
-including recovery, before the payout key is started — two ceremonies in one afternoon is how a step
-gets skipped on the second. And it refuses to proceed with one person present, noting that this is
-the same problem as G3 and is not solved by continuing anyway.
-
-**Verification:** the ceremony performed, with the register it describes existing outside the AWS
-account and holding the key ARN, the derived address, who was present, and the date recovery was
-last exercised. The derived address is also the mainnet `mint_authority` in C1, so an error there
-is baked into the genesis hash.
-
-**Blocked on:** the AWS account and key from A1, and a second person — which is G3.
+**Re-exercise on a schedule.** Azure client secrets expire by default, and a recovery path whose
+credential quietly expired is indistinguishable from a working one until the day it is needed.
 
 ### A4. Custody key stays absent — **Required, by design**
 
