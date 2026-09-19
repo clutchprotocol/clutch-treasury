@@ -303,7 +303,7 @@ this stack's Keccak-over-hex-string convention, so `digest_for_hash_hex` is the 
 per-transaction cap and the float balance stay in place; the KMS boundary is in addition to them,
 not a replacement for them.
 
-### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 remains**
+### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 blocked on the mainnet cutover**
 
 The ceremony has been performed against the real key. What is recorded here is the register entry
 this item asks for.
@@ -315,7 +315,7 @@ this item asks for.
 | 3. Derive the identity | `0xe44cda17f55acf4ccc03cab374de1f227cac6621`, derived by `address_from_uncompressed` — the same function the node uses — from the key's public coordinates. |
 | 4. Sign and verify end to end | `ceremony-check azure` on the stage host, through the real `AzureKmsSigner`: the vault signed and the signature **recovered to the address from step 3**. r `1c07f096…`, s `5ebf9772…`, v `28`, over digest `00112233…eeff`. |
 | 5. Test recovery | `clutch-treasury-signer-recovery` (a separate App Registration) read the key and **signed it**, from the operator's own machine via the Azure CLI. Its `x`/`y` were byte-identical to step 3's, so it reaches the same key. Signature 64 bytes raw `r‖s`: r `159838a7…`, s `13ffccf4…`, against the pinned version `a37aaf41…`. |
-| 6. Retire the predecessor | **Not done.** `APP_MINT_AUTHORITY_SECRET` is still on the host. Deliberately last, and the only irreversible step. |
+| 6. Retire the predecessor | **Not done, and blocked — not merely pending.** The testnet chain is live and its genesis-committed `mint_authority` is `0x662c5f11…`, not the KMS key. Removing `APP_MINT_AUTHORITY_SECRET` stops the running treasury-service (Compose declares it `:?`, and `signer_kind=env` panics when it is empty), and the KMS key cannot take over that chain at any price. See KEY-CEREMONY.md step 6. |
 
 **What step 5 proved, and what it did not.** It proved the things that actually fail: the recovery
 secret has not expired, its role assignment is live, it can sign and not merely read, and it reaches
