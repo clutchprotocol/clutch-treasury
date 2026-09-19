@@ -366,19 +366,42 @@ not a check, so it is broken by an addition rather than by a change.
 
 ## B. The payout rail on mainnet
 
-### B1. First real payout receipt — **Blocker**
+### B1. First real payout receipt — **Blocker** (wiring built 2026-09-19; unfunded)
 
-This cannot be tested on stage, and the runbook says so. Nile's test USDT contract sponsors its own
-energy, so every Nile payout reports `energy_fee: 0` and non-zero `origin_energy_usage` whether or
-not delegation works — a payout made before delegating reads identically to one made after. Mainnet
-USDT makes the sender pay. The first mainnet payout is therefore the first real test of the energy
-model, the delegation, and the fee.
+`clutch-deploy` now has everything needed to run a treasury against TRON mainnet, and none of it
+is started:
 
-**Verification:** a mainnet payout receipt showing non-zero `energy_usage` (sender-supplied, own or
-delegated) with `energy_fee: 0`, captured and attached to this document. `clutch-deploy`'s
-`inspect-stage.yml` already has an `energy` probe that reads the most recent payout's receipt and
-reports who supplied the energy; point the mainnet equivalent at that. Until the receipt exists,
-keep a fee that covers burning TRX outright.
+| Piece | State |
+|---|---|
+| `docker-compose.mainnet.treasury.yml` | An overlay on the testnet treasury file, holding only the differences: TRON mainnet, the KMS signer, `clutch-network` re-pointed at the mainnet chain, an alias so nginx can tell the two orchestrators apart. |
+| `.env.mainnet.example` | Every value, with the four that are yours marked. |
+| `provision-treasury-secrets.sh` | Takes `ENV_FILE`; the workflow offers `.env` or `.env.mainnet`. Generates a **separate** mnemonic and never overwrites. |
+| `/payment/` on the mainnet vhost | Returns **503**, asserted by a deploy gate. It stays that way until a mainnet orchestrator exists. |
+
+**The mnemonics must differ, and this is a money-loss hazard rather than hygiene.** TRON addresses
+are network-agnostic: one mnemonic derives the *same* deposit addresses on Nile and on mainnet. Two
+orchestrators with separate databases would assign one address to two different users, so a
+depositor shown an address by the testnet app could send real USDT and have the mainnet service
+credit somebody else. Separation comes from a different project name, a different env file, and a
+different chain network — none of them optional.
+
+**What is still required, and every item is the maintainer's:**
+
+1. `CUSTODY_TRON_ADDRESS` — a TRON mainnet wallet they control. Nothing in this stack can spend
+   from it (A4, A5), which is why it is the only address that matters for custody.
+2. `USDT_CONTRACT` — verified on tronscan, not taken on trust from the example.
+3. `TRONGRID_API_KEY` — the free tier's limits stall deposit polling.
+4. **Funding**: USDT in the payout float at `2/0`, TRX in the fee account at `1/0`. Without the
+   TRX every sweep answers `fee_account_dry` and nothing consolidates, while deposits still credit
+   and the reserve total stays correct — a failure that looks like nothing happening.
+
+**Caps are env vars, not genesis**, so they can start at the stage values and be raised with
+`set-mint-caps.sh`, which re-runs `check-cap-invariants.sh` afterwards. The one worth revisiting
+before drivers arrive is `MAX_REDEMPTION_CLT` at $25: a driver doing ten rides a day reaches it,
+cannot withdraw, and tells other drivers.
+
+**Verification:** a real deposit credited, swept to custody, and a redemption paid out — each
+confirmed on tronscan rather than from a service's own log.
 
 ### B2. Re-measure the redemption fee — **Blocker**
 
