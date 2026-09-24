@@ -77,7 +77,8 @@ pub enum SelfTest {
     Passed,
     /// The chain answered, and the answer is wrong for this configuration. The signer must not start.
     Failed(String),
-    /// TronGrid did not answer. Not fatal: the checks before each permit still run.
+    /// TronGrid gave no usable answer: none at all, or an error of its own. Not fatal: the checks
+    /// before each permit still run.
     Unreachable(String),
 }
 
@@ -476,7 +477,9 @@ impl SweepClient {
         // still chooses nothing (spec §4).
         //
         // ponytail: one deposit larger than the target still goes wholly to the float, so the float
-        // can overshoot by one deposit. Splitting one sweep between two receivers needs two permits.
+        // can overshoot by one pass of deposits: each sweep reads the float's balance on chain, and
+        // permits still in flight are not in it. Splitting one sweep between two receivers needs
+        // two permits.
         if gf.cfg.payouts {
             let float = gasfree::gasfree_address(gf.cfg.chain, &signer.payout_address()?)?;
             if self.usdt_balance(&float).await? < gf.cfg.payout_float_target_usdt {

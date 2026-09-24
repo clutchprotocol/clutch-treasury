@@ -14,6 +14,11 @@
 //! The fund-float route goes further than sweep: it takes NO parameters at all. Source, destination
 //! and token are fixed and both addresses are derived from the mnemonic, so the only thing it can
 //! be asked for is the one correction it exists to make.
+//!
+//! The activate-float route takes no parameters either, and it costs at most one activation fee, once:
+//! after the first call the float answers `already_active`, or "in flight" while that call is pending.
+//! The rule that the reserve's surplus must cover that fee lives in the clutch-deploy workflow that
+//! calls it, not here — so for that rule the bearer token is load-bearing.
 
 use std::sync::Arc;
 

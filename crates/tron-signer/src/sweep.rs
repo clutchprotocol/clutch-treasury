@@ -18,6 +18,17 @@
 //! Do not add a `to`, a `contract`, or an `amount` parameter. Each one individually converts this
 //! from "can only do the right thing" into "does whatever it is told by whoever got in".
 //!
+//! # On the GasFree rail, the fee is sized when the permit is signed
+//!
+//! A GasFree sweep's `maxFee` is fixed when the permit is signed, from the chain's record of
+//! whether the account is activated at that moment. The treasury sizes what it holds back when it
+//! mints. The two agree only when every deposit a sweep moves was credited first, and the treasury
+//! treats an account as activated only after it has seen that account's first transfer itself.
+//! The treasury's own sweeper keeps to the first rule — it sweeps credited deposits only — but a
+//! sweep requested any other way can move a deposit before it is credited. So on this rail the
+//! claim above, that a request's safety does not depend on who sends it, holds only together with
+//! the treasury's hold rule (spec §2; Plan 3).
+//!
 //! # Sweeping the whole balance, not the deposited amount
 //!
 //! A derived address exists for exactly one deposit, so anything sitting there is that deposit —
@@ -163,8 +174,9 @@ pub enum SweepOutcome {
     /// Nothing was signed, and nothing will be until a human acts: GasFree's code changed, or the
     /// relay and this signer disagree about an address.
     Halted { reason: String },
-    /// The GasFree account holds less than one transfer's fee, and the plain address holds nothing.
-    /// Not an error on its own; a later deposit to the same account lifts it over the fee.
+    /// The GasFree account holds at most `max_fee_usdt` — `fee_to_hold` for its activation state,
+    /// so the activation fee is included until the first transfer — and the plain address holds
+    /// nothing. Not an error on its own; a later deposit to the same account lifts it over the fee.
     BelowFee { gasfree_address: String, balance_usdt: i64, max_fee_usdt: i64 },
 }
 
@@ -603,7 +615,8 @@ impl SweepClient {
         Ok(resp.data.first().map(|a| a.balance).unwrap_or(0))
     }
 
-    /// Move everything at `index` to the configured treasury address.
+    /// Sweep what `index` holds: its GasFree account first, by permit to the payout float or
+    /// custody, then its plain address, to custody.
     ///
     /// The destination and the token are this service's config; only the index comes from the
     /// caller. See the module docs for why that is the whole point.
