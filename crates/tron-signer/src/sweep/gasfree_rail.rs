@@ -242,7 +242,19 @@ pub enum ActivateFloatOutcome {
 }
 
 pub fn activate_float_response(o: &ActivateFloatOutcome) -> serde_json::Value {
-    todo!("Task 5 Step 4")
+    match o {
+        ActivateFloatOutcome::Submitted { trace_id } => serde_json::json!({"status": "submitted", "trace_id": trace_id}),
+        ActivateFloatOutcome::AlreadyActive { float_address } => {
+            serde_json::json!({"status": "already_active", "float_address": float_address})
+        }
+        ActivateFloatOutcome::FloatDry { float_address, have_usdt, need_usdt } => serde_json::json!({
+            "status": "float_dry",
+            "float_address": float_address,
+            "have_usdt": have_usdt,
+            "need_usdt": need_usdt,
+        }),
+        ActivateFloatOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
+    }
 }
 
 impl SweepClient {
@@ -549,6 +561,84 @@ impl SweepClient {
     /// costs — the relay's fee — must come from surplus, which is why the workflow that calls this
     /// refuses unless the reserve leads supply by at least that much (spec §4).
     pub async fn activate_float(&self, signer: &Signer) -> Result<ActivateFloatOutcome, String> {
-        todo!("Task 5 Step 4")
+        let Some(gf) = &self.gasfree else {
+            return Ok(ActivateFloatOutcome::Refused("GasFree is not turned on in this signer".into()));
+        };
+        let refused = |what: &str, e: String| -> Result<ActivateFloatOutcome, String> {
+            Ok(ActivateFloatOutcome::Refused(format!("{what}: {e}")))
+        };
+
+        let owner = match signer.payout_address() {
+            Ok(a) => a,
+            Err(e) => return refused("deriving the float's owner", e),
+        };
+        let float = match gasfree::gasfree_address(gf.cfg.chain, &owner) {
+            Ok(a) => a,
+            Err(e) => return refused("deriving the GasFree float", e),
+        };
+        match self.code_changed(&gf.cfg).await {
+            Ok(None) => {}
+            Ok(Some(reason)) => return Ok(ActivateFloatOutcome::Refused(reason)),
+            Err(e) => return refused("reading GasFree's code", e),
+        }
+        match self.has_contract(&float).await {
+            Ok(false) => {}
+            Ok(true) => return Ok(ActivateFloatOutcome::AlreadyActive { float_address: float }),
+            Err(e) => return refused("reading whether the GasFree float is activated", e),
+        }
+        let max_fee = gasfree::fee_to_hold(false, gf.cfg.activate_fee_max_usdt, gf.cfg.transfer_fee_max_usdt);
+        let need = ACTIVATION_VALUE_USDT + max_fee;
+        let have = match self.usdt_balance(&float).await {
+            Ok(v) => v,
+            Err(e) => return refused("reading the GasFree float's balance", e),
+        };
+        if have < need {
+            return Ok(ActivateFloatOutcome::FloatDry { float_address: float, have_usdt: have, need_usdt: need });
+        }
+        let account = match gf.relay.account(&owner, &self.cfg.usdt_contract).await {
+            Ok(a) => a,
+            Err(e) => return refused("reading the GasFree float's account from the relay", format!("{e:?}")),
+        };
+        if account.gasfree_address != float {
+            return Ok(ActivateFloatOutcome::Refused(format!(
+                "the relay puts the GasFree float at {}, this signer derives {float}",
+                account.gasfree_address
+            )));
+        }
+        let nonce = match self.chain_nonce(gf.cfg.chain, &owner).await {
+            Ok(n) => n,
+            Err(e) => return refused("reading the float's nonce", e),
+        };
+        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
+            return Ok(ActivateFloatOutcome::Refused("a transfer from the GasFree float is already in flight".into()));
+        }
+        let key = match signer.payout_signing_key() {
+            Ok(k) => k,
+            Err(e) => return refused("deriving the payout signing key", e),
+        };
+        let permit = gasfree::Permit {
+            token: &self.cfg.usdt_contract,
+            service_provider: &gf.cfg.service_provider,
+            user: &owner,
+            receiver: &self.cfg.treasury_address,
+            value: ACTIVATION_VALUE_USDT as u64,
+            max_fee: max_fee as u64,
+            deadline: deadline_after(gf.cfg.deadline_secs),
+            version: 1,
+            nonce,
+        };
+        let sig = match sign_permit(&key, gf.cfg.chain, &permit) {
+            Ok(s) => s,
+            Err(e) => return refused("signing the activation permit", e),
+        };
+        // The receiver is custody and the value one micro-USDT, so even an unclear answer cannot
+        // send money anywhere but home. It is still Err, so the operator reads the chain.
+        match gf.relay.submit(&permit, &sig).await {
+            Ok(trace_id) => Ok(ActivateFloatOutcome::Submitted { trace_id }),
+            Err(RelayError::Refused { reason, message }) => {
+                Ok(ActivateFloatOutcome::Refused(format!("the relay refused the activation permit: {reason} {message}")))
+            }
+            Err(RelayError::Unavailable(e)) => Err(format!("submitting the activation permit: {e}")),
+        }
     }
 }
