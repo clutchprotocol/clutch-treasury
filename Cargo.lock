@@ -807,6 +807,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gasfree"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "hex",
+ "sha3",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

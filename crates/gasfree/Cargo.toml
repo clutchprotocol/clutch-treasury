@@ -1,0 +1,11 @@
+[package]
+name = "gasfree"
+version = "0.1.0"
+edition = "2021"
+
+# Pure functions over public constants: no key, no network, no async. Keep it that way. The
+# key-free payment-orchestrator links this crate, so nothing that can sign or spend belongs here.
+[dependencies]
+bs58 = { version = "0.5", features = ["check"] }
+sha3 = "0.10.1"
+hex.workspace = true
