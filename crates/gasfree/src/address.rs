@@ -144,10 +144,15 @@ mod tests {
     }
 
     #[test]
-    fn a_mistyped_address_is_refused() {
+    fn a_malformed_address_is_refused() {
         // The last character changed: still valid base58, but the checksum no longer matches.
         assert!(gasfree_address(&NILE, "TMVQGm1qAQYVdetCeGRRkTWYYrLXuHK2HD").is_err());
         // The same wallet in the hex form that Ethereum tools print. It is not base58 at all.
         assert!(gasfree_address(&NILE, "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf").is_err());
+        // Valid base58check, but with Bitcoin's version byte 0x00, not TRON's 0x41.
+        assert!(gasfree_address(&NILE, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").is_err());
+        // The checksum and the version byte are right, but the body is 10 bytes, not 20. Only the
+        // length check in `decode` refuses it; without that check, `copy_from_slice` would panic.
+        assert!(gasfree_address(&NILE, "2pUoQw6qT8ob6Jjopz1Lg").is_err());
     }
 }

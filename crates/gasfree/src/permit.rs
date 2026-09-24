@@ -21,9 +21,9 @@ pub struct Permit<'a> {
     pub token: &'a str,
     /// The relay that may submit this permit and collect its fee.
     pub service_provider: &'a str,
-    /// The wallet that signs: `D`, not its GasFree address. The tokens leave
-    /// `gasfree_address(user)`.
+    /// The wallet that signs, not its GasFree address. The tokens leave `gasfree_address(user)`.
     pub user: &'a str,
+    /// Where the tokens go.
     pub receiver: &'a str,
     /// In the token's smallest unit. Whether the fee is charged on top of it or taken out of it
     /// is the design's open question 1. This crate only hashes the number.

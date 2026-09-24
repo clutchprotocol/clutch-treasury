@@ -20,7 +20,10 @@ use sha3::{Digest, Keccak256};
 /// One GasFree deployment: the public constants that an address and a permit are computed from.
 ///
 /// Only `NILE` and `MAINNET` exist. The creation code field is private, so a caller cannot build a
-/// third `Chain` that mixes one network's controller with another network's creation code.
+/// third `Chain` that mixes one network's controller with another network's creation code. They
+/// are `static`, not `const`, and `Chain` is neither `Copy` nor `Clone`, so a caller cannot take an
+/// owned copy of one and change its public fields either. Keep both true: the two creation codes
+/// differ in only 32 bytes, so a mixed `Chain` gives a valid-looking address that nobody controls.
 pub struct Chain {
     /// The TIP-712 domain's `chainId`.
     pub chain_id: u64,
@@ -34,7 +37,7 @@ pub struct Chain {
 }
 
 /// TRON's Nile testnet, from the SDK's `DefaultChainInfoMap`.
-pub const NILE: Chain = Chain {
+pub static NILE: Chain = Chain {
     chain_id: 3_448_148_188, // 0xcd8690dc
     controller: "THQGuFzL87ZqhxkgqYEryRAd7gqFqL5rdc",
     beacon: "TLtCGmaxH3PbuaF6kbybwteZcHptEdgQGC",
@@ -42,7 +45,7 @@ pub const NILE: Chain = Chain {
 };
 
 /// TRON mainnet, from the SDK's `DefaultChainInfoMap`.
-pub const MAINNET: Chain = Chain {
+pub static MAINNET: Chain = Chain {
     chain_id: 728_126_428, // 0x2b6653dc
     controller: "TFFAMQLZybALaLb4uxHA9RBE7pxhUAjF3U",
     beacon: "TSP9UW6FQhT76XD2jWA6ipGMx3yGbjDffP",
