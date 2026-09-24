@@ -295,7 +295,7 @@ async fn activation_is_read_from_the_contract_record_not_the_bytecode() {
     let (url, _) = spawn(w).await;
     let c = client(&url);
     assert!(c.has_contract(&g0(&s)).await.unwrap(), "a contract record with empty bytecode is an activated account");
-    assert!(!c.has_contract(&float_of(&s)).await.unwrap(), "`{}` is an address with no contract");
+    assert!(!c.has_contract(&float_of(&s)).await.unwrap(), "`{{}}` is an address with no contract");
 }
 
 // ---- the boot check ----
