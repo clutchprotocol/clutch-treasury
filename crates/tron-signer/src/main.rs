@@ -27,8 +27,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    fund_float_response, load_gasfree_config, payout_response, validate_payout_cap, FundFloatOutcome,
-    PayoutOutcome, SelfTest, SweepClient, SweepConfig, SweepOutcome,
+    fund_float_response, load_gasfree_config, payout_response, sweep_response, validate_payout_cap, FundFloatOutcome,
+    PayoutOutcome, SelfTest, SweepClient, SweepConfig,
 };
 
 #[derive(Clone)]
@@ -146,23 +146,12 @@ async fn sweep(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     authed(&headers, &s.token)?;
     match s.sweeper.sweep(&s.signer, req.index).await {
-        Ok(SweepOutcome::Swept { tx_id, amount_usdt }) => {
-            tracing::info!("swept index {} : {amount_usdt} micro-USDT in {tx_id}", req.index);
-            Ok(Json(json!({"status": "swept", "tx_id": tx_id, "amount_usdt": amount_usdt})))
+        // Not errors, any of them: a worker must be able to tell "already empty", "funded, sweep
+        // next pass", "permit with the relay" and "wait" apart from a genuine failure.
+        Ok(outcome) => {
+            tracing::info!(index = req.index, ?outcome, "sweep");
+            Ok(Json(sweep_response(&outcome)))
         }
-        // Not errors: a worker re-running over an already-empty address, or one that just had its
-        // fee funded, must be able to tell those apart from a genuine failure and act differently.
-        Ok(SweepOutcome::NothingToSweep) => Ok(Json(json!({"status": "nothing_to_sweep"}))),
-        Ok(SweepOutcome::Funded { tx_id, amount_sun }) => {
-            Ok(Json(json!({"status": "funded", "tx_id": tx_id, "amount_sun": amount_sun})))
-        }
-        // The one outcome no retry resolves: only an operator can top the account up.
-        Ok(SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun }) => Ok(Json(json!({
-            "status": "fee_account_dry",
-            "fee_address": fee_address,
-            "have_sun": have_sun,
-            "need_sun": need_sun,
-        }))),
         Err(e) => {
             tracing::error!("sweep of index {} failed: {e}", req.index);
             Err(StatusCode::INTERNAL_SERVER_ERROR)

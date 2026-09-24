@@ -349,3 +349,340 @@ fn the_gasfree_address_is_only_known_when_gasfree_is_on() {
     assert_eq!(off.gasfree_address_for(&owner).unwrap(), None);
     assert_eq!(client("http://127.0.0.1:1").gasfree_address_for(&owner).unwrap(), Some(g0(&s)));
 }
+
+// ---- what every permit needs: the nonce, the tripwire, the signature ----
+
+/// The key that signed a submitted permit, recovered from the permit's own fields and `sig`. So a
+/// test that uses it proves the relay got a permit signed over exactly what it was sent.
+fn signer_of(body: &serde_json::Value) -> k256::ecdsa::VerifyingKey {
+    let permit = gasfree::Permit {
+        token: body["token"].as_str().unwrap(),
+        service_provider: body["serviceProvider"].as_str().unwrap(),
+        user: body["user"].as_str().unwrap(),
+        receiver: body["receiver"].as_str().unwrap(),
+        value: body["value"].as_u64().unwrap(),
+        max_fee: body["maxFee"].as_u64().unwrap(),
+        deadline: body["deadline"].as_u64().unwrap(),
+        version: body["version"].as_u64().unwrap(),
+        nonce: body["nonce"].as_u64().unwrap(),
+    };
+    let hash = gasfree::permit_hash(&gasfree::NILE, &permit).unwrap();
+    let sig = hex::decode(body["sig"].as_str().unwrap()).unwrap();
+    assert_eq!(sig.len(), 65, "r, s and v");
+    assert!(sig[64] == 27 || sig[64] == 28, "v must be 27 or 28, got {}", sig[64]);
+    let signature = Signature::from_slice(&sig[..64]).unwrap();
+    let recid = RecoveryId::from_byte(sig[64] - 27).unwrap();
+    k256::ecdsa::VerifyingKey::recover_from_prehash(&hash, &signature, recid).unwrap()
+}
+
+#[tokio::test]
+async fn the_nonce_is_the_controllers_not_the_relays() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let mut w = healthy(&s);
+    w.nonces.insert(abi_address(&owner).unwrap(), 7);
+    let (url, world) = spawn(w).await;
+    assert_eq!(client(&url).chain_nonce(&gasfree::NILE, &owner).await.unwrap(), 7);
+    let call = &named(&world, "nonces(address)")[0];
+    assert_eq!(call["contract_address"], gasfree::NILE.controller, "nonces live on the controller");
+}
+
+#[tokio::test]
+async fn a_changed_beacon_or_controller_is_named() {
+    let s = signer();
+    let (url, _) = spawn(healthy(&s)).await;
+    let cfg = gasfree_config(&url, true);
+    assert_eq!(client(&url).code_changed(&cfg).await.unwrap(), None, "the reviewed code passes");
+
+    let mut w = healthy(&s);
+    w.implementations.insert(gasfree::NILE.beacon.into(), "11".repeat(20));
+    let (url, _) = spawn(w).await;
+    let why = client(&url).code_changed(&gasfree_config(&url, true)).await.unwrap().expect("a new beacon implementation");
+    assert!(why.contains("beacon") && why.contains(&"11".repeat(20)), "{why}");
+
+    let mut w = healthy(&s);
+    w.implementations.insert(gasfree::NILE.controller.into(), "22".repeat(20));
+    let (url, _) = spawn(w).await;
+    let why = client(&url).code_changed(&gasfree_config(&url, true)).await.unwrap().expect("a new controller implementation");
+    assert!(why.contains("controller"), "{why}");
+}
+
+#[test]
+fn a_permit_signature_recovers_to_the_signing_key_with_v_27_or_28() {
+    let s = signer();
+    let key = s.signing_key_at(0).unwrap();
+    let owner = s.address_at(0).unwrap();
+    let permit = gasfree::Permit {
+        token: USDT,
+        service_provider: PROVIDER,
+        user: &owner,
+        receiver: CUSTODY,
+        value: 8_000_000,
+        max_fee: 2_000_000,
+        deadline: 1_790_000_000,
+        version: 1,
+        nonce: 0,
+    };
+    let sig = sign_permit(&key, &gasfree::NILE, &permit).unwrap();
+    assert_eq!(sig.len(), 130, "65 bytes as hex, no 0x");
+    let body = serde_json::json!({
+        "token": USDT, "serviceProvider": PROVIDER, "user": owner, "receiver": CUSTODY,
+        "value": 8_000_000u64, "maxFee": 2_000_000u64, "deadline": 1_790_000_000u64, "version": 1, "nonce": 0, "sig": sig,
+    });
+    assert_eq!(&signer_of(&body), key.verifying_key(), "the signature must be over this permit, by this key");
+}
+
+// ---- the GasFree sweep ----
+
+/// The whole rail in one test: everything above the fee, to the float while it is below its
+/// target, by a permit that D signed over exactly what the relay received.
+#[tokio::test]
+async fn a_deposit_is_swept_by_a_permit_for_everything_above_the_fee() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.nonces.insert(abi_address(&owner).unwrap(), 0);
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+    let fee = ACTIVATE_MAX + TRANSFER_MAX; // never activated: the first transfer also activates
+    assert_eq!(
+        outcome,
+        SweepOutcome::Pending {
+            trace_id: TRACE_ID.into(),
+            gasfree_address: g0(&s),
+            receiver: float_of(&s),
+            value_usdt: 10_000_000 - fee,
+            max_fee_usdt: fee,
+        }
+    );
+    let submits = named(&world, "submit");
+    assert_eq!(submits.len(), 1, "exactly one permit");
+    let p = &submits[0];
+    assert_eq!(p["user"], owner, "the permit's user is the plain wallet D, never G");
+    assert_eq!(p["receiver"], float_of(&s), "the float is below its target, so it receives");
+    assert_eq!(p["token"], USDT, "the token is config, never a parameter");
+    assert_eq!(p["serviceProvider"], PROVIDER, "the pinned relay");
+    assert_eq!(p["value"], 10_000_000 - fee, "value = balance − maxFee: the receiver gets exactly what was minted");
+    assert_eq!(p["maxFee"], fee);
+    assert_eq!(p["version"], 1);
+    assert_eq!(p["nonce"], 0, "the controller's nonce");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let deadline = p["deadline"].as_u64().unwrap();
+    assert!(deadline > now + 170 && deadline <= now + 185, "a short deadline, minutes: {deadline} vs {now}");
+    assert_eq!(&signer_of(p), s.signing_key_at(0).unwrap().verifying_key(), "signed by D's key over these fields");
+}
+
+#[tokio::test]
+async fn an_activated_account_holds_back_only_the_transfer_fee() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.contracts.insert(g0(&s));
+    let (url, world) = spawn(w).await;
+
+    client(&url).sweep(&s, 0).await.unwrap();
+
+    let p = &named(&world, "submit")[0];
+    assert_eq!(p["maxFee"], TRANSFER_MAX);
+    assert_eq!(p["value"], 10_000_000 - TRANSFER_MAX);
+}
+
+#[tokio::test]
+async fn the_float_stops_receiving_once_it_reaches_its_target() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.usdt.insert(float_of(&s), FLOAT_TARGET);
+    let (url, world) = spawn(w).await;
+
+    client(&url).sweep(&s, 0).await.unwrap();
+
+    assert_eq!(named(&world, "submit")[0]["receiver"], CUSTODY);
+}
+
+#[tokio::test]
+async fn with_trx_payouts_every_sweep_goes_to_custody() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    let (url, world) = spawn(w).await;
+    let c = SweepClient::new(sweep_config(&url)).with_gasfree(gasfree_config(&url, false));
+
+    c.sweep(&s, 0).await.unwrap();
+
+    assert_eq!(named(&world, "submit")[0]["receiver"], CUSTODY, "a float that pays nothing is not filled");
+    let reads: Vec<_> = named(&world, "balanceOf(address)").iter().map(|b| b["owner_address"].clone()).collect();
+    assert!(!reads.contains(&serde_json::json!(float_of(&s))), "the GasFree float is not even read");
+}
+
+#[tokio::test]
+async fn a_changed_beacon_halts_before_the_relay_is_asked() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.implementations.insert(gasfree::NILE.beacon.into(), "44".repeat(20));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+    assert!(matches!(outcome, SweepOutcome::Halted { .. }), "got {outcome:?}");
+    assert!(named(&world, "relay_account").is_empty() && named(&world, "submit").is_empty(), "nothing signed or sent");
+}
+
+#[tokio::test]
+async fn a_relay_that_disagrees_about_the_address_halts() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.accounts.insert(owner.clone(), relay_account_json(&owner, "TJM1BE5wq1VdHh3gwjUeyaVkvZp9DVYCfC", 0));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+    assert!(matches!(outcome, SweepOutcome::Halted { .. }), "got {outcome:?}");
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn a_transfer_in_flight_makes_the_sweep_wait() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let in_flight = [
+        // The relay's nonce is ahead of the chain's: a permit is queued.
+        relay_account_json(&owner, &g0(&s), 1),
+        serde_json::json!({"gasFreeAddress": g0(&s), "nonce": 0, "allowSubmit": false}),
+        serde_json::json!({"gasFreeAddress": g0(&s), "nonce": 0, "assets": [{"tokenAddress": USDT, "frozen": 2_000_000}]}),
+    ];
+    for account in in_flight {
+        let mut w = healthy(&s);
+        w.usdt.insert(g0(&s), 10_000_000);
+        w.accounts.insert(owner.clone(), account.clone());
+        let (url, world) = spawn(w).await;
+
+        let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+        assert_eq!(outcome, SweepOutcome::Busy { gasfree_address: g0(&s) }, "for {account}");
+        assert!(named(&world, "submit").is_empty(), "two permits in flight would collide on one nonce");
+    }
+}
+
+#[tokio::test]
+async fn a_relay_refusal_is_reported_as_rejected() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.submit_reply = serde_json::json!({
+        "code": 400, "reason": "MaxFeeExceededException", "message": "estimated fee exceeds the limit", "data": null,
+    })
+    .to_string();
+    let (url, _) = spawn(w).await;
+
+    assert_eq!(
+        client(&url).sweep(&s, 0).await.unwrap(),
+        SweepOutcome::Rejected {
+            reason: "MaxFeeExceededException".into(),
+            message: "estimated fee exceeds the limit".into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn dust_that_cannot_pay_its_fee_does_not_block_the_plain_address() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 1_000_000); // below ACTIVATE_MAX + TRANSFER_MAX
+    w.usdt.insert(owner, 5_000_000);
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+    // The plain address has no TRX and neither does the fee account, so today's path answers
+    // FeeAccountDry — which proves it ran.
+    assert!(matches!(outcome, SweepOutcome::FeeAccountDry { .. }), "got {outcome:?}");
+    assert!(named(&world, "submit").is_empty(), "no permit for a balance that cannot pay its fee");
+}
+
+#[tokio::test]
+async fn dust_alone_is_reported_below_fee() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 1_000_000);
+    let (url, _) = spawn(w).await;
+
+    assert_eq!(
+        client(&url).sweep(&s, 0).await.unwrap(),
+        SweepOutcome::BelowFee {
+            gasfree_address: g0(&s),
+            balance_usdt: 1_000_000,
+            max_fee_usdt: ACTIVATE_MAX + TRANSFER_MAX,
+        }
+    );
+}
+
+/// The property that makes merging this safe: without GasFree settings, a sweep reads exactly one
+/// balance, the plain address's, as it always has.
+#[tokio::test]
+async fn without_gasfree_the_sweep_never_looks_at_a_gasfree_address() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    let (url, world) = spawn(w).await;
+
+    let outcome = SweepClient::new(sweep_config(&url)).sweep(&s, 0).await.unwrap();
+
+    assert_eq!(outcome, SweepOutcome::NothingToSweep);
+    let reads = named(&world, "balanceOf(address)");
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["owner_address"], s.address_at(0).unwrap());
+}
+
+#[test]
+fn every_sweep_status_string_is_pinned() {
+    use crate::sweep::sweep_response;
+    let pending = sweep_response(&SweepOutcome::Pending {
+        trace_id: "t".into(),
+        gasfree_address: "g".into(),
+        receiver: "r".into(),
+        value_usdt: 8,
+        max_fee_usdt: 2,
+    });
+    assert_eq!(
+        pending,
+        serde_json::json!({"status": "pending", "trace_id": "t", "gasfree_address": "g", "receiver": "r", "value_usdt": 8, "max_fee_usdt": 2})
+    );
+    assert_eq!(
+        sweep_response(&SweepOutcome::Busy { gasfree_address: "g".into() }),
+        serde_json::json!({"status": "busy", "gasfree_address": "g"})
+    );
+    assert_eq!(
+        sweep_response(&SweepOutcome::Rejected { reason: "r".into(), message: "m".into() }),
+        serde_json::json!({"status": "rejected", "reason": "r", "message": "m"})
+    );
+    assert_eq!(
+        sweep_response(&SweepOutcome::Halted { reason: "r".into() }),
+        serde_json::json!({"status": "halted", "reason": "r"})
+    );
+    assert_eq!(
+        sweep_response(&SweepOutcome::BelowFee { gasfree_address: "g".into(), balance_usdt: 1, max_fee_usdt: 2 }),
+        serde_json::json!({"status": "below_fee", "gasfree_address": "g", "balance_usdt": 1, "max_fee_usdt": 2})
+    );
+    // The four the treasury already parses must not change.
+    assert_eq!(
+        sweep_response(&SweepOutcome::Swept { tx_id: "t".into(), amount_usdt: 5 }),
+        serde_json::json!({"status": "swept", "tx_id": "t", "amount_usdt": 5})
+    );
+    assert_eq!(sweep_response(&SweepOutcome::NothingToSweep), serde_json::json!({"status": "nothing_to_sweep"}));
+    assert_eq!(
+        sweep_response(&SweepOutcome::Funded { tx_id: "t".into(), amount_sun: 5 }),
+        serde_json::json!({"status": "funded", "tx_id": "t", "amount_sun": 5})
+    );
+    assert_eq!(
+        sweep_response(&SweepOutcome::FeeAccountDry { fee_address: "a".into(), have_sun: 1, need_sun: 2 }),
+        serde_json::json!({"status": "fee_account_dry", "fee_address": "a", "have_sun": 1, "need_sun": 2})
+    );
+}

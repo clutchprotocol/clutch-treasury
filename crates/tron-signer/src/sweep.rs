@@ -137,6 +137,22 @@ pub enum SweepOutcome {
     /// The fee account has run out of TRX. The only outcome here that no automation can resolve —
     /// an operator has to top the account up, and until they do every sweep stalls.
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
+    /// A GasFree permit is with the relay. NOT yet swept: the chain decides that on a later pass,
+    /// when the GasFree account's balance is gone. `value_usdt` is what `receiver` will get and
+    /// `max_fee_usdt` the most the relay may take on top.
+    Pending { trace_id: String, gasfree_address: String, receiver: String, value_usdt: i64, max_fee_usdt: i64 },
+    /// A transfer from this GasFree account is already in flight. Nothing was signed; try next pass.
+    Busy { gasfree_address: String },
+    /// The relay refused the permit. `reason` is its exception name. `MaxFeeExceededException`
+    /// means the live fee rose above the configured maximum: the deposit stays put, still counted,
+    /// and a human must decide — never a higher `maxFee` than the treasury held back.
+    Rejected { reason: String, message: String },
+    /// Nothing was signed, and nothing will be until a human acts: GasFree's code changed, or the
+    /// relay and this signer disagree about an address.
+    Halted { reason: String },
+    /// The GasFree account holds less than one transfer's fee, and the plain address holds nothing.
+    /// Not an error on its own; a later deposit to the same account lifts it over the fee.
+    BelowFee { gasfree_address: String, balance_usdt: i64, max_fee_usdt: i64 },
 }
 
 /// What one payout attempt did. Mirrors `SweepOutcome`: the caller must be able to tell "refused,
@@ -188,6 +204,15 @@ pub enum FundFloatOutcome {
     /// where the line is drawn: never used at or after `sign_and_broadcast`, because a failure
     /// there may have followed a real broadcast.
     Refused(String),
+}
+
+/// The wire form of a sweep outcome.
+///
+/// A contract with treasury-service's `HttpSigner`, which treats any status it does not know as a
+/// failure — so a typo here stalls sweeps rather than moving money. The first four are the same
+/// literals the handler sent before GasFree existed.
+pub fn sweep_response(outcome: &SweepOutcome) -> serde_json::Value {
+    todo!("Task 3 Step 5")
 }
 
 /// The wire form of a payout outcome.
@@ -511,9 +536,23 @@ impl SweepClient {
     pub async fn sweep(&self, signer: &Signer, index: u32) -> Result<SweepOutcome, String> {
         let from = signer.address_at(index)?;
 
+        // The GasFree account first, and only when GasFree is on. Its dust — a balance that cannot
+        // pay its own fee — must not stop the plain address below from being swept.
+        let mut gasfree_dust = None;
+        if let Some(gf) = &self.gasfree {
+            let g = gasfree::gasfree_address(gf.cfg.chain, &from)?;
+            let balance = self.usdt_balance(&g).await?;
+            if balance > 0 {
+                match self.sweep_gasfree(gf, signer, index, &from, &g, balance).await? {
+                    dust @ SweepOutcome::BelowFee { .. } => gasfree_dust = Some(dust),
+                    other => return Ok(other),
+                }
+            }
+        }
+
         let amount = self.usdt_balance(&from).await?;
         if amount == 0 {
-            return Ok(SweepOutcome::NothingToSweep);
+            return Ok(gasfree_dust.unwrap_or(SweepOutcome::NothingToSweep));
         }
 
         // Deliberately AFTER the balance check above: an address holding no USDT returns

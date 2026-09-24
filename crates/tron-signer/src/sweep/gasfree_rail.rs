@@ -26,9 +26,11 @@
 //! nothing when either differs from the reviewed one it was configured with. See spec §5 in
 //! docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md.
 
-use super::{abi_address, describe_rejection, SweepClient};
+use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
+
+use super::{abi_address, describe_rejection, SweepClient, SweepOutcome};
 use crate::keys::Signer;
-use crate::relay::RelayConfig;
+use crate::relay::{Relay, RelayConfig, RelayError};
 
 #[cfg(test)]
 mod tests;
@@ -56,14 +58,16 @@ pub struct GasFreeConfig {
     pub payouts: bool,
 }
 
-/// The GasFree half of a `SweepClient`.
+/// The GasFree half of a `SweepClient`: its settings and its relay.
 pub(super) struct GasFree {
     pub(super) cfg: GasFreeConfig,
+    pub(super) relay: Relay,
 }
 
 impl GasFree {
     pub(super) fn new(cfg: GasFreeConfig) -> Self {
-        Self { cfg }
+        let relay = Relay::new(cfg.relay.clone());
+        Self { cfg, relay }
     }
 }
 
@@ -172,6 +176,14 @@ fn implementation_hex(name: &str, raw: &str) -> Result<String, String> {
     Ok(hex)
 }
 
+/// Sign a permit as TIP-712 wallets do: the permit hash itself, no prefix, and `v` as 27 or 28.
+///
+/// Not `sign_txid`'s convention, where TRON wants the bare recovery id 0 or 1. The GasFree docs'
+/// own example signature ends in `1b`, which is 27.
+pub(super) fn sign_permit(key: &SigningKey, chain: &gasfree::Chain, permit: &gasfree::Permit<'_>) -> Result<String, String> {
+    todo!("Task 3 Step 5")
+}
+
 impl SweepClient {
     /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
     pub(super) async fn has_contract(&self, address: &str) -> Result<bool, String> {
@@ -242,5 +254,33 @@ impl SweepClient {
             )),
             Err(e) => SelfTest::Unreachable(e),
         }
+    }
+
+    /// The next nonce the controller will accept from `user`: the chain's count, not the relay's.
+    pub(super) async fn chain_nonce(&self, chain: &gasfree::Chain, user: &str) -> Result<u64, String> {
+        todo!("Task 3 Step 5")
+    }
+
+    /// Why permits must stop, when GasFree's code is not the reviewed code; `None` when it is.
+    pub(super) async fn code_changed(&self, cfg: &GasFreeConfig) -> Result<Option<String>, String> {
+        todo!("Task 3 Step 5")
+    }
+
+    /// Sweep the GasFree account `g` of the wallet `owner` at `index`, which holds `balance`.
+    pub(super) async fn sweep_gasfree(
+        &self,
+        gf: &GasFree,
+        signer: &Signer,
+        index: u32,
+        owner: &str,
+        g: &str,
+        balance: i64,
+    ) -> Result<SweepOutcome, String> {
+        todo!("Task 3 Step 5")
+    }
+
+    /// Where a GasFree sweep sends its value.
+    async fn sweep_receiver(&self, gf: &GasFree, signer: &Signer) -> Result<String, String> {
+        todo!("Task 3 Step 5")
     }
 }

@@ -61,6 +61,32 @@ impl Chain {
     }
 }
 
+/// How much one transfer out of a GasFree account may pay the relay: the transfer fee, plus the
+/// activation fee when the account has never made a transfer.
+///
+/// One copy, used by the treasury to size what it holds back from a mint and by the signer to set
+/// the permit's `maxFee`. The two must be the same number — a `maxFee` above what was held back is
+/// the one way this rail can leave CLT under-reserved — so neither service computes it on its own.
+/// `activated` must come from the chain, never from the relay's `active` field.
+pub fn fee_to_hold(activated: bool, activate_max_usdt: i64, transfer_max_usdt: i64) -> i64 {
+    if activated {
+        transfer_max_usdt
+    } else {
+        activate_max_usdt + transfer_max_usdt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fee_to_hold;
+
+    #[test]
+    fn the_fee_to_hold_includes_activation_only_before_it() {
+        assert_eq!(fee_to_hold(false, 1_500_000, 500_000), 2_000_000, "a first transfer also activates");
+        assert_eq!(fee_to_hold(true, 1_500_000, 500_000), 500_000, "an activated account pays one transfer fee");
+    }
+}
+
 const TRON_ADDRESS_VERSION: u8 = 0x41;
 
 /// A TRON address's 20-byte body, after its base58check checksum and version byte are checked.
