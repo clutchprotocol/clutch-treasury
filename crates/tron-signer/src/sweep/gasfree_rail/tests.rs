@@ -452,6 +452,9 @@ async fn a_deposit_is_swept_by_a_permit_for_everything_above_the_fee() {
 
     let outcome = client(&url).sweep(&s, 0).await.unwrap();
 
+    let submits = named(&world, "submit");
+    assert_eq!(submits.len(), 1, "exactly one permit");
+    let p = &submits[0];
     let fee = ACTIVATE_MAX + TRANSFER_MAX; // never activated: the first transfer also activates
     assert_eq!(
         outcome,
@@ -461,11 +464,11 @@ async fn a_deposit_is_swept_by_a_permit_for_everything_above_the_fee() {
             receiver: float_of(&s),
             value_usdt: 10_000_000 - fee,
             max_fee_usdt: fee,
-        }
+            nonce: p["nonce"].as_u64().unwrap(),
+            deadline: p["deadline"].as_u64().unwrap(),
+        },
+        "the reply names the permit the relay was sent"
     );
-    let submits = named(&world, "submit");
-    assert_eq!(submits.len(), 1, "exactly one permit");
-    let p = &submits[0];
     assert_eq!(p["user"], owner, "the permit's user is the plain wallet D, never G");
     assert_eq!(p["receiver"], float_of(&s), "the float is below its target, so it receives");
     assert_eq!(p["token"], USDT, "the token is config, never a parameter");
@@ -674,10 +677,15 @@ fn every_sweep_status_string_is_pinned() {
         receiver: "r".into(),
         value_usdt: 8,
         max_fee_usdt: 2,
+        nonce: 3,
+        deadline: 9,
     });
     assert_eq!(
         pending,
-        serde_json::json!({"status": "pending", "trace_id": "t", "gasfree_address": "g", "receiver": "r", "value_usdt": 8, "max_fee_usdt": 2})
+        serde_json::json!({
+            "status": "pending", "trace_id": "t", "gasfree_address": "g", "receiver": "r", "value_usdt": 8, "max_fee_usdt": 2,
+            "nonce": 3, "deadline": 9,
+        })
     );
     assert_eq!(
         sweep_response(&SweepOutcome::Busy { gasfree_address: "g".into() }),
@@ -726,12 +734,21 @@ fn with_float(s: &Signer) -> WorldState {
 #[tokio::test]
 async fn a_gasfree_payout_is_a_permit_from_the_float_for_exactly_the_amount() {
     let s = signer();
-    let (url, world) = spawn(with_float(&s)).await;
+    let owner = s.payout_address().unwrap();
+    let mut w = with_float(&s);
+    // Not the default 0, so the test sees which nonce the permit carries.
+    w.nonces.insert(abi_address(&owner).unwrap(), 3);
+    w.accounts.insert(owner.clone(), relay_account_json(&owner, &float_of(&s), 3));
+    let (url, world) = spawn(w).await;
 
     let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
 
-    assert_eq!(outcome, PayoutOutcome::Submitted { trace_id: TRACE_ID.into() });
     let p = &named(&world, "submit")[0];
+    assert_eq!(p["nonce"], 3, "the controller's nonce");
+    assert_eq!(
+        outcome,
+        PayoutOutcome::Submitted { trace_id: TRACE_ID.into(), nonce: 3, deadline: p["deadline"].as_u64().unwrap() }
+    );
     assert_eq!(p["user"], s.payout_address().unwrap(), "the float's owner, 2/0 — never a deposit key");
     assert_eq!(p["receiver"], REDEEMER);
     assert_eq!(p["value"], 20_000_000, "the redeemer gets exactly the amount; the fee comes on top");
@@ -780,11 +797,19 @@ async fn a_documented_relay_refusal_is_a_provable_non_payment() {
         "code": 400, "reason": "InsufficientBalanceException", "message": "insufficient balance", "data": null,
     })
     .to_string();
-    let (url, _) = spawn(w).await;
+    let (url, world) = spawn(w).await;
 
     let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
 
-    assert!(matches!(outcome, PayoutOutcome::Refused(ref why) if why.contains("InsufficientBalanceException")), "got {outcome:?}");
+    let p = &named(&world, "submit")[0];
+    match outcome {
+        PayoutOutcome::RelayRefused { reason, nonce, deadline } => {
+            assert!(reason.contains("InsufficientBalanceException"), "{reason}");
+            assert_eq!(Some(nonce), p["nonce"].as_u64(), "the nonce of the permit the relay refused");
+            assert_eq!(Some(deadline), p["deadline"].as_u64(), "the deadline of the permit the relay refused");
+        }
+        other => panic!("got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -838,8 +863,13 @@ async fn with_trx_payouts_the_gasfree_float_is_never_touched() {
 fn the_new_payout_status_strings_are_pinned() {
     use crate::sweep::payout_response;
     assert_eq!(
-        payout_response(&PayoutOutcome::Submitted { trace_id: "t".into() }),
-        serde_json::json!({"status": "submitted", "trace_id": "t"})
+        payout_response(&PayoutOutcome::Submitted { trace_id: "t".into(), nonce: 3, deadline: 9 }),
+        serde_json::json!({"status": "submitted", "trace_id": "t", "nonce": 3, "deadline": 9})
+    );
+    assert_eq!(
+        payout_response(&PayoutOutcome::RelayRefused { reason: "r".into(), nonce: 3, deadline: 9 }),
+        serde_json::json!({"status": "refused", "reason": "r", "nonce": 3, "deadline": 9}),
+        "status refused, so today's treasury reads it as a refusal"
     );
     assert_eq!(
         payout_response(&PayoutOutcome::FloatNotActive { float_address: "f".into() }),

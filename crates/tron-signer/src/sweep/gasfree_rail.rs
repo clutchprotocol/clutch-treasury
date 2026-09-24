@@ -435,6 +435,7 @@ impl SweepClient {
 
         let receiver = self.sweep_receiver(gf, signer).await?;
         let value = balance - max_fee;
+        let deadline = deadline_after(gf.cfg.deadline_secs);
         let permit = gasfree::Permit {
             token: &self.cfg.usdt_contract,
             service_provider: &gf.cfg.service_provider,
@@ -442,7 +443,7 @@ impl SweepClient {
             receiver: &receiver,
             value: u64::try_from(value).map_err(|_| format!("sweep value {value} is negative"))?,
             max_fee: u64::try_from(max_fee).map_err(|_| format!("maxFee {max_fee} is negative"))?,
-            deadline: deadline_after(gf.cfg.deadline_secs),
+            deadline,
             version: 1,
             nonce,
         };
@@ -457,6 +458,8 @@ impl SweepClient {
                 receiver,
                 value_usdt: value,
                 max_fee_usdt: max_fee,
+                nonce,
+                deadline,
             }),
             Err(RelayError::Refused { reason, message }) => Ok(SweepOutcome::Rejected { reason, message }),
             // A sweep can only move money into this service's own float or custody, so an unclear
@@ -546,6 +549,7 @@ impl SweepClient {
             Ok(v) => v,
             Err(_) => return refused("the fee maximum", format!("{max_fee} is negative")),
         };
+        let deadline = deadline_after(gf.cfg.deadline_secs);
         let permit = gasfree::Permit {
             token: &self.cfg.usdt_contract,
             service_provider: &gf.cfg.service_provider,
@@ -553,7 +557,7 @@ impl SweepClient {
             receiver: to,
             value,
             max_fee,
-            deadline: deadline_after(gf.cfg.deadline_secs),
+            deadline,
             version: 1,
             nonce,
         };
@@ -566,9 +570,13 @@ impl SweepClient {
         // docs list as a pre-execution check, is a clear answer. Anything else may still execute
         // before the deadline, so it goes to a human as ambiguous and is never retried.
         match gf.relay.submit(&permit, &sig).await {
-            Ok(trace_id) => Ok(PayoutOutcome::Submitted { trace_id }),
+            Ok(trace_id) => Ok(PayoutOutcome::Submitted { trace_id, nonce, deadline }),
             Err(RelayError::Refused { reason, message }) if PRE_EXECUTION_REFUSALS.contains(&reason.as_str()) => {
-                Ok(PayoutOutcome::Refused(format!("the relay refused the payout permit: {reason} {message}")))
+                Ok(PayoutOutcome::RelayRefused {
+                    reason: format!("the relay refused the payout permit: {reason} {message}"),
+                    nonce,
+                    deadline,
+                })
             }
             Err(e) => Err(format!("the relay gave no clear answer to a signed payout permit: {e:?}")),
         }

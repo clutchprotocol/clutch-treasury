@@ -139,10 +139,21 @@ pub enum SweepOutcome {
     /// The fee account has run out of TRX. The only outcome here that no automation can resolve —
     /// an operator has to top the account up, and until they do every sweep stalls.
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
-    /// A GasFree permit is with the relay. NOT yet swept: the chain decides that on a later pass,
-    /// when the GasFree account's balance is gone. `value_usdt` is what `receiver` will get and
-    /// `max_fee_usdt` the most the relay may take on top.
-    Pending { trace_id: String, gasfree_address: String, receiver: String, value_usdt: i64, max_fee_usdt: i64 },
+    /// A GasFree permit is with the relay. NOT yet swept: once it runs, `receiver` gets
+    /// `value_usdt` and the relay takes at most `max_fee_usdt` on top. The GasFree account keeps
+    /// whatever of `max_fee_usdt` the relay did not take — it never falls to 0, and after an
+    /// activation it can keep more than one transfer fee — so decide "swept" from the chain: the
+    /// controller's `nonces(owner)` moving past `nonce`. After `deadline` the permit can no longer
+    /// run.
+    Pending {
+        trace_id: String,
+        gasfree_address: String,
+        receiver: String,
+        value_usdt: i64,
+        max_fee_usdt: i64,
+        nonce: u64,
+        deadline: u64,
+    },
     /// A transfer from this GasFree account is already in flight. Nothing was signed; try next pass.
     Busy { gasfree_address: String },
     /// The relay refused the permit. `reason` is its exception name. `MaxFeeExceededException`
@@ -185,15 +196,21 @@ pub enum PayoutOutcome {
     /// call rather than inside it keeps that guarantee simple enough to trust.
     ///
     /// The GasFree rail (`sweep/gasfree_rail.rs`) keeps the same rule with one exception. After a
-    /// signed payout permit was handed to the relay, a reply is `Refused` only when the relay
+    /// signed payout permit was handed to the relay, a reply is a refusal only when the relay
     /// refused it with one of `PRE_EXECUTION_REFUSALS` — the refusals the GasFree docs list as its
-    /// checks before execution. At that point the relay holds a signed permit, and only its word
-    /// says the permit will not run; that is the trust the design already places in the pinned
-    /// relay. Any other answer after the permit was sent is `Err`, and so ambiguous.
+    /// checks before execution — and that refusal is `RelayRefused`, not `Refused`. At that point
+    /// the relay holds a signed permit, and only its word says the permit will not run; that is the
+    /// trust the design already places in the pinned relay. Any other answer after the permit was
+    /// sent is `Err`, and so ambiguous.
     Refused(String),
     /// A GasFree permit paying `to` is with the relay. Not yet paid: the treasury follows
     /// `trace_id` to the on-chain transaction and confirms it there, as it confirms a TRX payout.
-    Submitted { trace_id: String },
+    /// `nonce` and `deadline` are the signed permit's.
+    Submitted { trace_id: String, nonce: u64, deadline: u64 },
+    /// `Refused`, plus the identity of the refused permit: the relay refused a signed payout permit
+    /// with one of `PRE_EXECUTION_REFUSALS`. Its wire status is `refused`, so the treasury reads it
+    /// as a refusal; `nonce` and `deadline` let it later tell from the chain whether that permit ran.
+    RelayRefused { reason: String, nonce: u64, deadline: u64 },
     /// The GasFree float has never made a transfer, so its next one would also pay the activation
     /// fee, which a redemption's fee does not cover. Provably nothing was signed. Only the one-time
     /// activation (`/internal/activate-float`) resolves it.
@@ -240,13 +257,15 @@ pub fn sweep_response(outcome: &SweepOutcome) -> serde_json::Value {
             "have_sun": have_sun,
             "need_sun": need_sun,
         }),
-        SweepOutcome::Pending { trace_id, gasfree_address, receiver, value_usdt, max_fee_usdt } => json!({
+        SweepOutcome::Pending { trace_id, gasfree_address, receiver, value_usdt, max_fee_usdt, nonce, deadline } => json!({
             "status": "pending",
             "trace_id": trace_id,
             "gasfree_address": gasfree_address,
             "receiver": receiver,
             "value_usdt": value_usdt,
             "max_fee_usdt": max_fee_usdt,
+            "nonce": nonce,
+            "deadline": deadline,
         }),
         SweepOutcome::Busy { gasfree_address } => json!({"status": "busy", "gasfree_address": gasfree_address}),
         SweepOutcome::Rejected { reason, message } => json!({"status": "rejected", "reason": reason, "message": message}),
@@ -281,7 +300,13 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
         PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
         }
-        PayoutOutcome::Submitted { trace_id } => serde_json::json!({"status": "submitted", "trace_id": trace_id}),
+        PayoutOutcome::Submitted { trace_id, nonce, deadline } => {
+            serde_json::json!({"status": "submitted", "trace_id": trace_id, "nonce": nonce, "deadline": deadline})
+        }
+        // `refused`, so the treasury reads it as it reads any other refusal.
+        PayoutOutcome::RelayRefused { reason, nonce, deadline } => {
+            serde_json::json!({"status": "refused", "reason": reason, "nonce": nonce, "deadline": deadline})
+        }
         PayoutOutcome::FloatNotActive { float_address } => {
             serde_json::json!({"status": "float_not_active", "float_address": float_address})
         }

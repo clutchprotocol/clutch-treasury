@@ -176,7 +176,8 @@ async fn payout(
                 PayoutOutcome::CapExceeded { limit_usdt } => tracing::warn!(intent_id = %req.intent_id, amount_usdt = req.amount_usdt, limit_usdt, "payout over cap"),
                 PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => tracing::warn!(intent_id = %req.intent_id, %float_address, have_usdt, need_usdt, "payout float dry"),
                 PayoutOutcome::NeedsTrx { tx_id, amount_sun } => tracing::info!(intent_id = %req.intent_id, %tx_id, amount_sun, "funded the payout float with TRX"),
-                PayoutOutcome::Submitted { trace_id } => tracing::info!(intent_id = %req.intent_id, to = %req.to, amount_usdt = req.amount_usdt, %trace_id, "payout permit submitted"),
+                PayoutOutcome::Submitted { trace_id, .. } => tracing::info!(intent_id = %req.intent_id, to = %req.to, amount_usdt = req.amount_usdt, %trace_id, "payout permit submitted"),
+                PayoutOutcome::RelayRefused { reason, nonce, deadline } => tracing::warn!(intent_id = %req.intent_id, %reason, nonce, deadline, "payout permit refused by the relay"),
                 PayoutOutcome::FloatNotActive { float_address } => tracing::warn!(intent_id = %req.intent_id, %float_address, "the GasFree float is not activated yet"),
                 PayoutOutcome::Refused(reason) => tracing::warn!(intent_id = %req.intent_id, %reason, "payout refused pre-broadcast"),
             }
