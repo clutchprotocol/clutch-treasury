@@ -37,6 +37,8 @@ struct WorldState {
     trx: HashMap<String, i64>,
     /// Addresses `getcontract` reports as deployed.
     contracts: HashSet<String>,
+    /// When true, `getcontract` answers like a rate-limited TronGrid: `{"Error": "request rate exceeded"}`.
+    getcontract_error: bool,
     /// `nonces(user)`, by the user's ABI word.
     nonces: HashMap<String, u64>,
     /// `implementation()`, by proxy address, as 40 hex.
@@ -76,6 +78,9 @@ async fn constant(State(w): State<World>, Json(b): Json<serde_json::Value>) -> J
 async fn getcontract(State(w): State<World>, Json(b): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let mut s = w.0.lock().unwrap();
     s.calls.push(("getcontract".into(), b.clone()));
+    if s.getcontract_error {
+        return Json(serde_json::json!({"Error": "request rate exceeded"}));
+    }
     let address = b["value"].as_str().unwrap_or_default().to_string();
     // Shaped like the live reply for an activated GasFree account: a contract record whose
     // bytecode is EMPTY. An address with no contract gets `{}`.
@@ -914,4 +919,78 @@ fn every_activation_status_string_is_pinned() {
         activate_float_response(&ActivateFloatOutcome::Refused("r".into())),
         serde_json::json!({"status": "refused", "reason": "r"})
     );
+}
+
+// ---- found by the final review ----
+
+#[tokio::test]
+async fn a_trongrid_error_is_never_read_as_not_activated() {
+    // G is activated, so the treasury held back one transfer fee. Read as "not activated", a
+    // rate-limited answer would sign a maxFee of activation plus transfer: more than was held back.
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.contracts.insert(g0(&s));
+    w.getcontract_error = true;
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await;
+
+    assert!(outcome.is_err(), "an error is no answer about activation, got {outcome:?}");
+    assert!(named(&world, "submit").is_empty(), "no permit is signed on a guess");
+}
+
+#[tokio::test]
+async fn the_self_test_is_not_fatal_when_trongrid_answers_an_error() {
+    // A rate limit at boot says nothing about which network this is, so it must not stop the signer.
+    let s = signer();
+    let mut w = healthy(&s);
+    w.getcontract_error = true;
+    let (url, _) = spawn(w).await;
+
+    let result = client(&url).gasfree_self_test(&s).await;
+
+    assert!(matches!(result, SelfTest::Unreachable(_)), "got {result:?}");
+}
+
+#[tokio::test]
+async fn any_other_relay_answer_to_the_activation_is_ambiguous() {
+    let s = signer();
+    for reply in [
+        serde_json::json!({"code": 500, "reason": "RuntimeException", "message": "boom", "data": null}).to_string(),
+        serde_json::json!({"code": 400, "reason": "SomethingNewException", "message": "?", "data": null}).to_string(),
+        "Bad Gateway".to_string(),
+    ] {
+        let mut w = healthy(&s);
+        w.usdt.insert(float_of(&s), 5_000_000); // not activated: no contract record
+        w.submit_reply = reply.clone();
+        let (url, world) = spawn(w).await;
+
+        let outcome = client(&url).activate_float(&s).await;
+
+        // Refused tells the operator the permit did not run, and only a documented refusal proves
+        // that. After any other answer it may still run before its deadline: Err, read the chain.
+        assert!(outcome.is_err(), "{reply} must not read as a clear answer, got {outcome:?}");
+        assert_eq!(named(&world, "submit").len(), 1, "exactly one permit for {reply}");
+    }
+}
+
+#[test]
+fn a_blank_optional_setting_counts_as_unset() {
+    // The deploy repo passes an unset optional value as an empty string (`${X:-}`), so a blank must
+    // mean "not set", never "invalid" — an invalid rail would stop the TRX rail with it.
+    let blank = |k: &str| match k {
+        "APP_TRANSFER_RAIL" | "APP_GASFREE_API_KEY" => Some(String::new()),
+        _ => None,
+    };
+    assert!(matches!(load_gasfree_config(blank), Ok(None)), "a blank rail and a blank key: GasFree stays off");
+
+    let base = setting(&[]);
+    let with_blanks = move |k: &str| match k {
+        "APP_TRANSFER_RAIL" | "APP_GASFREE_DEADLINE_SECS" => Some(String::new()),
+        _ => base(k),
+    };
+    let cfg = load_gasfree_config(with_blanks).unwrap().expect("the API key still turns GasFree on");
+    assert!(!cfg.payouts, "a blank rail is trx");
+    assert_eq!(cfg.deadline_secs, 180, "a blank deadline is the default");
 }
