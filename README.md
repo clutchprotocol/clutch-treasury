@@ -17,6 +17,7 @@ mismatch treated as a P1 that halts minting rather than as a dashboard metric.
 | `payment-orchestrator` | The browser-facing deposit and redemption API; derives and polls deposit addresses | the account **xpub** only — it cannot spend |
 | `tron-signer` | Signs TRON transactions: sweeps and payouts | the deposit wallet **mnemonic** |
 | `clutch-chain` | Shared chain client: builds, signs and submits CLT transactions | — |
+| `gasfree` | GasFree address derivation and permit hashing, one copy shared by the orchestrator and the signer | — |
 
 The split is the point. Owning `payment-orchestrator` gets you an xpub, which derives addresses and
 cannot move a coin. The mnemonic exists only in `tron-signer`, which publishes no port.
