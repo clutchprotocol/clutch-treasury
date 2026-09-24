@@ -39,16 +39,41 @@ pub struct Permit<'a> {
 }
 
 /// The 32 bytes the owner of `permit.user` signs.
-pub fn permit_hash(_chain: &Chain, _permit: &Permit) -> Result<[u8; 32], String> {
-    Ok([0; 32])
+pub fn permit_hash(chain: &Chain, permit: &Permit) -> Result<[u8; 32], String> {
+    Ok(keccak(
+        &[&[0x19u8, 0x01][..], &domain_separator(chain)?[..], &struct_hash(permit)?[..]].concat(),
+    ))
 }
 
-fn domain_separator(_chain: &Chain) -> Result<[u8; 32], String> {
-    Ok([0; 32])
+fn domain_separator(chain: &Chain) -> Result<[u8; 32], String> {
+    Ok(keccak(
+        &[
+            &keccak(DOMAIN_TYPE)[..],
+            &keccak(b"GasFreeController")[..],
+            &keccak(b"V1.0.0")[..],
+            &uint_word(chain.chain_id)[..],
+            &address_word(&decode(chain.controller)?)[..],
+        ]
+        .concat(),
+    ))
 }
 
-fn struct_hash(_permit: &Permit) -> Result<[u8; 32], String> {
-    Ok([0; 32])
+fn struct_hash(permit: &Permit) -> Result<[u8; 32], String> {
+    Ok(keccak(
+        &[
+            &keccak(PERMIT_TYPE)[..],
+            &address_word(&decode(permit.token)?)[..],
+            &address_word(&decode(permit.service_provider)?)[..],
+            &address_word(&decode(permit.user)?)[..],
+            &address_word(&decode(permit.receiver)?)[..],
+            &uint_word(permit.value)[..],
+            &uint_word(permit.max_fee)[..],
+            &uint_word(permit.deadline)[..],
+            &uint_word(permit.version)[..],
+            &uint_word(permit.nonce)[..],
+        ]
+        .concat(),
+    ))
 }
 
 #[cfg(test)]
