@@ -3057,12 +3057,15 @@ name = "tron-signer"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bip32",
  "bip39",
  "bs58",
  "config",
  "dotenv",
+ "gasfree",
  "hex",
+ "hmac",
  "k256",
  "reqwest",
  "serde",
