@@ -67,13 +67,15 @@ pub enum RelayError {
 ///
 /// PATH is the URL path INCLUDING the network prefix (`/nile/api/v1/...`). The body is not signed.
 pub fn signature(secret: &str, method: &str, path: &str, timestamp: u64) -> String {
-    todo!("Task 1 Step 5")
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes a key of any length");
+    mac.update(format!("{method}{path}{timestamp}").as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 /// A trace id is a UUID. Checked before one goes into a URL path, so a caller cannot make this
 /// service call some other relay path with its credentials.
 pub fn is_trace_id(s: &str) -> bool {
-    todo!("Task 1 Step 5")
+    s.len() == 36 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 pub struct Relay {
@@ -83,26 +85,137 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(cfg: RelayConfig) -> Self {
-        todo!("Task 1 Step 5")
+        // A bound on every call. Without one a relay that stops answering holds a sweep pass, or a
+        // payout request, open for as long as the TCP connection survives.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("a reqwest client with only a timeout set always builds");
+        Self { http, cfg }
     }
 
     /// The GasFree account of the wallet `owner` — its EOA address, not its GasFree address.
     pub async fn account(&self, owner: &str, token: &str) -> Result<Account, RelayError> {
-        todo!("Task 1 Step 5")
+        let data = self.call(reqwest::Method::GET, &format!("/api/v1/address/{owner}"), None).await?;
+        parse_account(&data, token).map_err(RelayError::Unavailable)
     }
 
     /// Hand a signed permit to the relay. Returns its trace id.
     pub async fn submit(&self, permit: &gasfree::Permit<'_>, sig: &str) -> Result<String, RelayError> {
-        todo!("Task 1 Step 5")
+        let data = self.call(reqwest::Method::POST, "/api/v1/gasfree/submit", Some(submit_body(permit, sig))).await?;
+        data["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RelayError::Unavailable(format!("the submit reply has no id: {}", clip(&data.to_string()))))
     }
 
     pub async fn trace(&self, trace_id: &str) -> Result<Trace, RelayError> {
-        todo!("Task 1 Step 5")
+        if !is_trace_id(trace_id) {
+            return Err(RelayError::Unavailable(format!("{trace_id:?} is not a trace id")));
+        }
+        let data = self.call(reqwest::Method::GET, &format!("/api/v1/gasfree/{trace_id}"), None).await?;
+        parse_trace(&data).map_err(RelayError::Unavailable)
+    }
+
+    /// One signed request. Returns the envelope's `data` when `code` is 200.
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, RelayError> {
+        let url = format!("{}{path}", self.cfg.base_url);
+        let signed_path = reqwest::Url::parse(&url)
+            .map_err(|e| RelayError::Unavailable(format!("bad relay URL {url}: {e}")))?
+            .path()
+            .to_string();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let authorization = format!(
+            "ApiKey {}:{}",
+            self.cfg.api_key,
+            signature(&self.cfg.api_secret, method.as_str(), &signed_path, timestamp)
+        );
+        let mut request = self
+            .http
+            .request(method, &url)
+            .header("Timestamp", timestamp.to_string())
+            .header("Authorization", authorization);
+        if let Some(b) = body {
+            request = request.json(&b);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| RelayError::Unavailable(format!("the relay request failed: {e}")))?;
+        let status = response.status().as_u16();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| RelayError::Unavailable(format!("the relay reply was unreadable: {e}")))?;
+        envelope(status, &text)
+    }
+}
+
+/// Unwrap the relay's `{code, reason, message, data}` envelope.
+///
+/// The relay answers HTTP 200 to its own errors and puts the real result in `code`, so HTTP 200
+/// alone proves nothing. Anything that is not the envelope — like the plain-text "Authorization or
+/// timestamp not found." an unsigned request gets — is Unavailable, with the text kept.
+fn envelope(status: u16, text: &str) -> Result<serde_json::Value, RelayError> {
+    let body: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| RelayError::Unavailable(format!("the relay replied HTTP {status}: {}", clip(text))))?;
+    match body["code"].as_i64() {
+        Some(200) => Ok(body["data"].clone()),
+        Some(400) => Err(RelayError::Refused {
+            reason: body["reason"].as_str().unwrap_or("").to_string(),
+            message: body["message"].as_str().unwrap_or("").to_string(),
+        }),
+        _ => Err(RelayError::Unavailable(format!("the relay replied HTTP {status}: {}", clip(text)))),
     }
 }
 
 fn parse_account(data: &serde_json::Value, token: &str) -> Result<Account, String> {
-    todo!("Task 1 Step 5")
+    let gasfree_address = data["gasFreeAddress"].as_str().ok_or("the relay's account has no gasFreeAddress")?.to_string();
+    let nonce = data["nonce"].as_u64().ok_or("the relay's account has no nonce")?;
+    // Missing counts as allowed: the nonce comparison and the relay's own refusal still catch a
+    // transfer in flight, while "never allowed" for a renamed field would stop every sweep.
+    let allow_submit = data["allowSubmit"].as_bool().or_else(|| data["allow_submit"].as_bool()).unwrap_or(true);
+    let frozen = data["assets"]
+        .as_array()
+        .and_then(|assets| assets.iter().find(|a| a["tokenAddress"].as_str() == Some(token)))
+        .and_then(|a| a["frozen"].as_i64())
+        .unwrap_or(0);
+    Ok(Account { gasfree_address, nonce, allow_submit, frozen })
+}
+
+fn parse_trace(data: &serde_json::Value) -> Result<Trace, String> {
+    Ok(Trace {
+        state: data["state"].as_str().ok_or("the relay's trace has no state")?.to_string(),
+        txn_hash: data["txnHash"].as_str().filter(|h| !h.is_empty()).map(str::to_string),
+        txn_state: data["txnState"].as_str().map(str::to_string),
+        txn_amount: data["txnAmount"].as_i64(),
+        txn_total_fee: data["txnTotalFee"].as_i64(),
+    })
+}
+
+/// The submit request. Every number is a JSON number, as in the docs' example.
+fn submit_body(permit: &gasfree::Permit<'_>, sig: &str) -> serde_json::Value {
+    serde_json::json!({
+        "token": permit.token,
+        "serviceProvider": permit.service_provider,
+        "user": permit.user,
+        "receiver": permit.receiver,
+        "value": permit.value,
+        "maxFee": permit.max_fee,
+        "deadline": permit.deadline,
+        "version": permit.version,
+        "nonce": permit.nonce,
+        "sig": sig,
+    })
+}
+
+fn clip(s: &str) -> String {
+    s.chars().take(300).collect()
 }
 
 #[cfg(test)]
