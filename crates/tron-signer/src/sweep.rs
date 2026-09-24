@@ -271,8 +271,10 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
         PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
         }
-        PayoutOutcome::Submitted { .. } => todo!("Task 4 Step 5"),
-        PayoutOutcome::FloatNotActive { .. } => todo!("Task 4 Step 5"),
+        PayoutOutcome::Submitted { trace_id } => serde_json::json!({"status": "submitted", "trace_id": trace_id}),
+        PayoutOutcome::FloatNotActive { float_address } => {
+            serde_json::json!({"status": "float_not_active", "float_address": float_address})
+        }
         PayoutOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
     }
 }

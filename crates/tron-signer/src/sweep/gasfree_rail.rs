@@ -214,7 +214,13 @@ const PRE_EXECUTION_REFUSALS: [&str; 9] = [
 
 /// The wire form of a trace, in this service's own names.
 pub fn trace_response(t: &Trace) -> serde_json::Value {
-    todo!("Task 4 Step 5")
+    serde_json::json!({
+        "state": t.state,
+        "txn_hash": t.txn_hash,
+        "txn_state": t.txn_state,
+        "txn_amount": t.txn_amount,
+        "txn_total_fee": t.txn_total_fee,
+    })
 }
 
 impl SweepClient {
@@ -416,11 +422,101 @@ impl SweepClient {
         to: &str,
         amount_usdt: i64,
     ) -> Result<PayoutOutcome, String> {
-        todo!("Task 4 Step 5")
+        // Until the permit is signed and sent, every failure provably moved nothing, so it is
+        // Refused and never Err: the treasury retries a Refused and hands anything else to a human.
+        let refused = |what: &str, e: String| -> Result<PayoutOutcome, String> {
+            Ok(PayoutOutcome::Refused(format!("{what}: {e}")))
+        };
+
+        let owner = match signer.payout_address() {
+            Ok(a) => a,
+            Err(e) => return refused("deriving the float's owner", e),
+        };
+        let float = match gasfree::gasfree_address(gf.cfg.chain, &owner) {
+            Ok(a) => a,
+            Err(e) => return refused("deriving the GasFree float", e),
+        };
+        if let Err(e) = abi_address(to) {
+            return refused("the payout destination", e);
+        }
+        match self.code_changed(&gf.cfg).await {
+            Ok(None) => {}
+            Ok(Some(reason)) => return Ok(PayoutOutcome::Refused(reason)),
+            Err(e) => return refused("reading GasFree's code", e),
+        }
+        match self.has_contract(&float).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(PayoutOutcome::FloatNotActive { float_address: float }),
+            Err(e) => return refused("reading whether the GasFree float is activated", e),
+        }
+        // Activated, so one transfer fee and no activation fee.
+        let max_fee = gasfree::fee_to_hold(true, gf.cfg.activate_fee_max_usdt, gf.cfg.transfer_fee_max_usdt);
+        let need = amount_usdt + max_fee;
+        let have = match self.usdt_balance(&float).await {
+            Ok(v) => v,
+            Err(e) => return refused("reading the GasFree float's balance", e),
+        };
+        if have < need {
+            return Ok(PayoutOutcome::FloatDry { float_address: float, have_usdt: have, need_usdt: need });
+        }
+        let account = match gf.relay.account(&owner, &self.cfg.usdt_contract).await {
+            Ok(a) => a,
+            Err(e) => return refused("reading the GasFree float's account from the relay", format!("{e:?}")),
+        };
+        if account.gasfree_address != float {
+            return Ok(PayoutOutcome::Refused(format!(
+                "the relay puts the GasFree float at {}, this signer derives {float}",
+                account.gasfree_address
+            )));
+        }
+        let nonce = match self.chain_nonce(gf.cfg.chain, &owner).await {
+            Ok(n) => n,
+            Err(e) => return refused("reading the float's nonce", e),
+        };
+        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
+            return Ok(PayoutOutcome::Refused(
+                "a transfer from the GasFree float is still in flight; retry once it lands".into(),
+            ));
+        }
+        let key = match signer.payout_signing_key() {
+            Ok(k) => k,
+            Err(e) => return refused("deriving the payout signing key", e),
+        };
+        let value = match u64::try_from(amount_usdt) {
+            Ok(v) => v,
+            Err(_) => return refused("the payout amount", format!("{amount_usdt} is negative")),
+        };
+        let permit = gasfree::Permit {
+            token: &self.cfg.usdt_contract,
+            service_provider: &gf.cfg.service_provider,
+            user: &owner,
+            receiver: to,
+            value,
+            max_fee: max_fee as u64,
+            deadline: deadline_after(gf.cfg.deadline_secs),
+            version: 1,
+            nonce,
+        };
+        let sig = match sign_permit(&key, gf.cfg.chain, &permit) {
+            Ok(s) => s,
+            Err(e) => return refused("signing the payout permit", e),
+        };
+
+        // From here the relay holds a permit that pays `to`. Only a trace id, or a refusal the
+        // docs list as a pre-execution check, is a clear answer. Anything else may still execute
+        // before the deadline, so it goes to a human as ambiguous and is never retried.
+        match gf.relay.submit(&permit, &sig).await {
+            Ok(trace_id) => Ok(PayoutOutcome::Submitted { trace_id }),
+            Err(RelayError::Refused { reason, message }) if PRE_EXECUTION_REFUSALS.contains(&reason.as_str()) => {
+                Ok(PayoutOutcome::Refused(format!("the relay refused the payout permit: {reason} {message}")))
+            }
+            Err(e) => Err(format!("the relay gave no clear answer to a signed payout permit: {e:?}")),
+        }
     }
 
     /// What became of a permit, by trace id. `None` when GasFree is off.
     pub async fn gasfree_trace(&self, trace_id: &str) -> Result<Option<Trace>, String> {
-        todo!("Task 4 Step 5")
+        let Some(gf) = &self.gasfree else { return Ok(None) };
+        gf.relay.trace(trace_id).await.map(Some).map_err(|e| format!("{e:?}"))
     }
 }
