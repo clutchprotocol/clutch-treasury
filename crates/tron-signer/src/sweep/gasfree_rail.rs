@@ -181,7 +181,19 @@ fn implementation_hex(name: &str, raw: &str) -> Result<String, String> {
 /// Not `sign_txid`'s convention, where TRON wants the bare recovery id 0 or 1. The GasFree docs'
 /// own example signature ends in `1b`, which is 27.
 pub(super) fn sign_permit(key: &SigningKey, chain: &gasfree::Chain, permit: &gasfree::Permit<'_>) -> Result<String, String> {
-    todo!("Task 3 Step 5")
+    let hash = gasfree::permit_hash(chain, permit)?;
+    let (sig, recid): (Signature, RecoveryId) =
+        key.sign_prehash(&hash).map_err(|e| format!("signing the permit failed: {e}"))?;
+    Ok(format!("{}{:02x}", hex::encode(sig.to_bytes()), recid.to_byte() + 27))
+}
+
+/// Now plus `secs`, in unix seconds: when a permit signed now stops being valid.
+fn deadline_after(secs: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + secs
 }
 
 impl SweepClient {
@@ -258,12 +270,31 @@ impl SweepClient {
 
     /// The next nonce the controller will accept from `user`: the chain's count, not the relay's.
     pub(super) async fn chain_nonce(&self, chain: &gasfree::Chain, user: &str) -> Result<u64, String> {
-        todo!("Task 3 Step 5")
+        let word = self.view_word(chain.controller, "nonces(address)", Some(&abi_address(user)?)).await?;
+        let (high, low) = word.split_at(48);
+        if high.bytes().any(|b| b != b'0') {
+            return Err(format!("nonces({user}) returned 0x{word}, more than a u64"));
+        }
+        u64::from_str_radix(low, 16).map_err(|e| format!("nonces({user}) returned 0x{word}: {e}"))
     }
 
     /// Why permits must stop, when GasFree's code is not the reviewed code; `None` when it is.
     pub(super) async fn code_changed(&self, cfg: &GasFreeConfig) -> Result<Option<String>, String> {
-        todo!("Task 3 Step 5")
+        let checks = [
+            ("beacon", cfg.chain.beacon, &cfg.expected_beacon_implementation),
+            ("controller", cfg.chain.controller, &cfg.expected_controller_implementation),
+        ];
+        for (what, proxy, expected) in checks {
+            let word = self.view_word(proxy, "implementation()", None).await?;
+            let now = &word[24..];
+            if now != expected.as_str() {
+                return Ok(Some(format!(
+                    "the GasFree {what} {proxy} now runs 0x{now}, not the reviewed 0x{expected}; nothing \
+                     will be signed until someone reviews the new code and updates the setting"
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /// Sweep the GasFree account `g` of the wallet `owner` at `index`, which holds `balance`.
@@ -276,11 +307,83 @@ impl SweepClient {
         g: &str,
         balance: i64,
     ) -> Result<SweepOutcome, String> {
-        todo!("Task 3 Step 5")
+        // The same number the treasury held back when it minted: the same maxima, the same
+        // function, and the same on-chain fact about activation.
+        let activated = self.has_contract(g).await?;
+        let max_fee = gasfree::fee_to_hold(activated, gf.cfg.activate_fee_max_usdt, gf.cfg.transfer_fee_max_usdt);
+        if balance <= max_fee {
+            return Ok(SweepOutcome::BelowFee { gasfree_address: g.to_string(), balance_usdt: balance, max_fee_usdt: max_fee });
+        }
+
+        if let Some(reason) = self.code_changed(&gf.cfg).await? {
+            return Ok(SweepOutcome::Halted { reason });
+        }
+
+        let account = gf
+            .relay
+            .account(owner, &self.cfg.usdt_contract)
+            .await
+            .map_err(|e| format!("reading the GasFree account of {owner} from the relay: {e:?}"))?;
+        if account.gasfree_address != g {
+            return Ok(SweepOutcome::Halted {
+                reason: format!(
+                    "the relay puts the GasFree account of {owner} at {}, this signer derives {g}",
+                    account.gasfree_address
+                ),
+            });
+        }
+        let nonce = self.chain_nonce(gf.cfg.chain, owner).await?;
+        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
+            return Ok(SweepOutcome::Busy { gasfree_address: g.to_string() });
+        }
+
+        let receiver = self.sweep_receiver(gf, signer).await?;
+        let value = balance - max_fee;
+        let permit = gasfree::Permit {
+            token: &self.cfg.usdt_contract,
+            service_provider: &gf.cfg.service_provider,
+            user: owner,
+            receiver: &receiver,
+            value: u64::try_from(value).map_err(|_| format!("sweep value {value} is negative"))?,
+            max_fee: u64::try_from(max_fee).map_err(|_| format!("maxFee {max_fee} is negative"))?,
+            deadline: deadline_after(gf.cfg.deadline_secs),
+            version: 1,
+            nonce,
+        };
+        let sig = sign_permit(&signer.signing_key_at(index)?, gf.cfg.chain, &permit)?;
+        // Taken out of the match so the permit's borrow of `receiver` has ended before `receiver`
+        // moves into the outcome.
+        let reply = gf.relay.submit(&permit, &sig).await;
+        match reply {
+            Ok(trace_id) => Ok(SweepOutcome::Pending {
+                trace_id,
+                gasfree_address: g.to_string(),
+                receiver,
+                value_usdt: value,
+                max_fee_usdt: max_fee,
+            }),
+            Err(RelayError::Refused { reason, message }) => Ok(SweepOutcome::Rejected { reason, message }),
+            // A sweep can only move money into this service's own float or custody, so an unclear
+            // answer is safe to leave to the next pass: the chain will show whether it ran, and a
+            // second permit reuses the same nonce unless the first one executed.
+            Err(RelayError::Unavailable(e)) => Err(format!("submitting the sweep permit for {g}: {e}")),
+        }
     }
 
     /// Where a GasFree sweep sends its value.
     async fn sweep_receiver(&self, gf: &GasFree, signer: &Signer) -> Result<String, String> {
-        todo!("Task 3 Step 5")
+        // The float first, while it is below its target and while redemptions are paid from it;
+        // custody otherwise. Both are fixed — the float derived, custody configured — so the caller
+        // still chooses nothing (spec §4).
+        //
+        // ponytail: one deposit larger than the target still goes wholly to the float, so the float
+        // can overshoot by one deposit. Splitting one sweep between two receivers needs two permits.
+        if gf.cfg.payouts {
+            let float = gasfree::gasfree_address(gf.cfg.chain, &signer.payout_address()?)?;
+            if self.usdt_balance(&float).await? < gf.cfg.payout_float_target_usdt {
+                return Ok(float);
+            }
+        }
+        Ok(self.cfg.treasury_address.clone())
     }
 }

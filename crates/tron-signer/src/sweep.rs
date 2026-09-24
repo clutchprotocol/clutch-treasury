@@ -212,7 +212,35 @@ pub enum FundFloatOutcome {
 /// failure — so a typo here stalls sweeps rather than moving money. The first four are the same
 /// literals the handler sent before GasFree existed.
 pub fn sweep_response(outcome: &SweepOutcome) -> serde_json::Value {
-    todo!("Task 3 Step 5")
+    use serde_json::json;
+    match outcome {
+        SweepOutcome::Swept { tx_id, amount_usdt } => json!({"status": "swept", "tx_id": tx_id, "amount_usdt": amount_usdt}),
+        SweepOutcome::NothingToSweep => json!({"status": "nothing_to_sweep"}),
+        SweepOutcome::Funded { tx_id, amount_sun } => json!({"status": "funded", "tx_id": tx_id, "amount_sun": amount_sun}),
+        SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => json!({
+            "status": "fee_account_dry",
+            "fee_address": fee_address,
+            "have_sun": have_sun,
+            "need_sun": need_sun,
+        }),
+        SweepOutcome::Pending { trace_id, gasfree_address, receiver, value_usdt, max_fee_usdt } => json!({
+            "status": "pending",
+            "trace_id": trace_id,
+            "gasfree_address": gasfree_address,
+            "receiver": receiver,
+            "value_usdt": value_usdt,
+            "max_fee_usdt": max_fee_usdt,
+        }),
+        SweepOutcome::Busy { gasfree_address } => json!({"status": "busy", "gasfree_address": gasfree_address}),
+        SweepOutcome::Rejected { reason, message } => json!({"status": "rejected", "reason": reason, "message": message}),
+        SweepOutcome::Halted { reason } => json!({"status": "halted", "reason": reason}),
+        SweepOutcome::BelowFee { gasfree_address, balance_usdt, max_fee_usdt } => json!({
+            "status": "below_fee",
+            "gasfree_address": gasfree_address,
+            "balance_usdt": balance_usdt,
+            "max_fee_usdt": max_fee_usdt,
+        }),
+    }
 }
 
 /// The wire form of a payout outcome.
