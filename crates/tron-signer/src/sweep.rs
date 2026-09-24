@@ -43,6 +43,10 @@ use sha2::{Digest, Sha256};
 
 use crate::keys::Signer;
 
+mod gasfree_rail;
+
+pub use gasfree_rail::{load_gasfree_config, GasFreeConfig, SelfTest};
+
 /// Enough TRX at a deposit address to pay for the one TRC-20 transfer that sweeps it.
 ///
 /// A fresh address holds none: it has only ever received tokens, and receiving does not create a
@@ -362,11 +366,26 @@ struct AccountRow {
 pub struct SweepClient {
     http: reqwest::Client,
     cfg: SweepConfig,
+    /// `None` unless GasFree is configured. While it is `None` nothing in this service derives,
+    /// reads or signs for a GasFree address — the state every signer is in until someone sets
+    /// `APP_GASFREE_API_KEY`.
+    gasfree: Option<gasfree_rail::GasFree>,
 }
 
 impl SweepClient {
     pub fn new(cfg: SweepConfig) -> Self {
-        Self { http: reqwest::Client::new(), cfg }
+        Self { http: reqwest::Client::new(), cfg, gasfree: None }
+    }
+
+    /// Turn the GasFree rail on.
+    pub fn with_gasfree(mut self, cfg: GasFreeConfig) -> Self {
+        self.gasfree = Some(gasfree_rail::GasFree::new(cfg));
+        self
+    }
+
+    /// The GasFree address of the wallet `plain`, when GasFree is on.
+    pub fn gasfree_address_for(&self, plain: &str) -> Result<Option<String>, String> {
+        self.gasfree.as_ref().map(|gf| gasfree::gasfree_address(gf.cfg.chain, plain)).transpose()
     }
 
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
