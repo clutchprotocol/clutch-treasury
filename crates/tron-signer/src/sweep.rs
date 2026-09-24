@@ -163,7 +163,8 @@ pub enum PayoutOutcome {
     /// Broadcast accepted; `tx_id` is the on-chain transfer.
     Paid { tx_id: String },
     /// The float does not hold enough USDT. Proof that nothing was broadcast. Only an operator
-    /// topping the float up resolves it.
+    /// topping the float up resolves it on the TRX rail; on the GasFree rail, sweeps refill the
+    /// GasFree float until it holds its target (spec §4).
     FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
     /// Above `per_tx_payout_cap_usdt`. Proof that nothing was broadcast.
     CapExceeded { limit_usdt: i64 },
@@ -180,6 +181,13 @@ pub enum PayoutOutcome {
     /// the treasury) even though some of ITS internal failures (a txID mismatch, a node rejecting
     /// the broadcast) are, in principle, also provable non-broadcasts. Drawing the line at the
     /// call rather than inside it keeps that guarantee simple enough to trust.
+    ///
+    /// The GasFree rail (`sweep/gasfree_rail.rs`) keeps the same rule with one exception. After a
+    /// signed payout permit was handed to the relay, a reply is `Refused` only when the relay
+    /// refused it with one of `PRE_EXECUTION_REFUSALS` — the refusals the GasFree docs list as its
+    /// checks before execution. At that point the relay holds a signed permit, and only its word
+    /// says the permit will not run; that is the trust the design already places in the pinned
+    /// relay. Any other answer after the permit was sent is `Err`, and so ambiguous.
     Refused(String),
     /// A GasFree permit paying `to` is with the relay. Not yet paid: the treasury follows
     /// `trace_id` to the on-chain transaction and confirms it there, as it confirms a TRX payout.
