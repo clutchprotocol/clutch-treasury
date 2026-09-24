@@ -21,20 +21,42 @@ const CREATE2_PREFIX: u8 = 0x41;
 ///
 /// USDT sent here can be moved later by a permit signed with `user`'s key. The beacon's upgrade
 /// authority can also move it; that is the risk the design accepted.
-pub fn gasfree_address(_chain: &Chain, _user: &str) -> Result<String, String> {
-    Ok(String::new())
+pub fn gasfree_address(chain: &Chain, user: &str) -> Result<String, String> {
+    let hash = keccak(
+        &[
+            &[CREATE2_PREFIX][..],
+            &decode(chain.controller)?[..],
+            &salt(user)?[..],
+            &bytecode_hash(chain, user)?[..],
+        ]
+        .concat(),
+    );
+    let mut body = [0u8; 20];
+    body.copy_from_slice(&hash[12..]);
+    Ok(encode(&body))
 }
 
 /// `user`'s 20 bytes, left-padded to 32. It is the CREATE2 salt, and also the argument of the
 /// `initialize` call.
-fn salt(_user: &str) -> Result<[u8; 32], String> {
-    Ok([0; 32])
+fn salt(user: &str) -> Result<[u8; 32], String> {
+    Ok(address_word(&decode(user)?))
 }
 
 /// Keccak-256 of the proxy's creation code followed by its ABI-encoded constructor arguments,
 /// `(address beacon, bytes initData)`, where `initData` is the call `initialize(user)`.
-fn bytecode_hash(_chain: &Chain, _user: &str) -> Result<[u8; 32], String> {
-    Ok([0; 32])
+fn bytecode_hash(chain: &Chain, user: &str) -> Result<[u8; 32], String> {
+    let init_data = [&keccak(b"initialize(address)")[..4], &salt(user)?[..]].concat();
+    let mut args = [
+        &address_word(&decode(chain.beacon)?)[..],
+        // `bytes` is a dynamic type, so its head word holds the offset of its tail. The tail
+        // starts after the two head words.
+        &uint_word(64)[..],
+        &uint_word(init_data.len() as u64)[..],
+        &init_data[..],
+    ]
+    .concat();
+    args.resize(160, 0); // pad the 36-byte tail up to a whole number of 32-byte words
+    Ok(keccak(&[&chain.creation_code()[..], &args[..]].concat()))
 }
 
 #[cfg(test)]
