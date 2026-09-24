@@ -223,6 +223,28 @@ pub fn trace_response(t: &Trace) -> serde_json::Value {
     })
 }
 
+/// The float's first transfer moves this much to custody: the smallest possible amount, one
+/// micro-USDT. The relay does not document a minimum; rollout step 4 (Plan 4) finds out.
+const ACTIVATION_VALUE_USDT: i64 = 1;
+
+/// What one activation attempt did. Read by an operator, from a workflow's run log.
+#[derive(Debug, PartialEq)]
+pub enum ActivateFloatOutcome {
+    /// The float's first permit is with the relay. Once it executes the float is activated.
+    Submitted { trace_id: String },
+    /// The float already has its contract. Nothing to do; nothing was signed.
+    AlreadyActive { float_address: String },
+    /// The float cannot pay the activation, one transfer fee and the smallest transfer. Nothing
+    /// was signed; the float fills from sweeps (spec §4).
+    FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
+    /// Provably nothing was submitted, or the relay refused it.
+    Refused(String),
+}
+
+pub fn activate_float_response(o: &ActivateFloatOutcome) -> serde_json::Value {
+    todo!("Task 5 Step 4")
+}
+
 impl SweepClient {
     /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
     pub(super) async fn has_contract(&self, address: &str) -> Result<bool, String> {
@@ -518,5 +540,15 @@ impl SweepClient {
     pub async fn gasfree_trace(&self, trace_id: &str) -> Result<Option<Trace>, String> {
         let Some(gf) = &self.gasfree else { return Ok(None) };
         gf.relay.trace(trace_id).await.map(Some).map_err(|e| format!("{e:?}"))
+    }
+
+    /// Make the GasFree float's first transfer, which is what makes the relay deploy its contract.
+    ///
+    /// Takes nothing, like `fund_float`: the source is the float, the receiver is custody, the
+    /// value is the smallest possible, and `maxFee` covers activation plus one transfer. What it
+    /// costs — the relay's fee — must come from surplus, which is why the workflow that calls this
+    /// refuses unless the reserve leads supply by at least that much (spec §4).
+    pub async fn activate_float(&self, signer: &Signer) -> Result<ActivateFloatOutcome, String> {
+        todo!("Task 5 Step 4")
     }
 }

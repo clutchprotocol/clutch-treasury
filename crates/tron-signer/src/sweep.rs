@@ -45,7 +45,9 @@ use crate::keys::Signer;
 
 mod gasfree_rail;
 
-pub use gasfree_rail::{load_gasfree_config, trace_response, GasFreeConfig, SelfTest};
+pub use gasfree_rail::{
+    activate_float_response, load_gasfree_config, trace_response, ActivateFloatOutcome, GasFreeConfig, SelfTest,
+};
 
 /// Enough TRX at a deposit address to pay for the one TRC-20 transfer that sweeps it.
 ///

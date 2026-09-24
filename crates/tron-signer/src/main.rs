@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, FundFloatOutcome,
+    activate_float_response, ActivateFloatOutcome, fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, FundFloatOutcome,
     PayoutOutcome, SelfTest, SweepClient, SweepConfig,
 };
 
@@ -241,6 +241,29 @@ async fn fund_float(State(s): State<AppState>, headers: HeaderMap) -> Result<Jso
     }
 }
 
+/// No request struct, like fund-float: source, receiver, value and fee are all fixed.
+async fn activate_float(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    match s.sweeper.activate_float(&s.signer).await {
+        Ok(outcome) => {
+            match &outcome {
+                ActivateFloatOutcome::Submitted { trace_id } => tracing::info!(%trace_id, "GasFree float activation submitted"),
+                ActivateFloatOutcome::AlreadyActive { float_address } => tracing::info!(%float_address, "GasFree float already active"),
+                ActivateFloatOutcome::FloatDry { float_address, have_usdt, need_usdt } => {
+                    tracing::warn!(%float_address, have_usdt, need_usdt, "GasFree float cannot pay for its activation")
+                }
+                ActivateFloatOutcome::Refused(reason) => tracing::warn!(%reason, "GasFree float activation refused"),
+            }
+            Ok(Json(activate_float_response(&outcome)))
+        }
+        // Only after a permit was sent: the operator must read the float on chain.
+        Err(e) => {
+            tracing::error!("GasFree float activation gave no clear answer: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -291,6 +314,7 @@ async fn main() {
         .route("/internal/payout", post(payout))
         .route("/internal/gasfree/trace/:trace_id", get(gasfree_trace))
         .route("/internal/fund-float", post(fund_float))
+        .route("/internal/activate-float", post(activate_float))
         .with_state(state);
 
     let addr = std::env::var("APP_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8093".into());

@@ -839,3 +839,79 @@ async fn a_trace_is_reported_in_the_signers_own_words() {
     );
     assert_eq!(SweepClient::new(sweep_config(&url)).gasfree_trace(TRACE_ID).await.unwrap(), None, "off means no trace");
 }
+
+// ---- activating the float ----
+
+#[tokio::test]
+async fn activation_sends_the_smallest_amount_from_the_float_to_custody() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(float_of(&s), 5_000_000); // not activated: no contract record
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).activate_float(&s).await.unwrap();
+
+    assert_eq!(outcome, ActivateFloatOutcome::Submitted { trace_id: TRACE_ID.into() });
+    let p = &named(&world, "submit")[0];
+    assert_eq!(p["user"], s.payout_address().unwrap());
+    assert_eq!(p["receiver"], CUSTODY, "custody gets the value back; only the fee leaves the reserve");
+    assert_eq!(p["value"], 1);
+    assert_eq!(p["maxFee"], ACTIVATE_MAX + TRANSFER_MAX, "the first transfer pays activation too");
+    assert_eq!(&signer_of(p), s.payout_signing_key().unwrap().verifying_key());
+}
+
+#[tokio::test]
+async fn an_activated_float_is_left_alone() {
+    let s = signer();
+    let (url, world) = spawn(with_float(&s)).await;
+
+    assert_eq!(
+        client(&url).activate_float(&s).await.unwrap(),
+        ActivateFloatOutcome::AlreadyActive { float_address: float_of(&s) }
+    );
+    assert!(named(&world, "submit").is_empty(), "re-running the workflow must cost nothing");
+}
+
+#[tokio::test]
+async fn a_float_that_cannot_pay_for_its_activation_is_dry() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(float_of(&s), ACTIVATE_MAX + TRANSFER_MAX); // one micro-USDT short
+    let (url, world) = spawn(w).await;
+
+    assert_eq!(
+        client(&url).activate_float(&s).await.unwrap(),
+        ActivateFloatOutcome::FloatDry {
+            float_address: float_of(&s),
+            have_usdt: ACTIVATE_MAX + TRANSFER_MAX,
+            need_usdt: 1 + ACTIVATE_MAX + TRANSFER_MAX,
+        }
+    );
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn activation_without_gasfree_is_refused() {
+    let outcome = SweepClient::new(sweep_config("http://127.0.0.1:1")).activate_float(&signer()).await.unwrap();
+    assert!(matches!(outcome, ActivateFloatOutcome::Refused(_)), "got {outcome:?}");
+}
+
+#[test]
+fn every_activation_status_string_is_pinned() {
+    assert_eq!(
+        activate_float_response(&ActivateFloatOutcome::Submitted { trace_id: "t".into() }),
+        serde_json::json!({"status": "submitted", "trace_id": "t"})
+    );
+    assert_eq!(
+        activate_float_response(&ActivateFloatOutcome::AlreadyActive { float_address: "f".into() }),
+        serde_json::json!({"status": "already_active", "float_address": "f"})
+    );
+    assert_eq!(
+        activate_float_response(&ActivateFloatOutcome::FloatDry { float_address: "f".into(), have_usdt: 1, need_usdt: 2 }),
+        serde_json::json!({"status": "float_dry", "float_address": "f", "have_usdt": 1, "need_usdt": 2})
+    );
+    assert_eq!(
+        activate_float_response(&ActivateFloatOutcome::Refused("r".into())),
+        serde_json::json!({"status": "refused", "reason": "r"})
+    );
+}
