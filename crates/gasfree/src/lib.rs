@@ -10,8 +10,10 @@
 //! Design: `docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md`.
 
 mod address;
+mod permit;
 
 pub use address::gasfree_address;
+pub use permit::{permit_hash, Permit};
 
 use sha3::{Digest, Keccak256};
 
