@@ -1,7 +1,10 @@
 //! The signer's HTTP surface.
 //!
-//! Four routes. The sweep route's shape IS its security argument: it accepts an INDEX and nothing
-//! else, so no field a caller sets can redirect funds.
+//! The sweep route's shape IS its security argument: it accepts an INDEX and nothing else, so no
+//! field a caller sets can redirect funds. That holds on the GasFree rail too — every field of a
+//! GasFree permit comes from this service's config or from the chain.
+//!
+//! `/internal/addresses/:index` and `/internal/xpub` move nothing; they publish derived addresses.
 //!
 //! The payout route cannot make that claim and does not pretend to — it takes a destination and an
 //! amount because a redemption has no other way to express them. Its bound is different: the source
@@ -15,7 +18,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -24,8 +27,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    fund_float_response, payout_response, validate_payout_cap, FundFloatOutcome, PayoutOutcome, SweepClient,
-    SweepConfig, SweepOutcome,
+    fund_float_response, load_gasfree_config, payout_response, validate_payout_cap, FundFloatOutcome,
+    PayoutOutcome, SelfTest, SweepClient, SweepConfig, SweepOutcome,
 };
 
 #[derive(Clone)]
@@ -74,11 +77,46 @@ async fn xpub(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serd
         tracing::error!("payout address derivation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // Where redemptions are paid from on the GasFree rail, and what provisioning writes into the
+    // treasury's PAYOUT_FLOAT_ADDRESS so the reserve counts the same float the signer spends from.
+    let payout_gasfree_address = s.sweeper.gasfree_address_for(&payout_address).map_err(|e| {
+        tracing::error!("GasFree float address derivation failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(Json(json!({
         "account_xpub": s.signer.account_xpub(),
         "fee_address": fee_address,
         "payout_address": payout_address,
+        "payout_gasfree_address": payout_gasfree_address,
     })))
+}
+
+/// Both deposit addresses of `index`: the plain one and, when GasFree is on, its GasFree account.
+///
+/// Public material, and it moves nothing. The treasury reads it to decide how much of a deposit to
+/// hold back: USDT paid to the GasFree address pays a relay fee when it is swept, USDT paid to the
+/// plain address does not. It asks here, where the addresses are derived, rather than trusting the
+/// address the orchestrator reported, because that fee must not be the orchestrator's choice.
+async fn addresses(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(index): Path<u32>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    // Hardened indexes are never handed out: the orchestrator derives from an xpub and cannot
+    // reach them, so a question about one is about an address no depositor has.
+    if index >= 0x8000_0000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let plain = s.signer.address_at(index).map_err(|e| {
+        tracing::error!("address derivation for index {index} failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let gasfree = s.sweeper.gasfree_address_for(&plain).map_err(|e| {
+        tracing::error!("GasFree address derivation for index {index} failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({"index": index, "plain": plain, "gasfree": gasfree})))
 }
 
 /// ONLY an index. Adding `to`, `contract` or `amount` here would delete the reason this service
@@ -206,19 +244,37 @@ async fn main() {
     );
     tracing::info!("deposit wallet account xpub: {}", signer.account_xpub());
 
-    let sweeper = Arc::new(SweepClient::new(SweepConfig {
+    // Off unless APP_GASFREE_API_KEY is set. A half-configured rail stops the signer here, not at
+    // the first deposit.
+    let gasfree = load_gasfree_config(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+
+    let mut sweeper = SweepClient::new(SweepConfig {
         trongrid_url: env("APP_TRONGRID_URL"),
         trongrid_api_key: std::env::var("APP_TRONGRID_API_KEY").unwrap_or_default(),
         treasury_address: env("APP_TREASURY_ADDRESS"),
         usdt_contract: env("APP_USDT_CONTRACT"),
         fee_limit: std::env::var("APP_FEE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(150_000_000),
         per_tx_payout_cap_usdt: validate_payout_cap(&env("APP_PER_TX_PAYOUT_CAP_USDT")).unwrap_or_else(|e| panic!("{e}")),
-    }));
+    });
+    if let Some(cfg) = gasfree {
+        tracing::info!(chain_id = cfg.chain.chain_id, payouts = cfg.payouts, "GasFree rail on");
+        sweeper = sweeper.with_gasfree(cfg);
+    }
+    let sweeper = Arc::new(sweeper);
+    match sweeper.gasfree_self_test(&signer).await {
+        SelfTest::Passed => {}
+        SelfTest::Failed(e) => panic!("GasFree self-test failed: {e}"),
+        SelfTest::Unreachable(e) => tracing::warn!(
+            "GasFree self-test could not reach TronGrid, so it did not run; every permit is still checked \
+             before it is signed: {e}"
+        ),
+    }
 
     let state = AppState { signer, sweeper, token: env("APP_SIGNER_TOKEN") };
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/internal/xpub", get(xpub))
+        .route("/internal/addresses/:index", get(addresses))
         .route("/internal/sweep", post(sweep))
         .route("/internal/payout", post(payout))
         .route("/internal/fund-float", post(fund_float))

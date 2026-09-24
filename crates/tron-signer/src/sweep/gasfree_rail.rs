@@ -82,24 +82,165 @@ pub enum SelfTest {
 /// GasFree is on when `APP_GASFREE_API_KEY` is set, and then every other setting is required: a
 /// missing one stops the signer at boot, not at the first deposit.
 pub fn load_gasfree_config(var: impl Fn(&str) -> Option<String>) -> Result<Option<GasFreeConfig>, String> {
-    todo!("Task 2 Step 5")
+    let rail = var("APP_TRANSFER_RAIL").unwrap_or_else(|| "trx".to_string());
+    let payouts = match rail.trim() {
+        "trx" => false,
+        "gasfree" => true,
+        other => return Err(format!("APP_TRANSFER_RAIL must be trx or gasfree, got {other:?}")),
+    };
+    let api_key = var("APP_GASFREE_API_KEY").map(|v| v.trim().to_string()).unwrap_or_default();
+    if api_key.is_empty() {
+        return if payouts {
+            Err("APP_TRANSFER_RAIL=gasfree needs APP_GASFREE_API_KEY and the other APP_GASFREE_* settings".into())
+        } else {
+            Ok(None)
+        };
+    }
+
+    let required = |name: &str| {
+        var(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{name} must be set when APP_GASFREE_API_KEY is"))
+    };
+    let chain: &'static gasfree::Chain = match required("APP_GASFREE_NETWORK")?.as_str() {
+        "nile" => &gasfree::NILE,
+        "mainnet" => &gasfree::MAINNET,
+        other => return Err(format!("APP_GASFREE_NETWORK must be nile or mainnet, got {other:?}")),
+    };
+    let service_provider = required("APP_GASFREE_SERVICE_PROVIDER")?;
+    abi_address(&service_provider).map_err(|e| format!("APP_GASFREE_SERVICE_PROVIDER: {e}"))?;
+    let deadline_secs = match var("APP_GASFREE_DEADLINE_SECS") {
+        None => 180,
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("APP_GASFREE_DEADLINE_SECS must be whole seconds, got {raw:?}"))?,
+    };
+    // The relay's published limits. A permit outside them is refused at submit, every time.
+    if !(60..=600).contains(&deadline_secs) {
+        return Err(format!("APP_GASFREE_DEADLINE_SECS must be 60 to 600, got {deadline_secs}"));
+    }
+
+    Ok(Some(GasFreeConfig {
+        chain,
+        relay: RelayConfig {
+            base_url: required("APP_GASFREE_API_URL")?.trim_end_matches('/').to_string(),
+            api_key,
+            api_secret: required("APP_GASFREE_API_SECRET")?,
+        },
+        service_provider,
+        activate_fee_max_usdt: positive_micro_usdt(
+            "APP_GASFREE_ACTIVATE_FEE_MAX_USDT",
+            &required("APP_GASFREE_ACTIVATE_FEE_MAX_USDT")?,
+        )?,
+        transfer_fee_max_usdt: positive_micro_usdt(
+            "APP_GASFREE_TRANSFER_FEE_MAX_USDT",
+            &required("APP_GASFREE_TRANSFER_FEE_MAX_USDT")?,
+        )?,
+        expected_beacon_implementation: implementation_hex(
+            "APP_GASFREE_EXPECTED_IMPLEMENTATION",
+            &required("APP_GASFREE_EXPECTED_IMPLEMENTATION")?,
+        )?,
+        expected_controller_implementation: implementation_hex(
+            "APP_GASFREE_EXPECTED_CONTROLLER_IMPLEMENTATION",
+            &required("APP_GASFREE_EXPECTED_CONTROLLER_IMPLEMENTATION")?,
+        )?,
+        payout_float_target_usdt: positive_micro_usdt(
+            "APP_PAYOUT_FLOAT_TARGET_USDT",
+            &required("APP_PAYOUT_FLOAT_TARGET_USDT")?,
+        )?,
+        deadline_secs,
+        payouts,
+    }))
+}
+
+/// A zero maximum would sign permits the relay refuses, stopping every sweep while looking set up.
+fn positive_micro_usdt(name: &str, raw: &str) -> Result<i64, String> {
+    match raw.trim().parse::<i64>() {
+        Ok(v) if v > 0 => Ok(v),
+        _ => Err(format!("{name} must be a positive whole number of micro-USDT, got {raw:?}")),
+    }
+}
+
+/// `0xA3B0…` or `a3b0…` in, 40 lowercase hex characters out.
+fn implementation_hex(name: &str, raw: &str) -> Result<String, String> {
+    let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase();
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{name} must be a 20-byte hex address like 0xa3b0edff…, got {raw:?}"));
+    }
+    Ok(hex)
 }
 
 impl SweepClient {
     /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
     pub(super) async fn has_contract(&self, address: &str) -> Result<bool, String> {
-        todo!("Task 2 Step 5")
+        // `contract_address`, NOT `bytecode`: on 2026-09-24 the activated mainnet GasFree account
+        // TBdkSW3VkKsA8RxmZFxMvNezimndUEymgg returned its contract record with an EMPTY bytecode,
+        // and an address with no contract returns `{}`.
+        let resp = self.post("/wallet/getcontract", serde_json::json!({"value": address, "visible": true})).await?;
+        Ok(resp["contract_address"].as_str().is_some_and(|a| !a.is_empty()))
     }
 
     /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
     async fn view_word(&self, contract: &str, selector: &str, parameter: Option<&str>) -> Result<String, String> {
-        todo!("Task 2 Step 5")
+        // The contract is also the caller. TronGrid wants an `owner_address`, and a view call's
+        // caller changes nothing.
+        let mut body = serde_json::json!({
+            "owner_address": contract,
+            "contract_address": contract,
+            "function_selector": selector,
+            "visible": true,
+        });
+        if let Some(p) = parameter {
+            body["parameter"] = serde_json::Value::from(p);
+        }
+        let resp = self.post("/wallet/triggerconstantcontract", body).await?;
+        let word = resp["constant_result"][0]
+            .as_str()
+            .ok_or_else(|| format!("{selector} on {contract} returned nothing: {}", describe_rejection(&resp)))?;
+        if word.len() != 64 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{selector} on {contract} returned {word:?}, not one 32-byte word"));
+        }
+        Ok(word.to_ascii_lowercase())
     }
 
     /// Once at boot: are these GasFree constants the ones deployed on the network this TronGrid
     /// serves? A Nile setting on a mainnet signer fails here instead of handing out addresses that
     /// nobody controls.
     pub async fn gasfree_self_test(&self, signer: &Signer) -> SelfTest {
-        todo!("Task 2 Step 5")
+        let Some(gf) = &self.gasfree else { return SelfTest::Passed };
+        let chain = gf.cfg.chain;
+        match self.has_contract(chain.controller).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return SelfTest::Failed(format!(
+                    "the GasFree controller {} is not a contract on this TronGrid: APP_GASFREE_NETWORK does \
+                     not match APP_TRONGRID_URL",
+                    chain.controller
+                ))
+            }
+            Err(e) => return SelfTest::Unreachable(e),
+        }
+        let owner = match signer.address_at(0) {
+            Ok(a) => a,
+            Err(e) => return SelfTest::Failed(e),
+        };
+        let ours = match gasfree::gasfree_address(chain, &owner).and_then(|g| abi_address(&g)) {
+            Ok(word) => word[24..].to_string(),
+            Err(e) => return SelfTest::Failed(e),
+        };
+        let parameter = match abi_address(&owner) {
+            Ok(p) => p,
+            Err(e) => return SelfTest::Failed(e),
+        };
+        match self.view_word(chain.controller, "getGasFreeAddress(address)", Some(&parameter)).await {
+            Ok(word) if word[24..] == ours => SelfTest::Passed,
+            Ok(word) => SelfTest::Failed(format!(
+                "the controller puts the GasFree account of {owner} at 0x{}, this signer derives 0x{ours}",
+                &word[24..]
+            )),
+            Err(e) => SelfTest::Unreachable(e),
+        }
     }
 }
