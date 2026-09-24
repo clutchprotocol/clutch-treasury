@@ -994,3 +994,23 @@ fn a_blank_optional_setting_counts_as_unset() {
     assert!(!cfg.payouts, "a blank rail is trx");
     assert_eq!(cfg.deadline_secs, 180, "a blank deadline is the default");
 }
+
+#[tokio::test]
+async fn a_documented_relay_refusal_of_the_activation_is_refused() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(float_of(&s), 5_000_000); // not activated: no contract record
+    w.submit_reply = serde_json::json!({
+        "code": 400, "reason": "InsufficientBalanceException", "message": "insufficient balance", "data": null,
+    })
+    .to_string();
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).activate_float(&s).await.unwrap();
+
+    assert!(
+        matches!(outcome, ActivateFloatOutcome::Refused(ref why) if why.contains("InsufficientBalanceException")),
+        "got {outcome:?}"
+    );
+    assert_eq!(named(&world, "submit").len(), 1, "exactly one permit");
+}

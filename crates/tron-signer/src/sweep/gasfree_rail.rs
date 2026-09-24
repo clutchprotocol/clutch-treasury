@@ -87,13 +87,15 @@ pub enum SelfTest {
 /// GasFree is on when `APP_GASFREE_API_KEY` is set, and then every other setting is required: a
 /// missing one stops the signer at boot, not at the first deposit.
 pub fn load_gasfree_config(var: impl Fn(&str) -> Option<String>) -> Result<Option<GasFreeConfig>, String> {
-    let rail = var("APP_TRANSFER_RAIL").unwrap_or_else(|| "trx".to_string());
-    let payouts = match rail.trim() {
+    // Blank is unset: the deploy repo passes an unset optional value as an empty string (`${X:-}`).
+    let optional = |name: &str| var(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let rail = optional("APP_TRANSFER_RAIL").unwrap_or_else(|| "trx".to_string());
+    let payouts = match rail.as_str() {
         "trx" => false,
         "gasfree" => true,
         other => return Err(format!("APP_TRANSFER_RAIL must be trx or gasfree, got {other:?}")),
     };
-    let api_key = var("APP_GASFREE_API_KEY").map(|v| v.trim().to_string()).unwrap_or_default();
+    let api_key = optional("APP_GASFREE_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         return if payouts {
             Err("APP_TRANSFER_RAIL=gasfree needs APP_GASFREE_API_KEY and the other APP_GASFREE_* settings".into())
@@ -102,12 +104,7 @@ pub fn load_gasfree_config(var: impl Fn(&str) -> Option<String>) -> Result<Optio
         };
     }
 
-    let required = |name: &str| {
-        var(name)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{name} must be set when APP_GASFREE_API_KEY is"))
-    };
+    let required = |name: &str| optional(name).ok_or_else(|| format!("{name} must be set when APP_GASFREE_API_KEY is"));
     let chain: &'static gasfree::Chain = match required("APP_GASFREE_NETWORK")?.as_str() {
         "nile" => &gasfree::NILE,
         "mainnet" => &gasfree::MAINNET,
@@ -115,10 +112,9 @@ pub fn load_gasfree_config(var: impl Fn(&str) -> Option<String>) -> Result<Optio
     };
     let service_provider = required("APP_GASFREE_SERVICE_PROVIDER")?;
     abi_address(&service_provider).map_err(|e| format!("APP_GASFREE_SERVICE_PROVIDER: {e}"))?;
-    let deadline_secs = match var("APP_GASFREE_DEADLINE_SECS") {
+    let deadline_secs = match optional("APP_GASFREE_DEADLINE_SECS") {
         None => 180,
         Some(raw) => raw
-            .trim()
             .parse::<u64>()
             .map_err(|_| format!("APP_GASFREE_DEADLINE_SECS must be whole seconds, got {raw:?}"))?,
     };
@@ -198,8 +194,9 @@ fn deadline_after(secs: u64) -> u64 {
 }
 
 /// The refusals the GasFree docs list for `submit`. Each is the relay's pre-execution check
-/// failing, so for a payout it proves the permit did not pay. Any other answer to a signed payout
-/// permit is ambiguous: the permit may still execute before its deadline.
+/// failing, so for a payout or the float's activation it is the relay's word that the permit did
+/// not run. Any other answer to a signed payout or activation permit is ambiguous: the permit may
+/// still execute before its deadline.
 const PRE_EXECUTION_REFUSALS: [&str; 9] = [
     "ProviderAddressNotMatchException",
     "DeadlineExceededException",
@@ -237,7 +234,8 @@ pub enum ActivateFloatOutcome {
     /// The float cannot pay the activation, one transfer fee and the smallest transfer. Nothing
     /// was signed; the float fills from sweeps (spec §4).
     FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
-    /// Provably nothing was submitted, or the relay refused it.
+    /// Provably nothing was submitted, or the relay refused the permit with one of
+    /// `PRE_EXECUTION_REFUSALS`.
     Refused(String),
 }
 
@@ -259,12 +257,22 @@ pub fn activate_float_response(o: &ActivateFloatOutcome) -> serde_json::Value {
 
 impl SweepClient {
     /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
+    /// Any answer that is neither a contract record nor `{}` is an error, never "no".
     pub(super) async fn has_contract(&self, address: &str) -> Result<bool, String> {
         // `contract_address`, NOT `bytecode`: on 2026-09-24 the activated mainnet GasFree account
         // TBdkSW3VkKsA8RxmZFxMvNezimndUEymgg returned its contract record with an EMPTY bytecode,
         // and an address with no contract returns `{}`.
         let resp = self.post("/wallet/getcontract", serde_json::json!({"value": address, "visible": true})).await?;
-        Ok(resp["contract_address"].as_str().is_some_and(|a| !a.is_empty()))
+        if resp["contract_address"].as_str().is_some_and(|a| !a.is_empty()) {
+            return Ok(true);
+        }
+        // Only `{}` means "no contract". TronGrid answers its own errors — a rate limit, a bad key —
+        // as JSON too, and reading one of those as "not activated" would size maxFee for an
+        // activation that already happened: more than the treasury held back.
+        if resp.as_object().is_some_and(|o| o.is_empty()) {
+            return Ok(false);
+        }
+        Err(format!("getcontract for {address} gave neither a contract nor {{}}: {}", describe_rejection(&resp)))
     }
 
     /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
@@ -633,12 +641,14 @@ impl SweepClient {
         };
         // The receiver is custody and the value one micro-USDT, so even an unclear answer cannot
         // send money anywhere but home. It is still Err, so the operator reads the chain.
-        match gf.relay.submit(&permit, &sig).await {
+        let reply = gf.relay.submit(&permit, &sig).await;
+        match reply {
             Ok(trace_id) => Ok(ActivateFloatOutcome::Submitted { trace_id }),
-            Err(RelayError::Refused { reason, message }) => {
+            Err(RelayError::Refused { reason, message }) if PRE_EXECUTION_REFUSALS.contains(&reason.as_str()) => {
                 Ok(ActivateFloatOutcome::Refused(format!("the relay refused the activation permit: {reason} {message}")))
             }
-            Err(RelayError::Unavailable(e)) => Err(format!("submitting the activation permit: {e}")),
+            // The workflow only sees a 500, so the relay's own words must be in the error.
+            Err(e) => Err(format!("the relay gave no clear answer to the activation permit: {e:?}")),
         }
     }
 }
