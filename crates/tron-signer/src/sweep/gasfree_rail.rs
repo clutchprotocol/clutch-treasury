@@ -29,9 +29,8 @@
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 
 use super::{abi_address, describe_rejection, PayoutOutcome, SweepClient, SweepOutcome};
-use crate::relay::Trace;
 use crate::keys::Signer;
-use crate::relay::{Relay, RelayConfig, RelayError};
+use crate::relay::{Relay, RelayConfig, RelayError, Trace};
 
 #[cfg(test)]
 mod tests;
@@ -80,6 +79,17 @@ pub enum SelfTest {
     Failed(String),
     /// TronGrid did not answer. Not fatal: the checks before each permit still run.
     Unreachable(String),
+}
+
+/// Why a permit must not be signed for an account yet.
+#[derive(Debug)]
+enum NotReady {
+    /// The relay's account or the chain's nonce could not be read. Nothing was signed; retry.
+    Unread(String),
+    /// The relay and this signer disagree about the GasFree address. Nothing is signed until a human looks.
+    Halt(String),
+    /// A transfer from this account is in flight: the relay's nonce is ahead of the chain's, or it says wait.
+    InFlight(String),
 }
 
 /// Read the GasFree settings. `Ok(None)` means GasFree is off, which is the default.
@@ -366,6 +376,31 @@ impl SweepClient {
         Ok(None)
     }
 
+    /// The nonce the next permit for `owner`'s GasFree account `account` must carry — the chain's —
+    /// or why there must not be a permit yet. One copy of the checks every permit needs after the
+    /// tripwire. An address disagreement outranks a transfer in flight.
+    async fn next_nonce(&self, gf: &GasFree, owner: &str, account: &str) -> Result<u64, NotReady> {
+        let relay = gf
+            .relay
+            .account(owner, &self.cfg.usdt_contract)
+            .await
+            .map_err(|e| NotReady::Unread(format!("reading the GasFree account of {owner} from the relay: {e:?}")))?;
+        if relay.gasfree_address != account {
+            return Err(NotReady::Halt(format!(
+                "the relay puts the GasFree account of {owner} at {}, this signer derives {account}",
+                relay.gasfree_address
+            )));
+        }
+        let nonce = self.chain_nonce(gf.cfg.chain, owner).await.map_err(NotReady::Unread)?;
+        if !relay.allow_submit || relay.frozen > 0 || relay.nonce != nonce {
+            return Err(NotReady::InFlight(format!(
+                "a transfer from {account} is in flight: relay nonce {}, chain nonce {nonce}, allowSubmit {}, frozen {}",
+                relay.nonce, relay.allow_submit, relay.frozen
+            )));
+        }
+        Ok(nonce)
+    }
+
     /// Sweep the GasFree account `g` of the wallet `owner` at `index`, which holds `balance`.
     pub(super) async fn sweep_gasfree(
         &self,
@@ -388,23 +423,15 @@ impl SweepClient {
             return Ok(SweepOutcome::Halted { reason });
         }
 
-        let account = gf
-            .relay
-            .account(owner, &self.cfg.usdt_contract)
-            .await
-            .map_err(|e| format!("reading the GasFree account of {owner} from the relay: {e:?}"))?;
-        if account.gasfree_address != g {
-            return Ok(SweepOutcome::Halted {
-                reason: format!(
-                    "the relay puts the GasFree account of {owner} at {}, this signer derives {g}",
-                    account.gasfree_address
-                ),
-            });
-        }
-        let nonce = self.chain_nonce(gf.cfg.chain, owner).await?;
-        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
-            return Ok(SweepOutcome::Busy { gasfree_address: g.to_string() });
-        }
+        let nonce = match self.next_nonce(gf, owner, g).await {
+            Ok(n) => n,
+            Err(NotReady::Unread(e)) => return Err(e),
+            Err(NotReady::Halt(reason)) => return Ok(SweepOutcome::Halted { reason }),
+            Err(NotReady::InFlight(r)) => {
+                tracing::info!("{r}");
+                return Ok(SweepOutcome::Busy { gasfree_address: g.to_string() });
+            }
+        };
 
         let receiver = self.sweep_receiver(gf, signer).await?;
         let value = balance - max_fee;
@@ -501,25 +528,12 @@ impl SweepClient {
         if have < need {
             return Ok(PayoutOutcome::FloatDry { float_address: float, have_usdt: have, need_usdt: need });
         }
-        let account = match gf.relay.account(&owner, &self.cfg.usdt_contract).await {
-            Ok(a) => a,
-            Err(e) => return refused("reading the GasFree float's account from the relay", format!("{e:?}")),
-        };
-        if account.gasfree_address != float {
-            return Ok(PayoutOutcome::Refused(format!(
-                "the relay puts the GasFree float at {}, this signer derives {float}",
-                account.gasfree_address
-            )));
-        }
-        let nonce = match self.chain_nonce(gf.cfg.chain, &owner).await {
+        let nonce = match self.next_nonce(gf, &owner, &float).await {
             Ok(n) => n,
-            Err(e) => return refused("reading the float's nonce", e),
+            Err(NotReady::Unread(e)) => return refused("reading the GasFree float's account", e),
+            Err(NotReady::Halt(r)) => return Ok(PayoutOutcome::Refused(r)),
+            Err(NotReady::InFlight(r)) => return Ok(PayoutOutcome::Refused(format!("{r}; retry once it lands"))),
         };
-        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
-            return Ok(PayoutOutcome::Refused(
-                "a transfer from the GasFree float is still in flight; retry once it lands".into(),
-            ));
-        }
         let key = match signer.payout_signing_key() {
             Ok(k) => k,
             Err(e) => return refused("deriving the payout signing key", e),
@@ -528,13 +542,17 @@ impl SweepClient {
             Ok(v) => v,
             Err(_) => return refused("the payout amount", format!("{amount_usdt} is negative")),
         };
+        let max_fee = match u64::try_from(max_fee) {
+            Ok(v) => v,
+            Err(_) => return refused("the fee maximum", format!("{max_fee} is negative")),
+        };
         let permit = gasfree::Permit {
             token: &self.cfg.usdt_contract,
             service_provider: &gf.cfg.service_provider,
             user: &owner,
             receiver: to,
             value,
-            max_fee: max_fee as u64,
+            max_fee,
             deadline: deadline_after(gf.cfg.deadline_secs),
             version: 1,
             nonce,
@@ -603,26 +621,18 @@ impl SweepClient {
         if have < need {
             return Ok(ActivateFloatOutcome::FloatDry { float_address: float, have_usdt: have, need_usdt: need });
         }
-        let account = match gf.relay.account(&owner, &self.cfg.usdt_contract).await {
-            Ok(a) => a,
-            Err(e) => return refused("reading the GasFree float's account from the relay", format!("{e:?}")),
-        };
-        if account.gasfree_address != float {
-            return Ok(ActivateFloatOutcome::Refused(format!(
-                "the relay puts the GasFree float at {}, this signer derives {float}",
-                account.gasfree_address
-            )));
-        }
-        let nonce = match self.chain_nonce(gf.cfg.chain, &owner).await {
+        let nonce = match self.next_nonce(gf, &owner, &float).await {
             Ok(n) => n,
-            Err(e) => return refused("reading the float's nonce", e),
+            Err(NotReady::Unread(e)) => return refused("reading the GasFree float's account", e),
+            Err(NotReady::Halt(r) | NotReady::InFlight(r)) => return Ok(ActivateFloatOutcome::Refused(r)),
         };
-        if !account.allow_submit || account.frozen > 0 || account.nonce != nonce {
-            return Ok(ActivateFloatOutcome::Refused("a transfer from the GasFree float is already in flight".into()));
-        }
         let key = match signer.payout_signing_key() {
             Ok(k) => k,
             Err(e) => return refused("deriving the payout signing key", e),
+        };
+        let max_fee = match u64::try_from(max_fee) {
+            Ok(v) => v,
+            Err(_) => return refused("the fee maximum", format!("{max_fee} is negative")),
         };
         let permit = gasfree::Permit {
             token: &self.cfg.usdt_contract,
@@ -630,7 +640,7 @@ impl SweepClient {
             user: &owner,
             receiver: &self.cfg.treasury_address,
             value: ACTIVATION_VALUE_USDT as u64,
-            max_fee: max_fee as u64,
+            max_fee,
             deadline: deadline_after(gf.cfg.deadline_secs),
             version: 1,
             nonce,

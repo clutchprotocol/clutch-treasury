@@ -483,9 +483,13 @@ async fn a_deposit_is_swept_by_a_permit_for_everything_above_the_fee() {
 #[tokio::test]
 async fn an_activated_account_holds_back_only_the_transfer_fee() {
     let s = signer();
+    let owner = s.address_at(0).unwrap();
     let mut w = healthy(&s);
     w.usdt.insert(g0(&s), 10_000_000);
     w.contracts.insert(g0(&s));
+    // An activated account has made transfers, so its nonce is past 0 on the chain and the relay.
+    w.nonces.insert(abi_address(&owner).unwrap(), 4);
+    w.accounts.insert(owner.clone(), relay_account_json(&owner, &g0(&s), 4));
     let (url, world) = spawn(w).await;
 
     client(&url).sweep(&s, 0).await.unwrap();
@@ -493,6 +497,7 @@ async fn an_activated_account_holds_back_only_the_transfer_fee() {
     let p = &named(&world, "submit")[0];
     assert_eq!(p["maxFee"], TRANSFER_MAX);
     assert_eq!(p["value"], 10_000_000 - TRANSFER_MAX);
+    assert_eq!(p["nonce"], 4, "the controller's nonce");
 }
 
 #[tokio::test]
@@ -627,6 +632,20 @@ async fn dust_alone_is_reported_below_fee() {
             max_fee_usdt: ACTIVATE_MAX + TRANSFER_MAX,
         }
     );
+
+    // The boundary: exactly the fee is still dust, because the permit's value would be 0.
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), ACTIVATE_MAX + TRANSFER_MAX);
+    let (url, world) = spawn(w).await;
+    assert_eq!(
+        client(&url).sweep(&s, 0).await.unwrap(),
+        SweepOutcome::BelowFee {
+            gasfree_address: g0(&s),
+            balance_usdt: ACTIVATE_MAX + TRANSFER_MAX,
+            max_fee_usdt: ACTIVATE_MAX + TRANSFER_MAX,
+        }
+    );
+    assert!(named(&world, "submit").is_empty(), "never a permit for a value of 0");
 }
 
 /// The property that makes merging this safe: without GasFree settings, a sweep reads exactly one
@@ -778,9 +797,10 @@ async fn any_other_relay_answer_after_signing_is_ambiguous() {
     ] {
         let mut w = with_float(&s);
         w.submit_reply = reply.clone();
-        let (url, _) = spawn(w).await;
+        let (url, world) = spawn(w).await;
         // Err is a 500 on the wire, which the treasury records as ambiguous and hands to a human.
         assert!(client(&url).payout(&s, REDEEMER, 20_000_000).await.is_err(), "{reply} must not read as a clear answer");
+        assert_eq!(named(&world, "submit").len(), 1, "exactly one permit for {reply}");
     }
 }
 
@@ -1013,4 +1033,108 @@ async fn a_documented_relay_refusal_of_the_activation_is_refused() {
         "got {outcome:?}"
     );
     assert_eq!(named(&world, "submit").len(), 1, "exactly one permit");
+}
+
+#[tokio::test]
+async fn a_payout_over_the_cap_asks_nothing_on_the_gasfree_rail() {
+    let s = signer();
+    let (url, world) = spawn(with_float(&s)).await;
+
+    let outcome = client(&url).payout(&s, REDEEMER, 25_000_001).await.unwrap();
+
+    assert_eq!(outcome, PayoutOutcome::CapExceeded { limit_usdt: 25_000_000 });
+    assert!(world.0.lock().unwrap().calls.is_empty(), "the cap comes before any call, on this rail too");
+}
+
+#[tokio::test]
+async fn a_relay_that_disagrees_about_the_float_refuses_the_payout() {
+    let s = signer();
+    let owner = s.payout_address().unwrap();
+    let mut w = with_float(&s);
+    w.accounts.insert(owner.clone(), relay_account_json(&owner, REDEEMER, 0));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+    assert!(matches!(outcome, PayoutOutcome::Refused(_)), "got {outcome:?}");
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn a_payout_waits_while_a_float_transfer_is_in_flight() {
+    let s = signer();
+    let owner = s.payout_address().unwrap();
+    let in_flight = [
+        // The relay's nonce is ahead of the chain's: a permit is queued.
+        relay_account_json(&owner, &float_of(&s), 1),
+        serde_json::json!({"gasFreeAddress": float_of(&s), "nonce": 0, "allowSubmit": false}),
+        serde_json::json!({"gasFreeAddress": float_of(&s), "nonce": 0, "assets": [{"tokenAddress": USDT, "frozen": 2_000_000}]}),
+    ];
+    for account in in_flight {
+        let mut w = with_float(&s);
+        w.accounts.insert(owner.clone(), account.clone());
+        let (url, world) = spawn(w).await;
+
+        let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+        assert!(matches!(outcome, PayoutOutcome::Refused(_)), "for {account}: got {outcome:?}");
+        assert!(named(&world, "submit").is_empty(), "two permits in flight would collide on one nonce");
+    }
+}
+
+#[tokio::test]
+async fn an_unread_relay_account_is_an_error_for_a_sweep_and_a_refusal_for_a_payout() {
+    // Without an account, the fake relay answers GasFreeAddressNotFoundException.
+    let s = signer();
+
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    w.accounts.remove(&s.address_at(0).unwrap());
+    let (url, world) = spawn(w).await;
+    let sweep_result = client(&url).sweep(&s, 0).await;
+    assert!(sweep_result.is_err(), "a sweep retries on the next pass; got {sweep_result:?}");
+    assert!(named(&world, "submit").is_empty());
+
+    let mut w = with_float(&s);
+    w.accounts.remove(&s.payout_address().unwrap());
+    let (url, world) = spawn(w).await;
+    let payout_outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+    assert!(
+        matches!(payout_outcome, PayoutOutcome::Refused(_)),
+        "nothing was signed, so the treasury may retry; got {payout_outcome:?}"
+    );
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn an_address_disagreement_outranks_a_transfer_in_flight() {
+    let s = signer();
+    let owner = s.address_at(0).unwrap();
+    let mut w = healthy(&s);
+    w.usdt.insert(g0(&s), 10_000_000);
+    // Another address AND a relay nonce ahead of the chain's.
+    w.accounts.insert(owner.clone(), relay_account_json(&owner, REDEEMER, 1));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).sweep(&s, 0).await.unwrap();
+
+    assert!(
+        matches!(outcome, SweepOutcome::Halted { .. }),
+        "a wrong address needs a human, not a later pass; got {outcome:?}"
+    );
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn a_changed_controller_refuses_the_activation() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.usdt.insert(float_of(&s), 5_000_000); // not activated: no contract record
+    w.implementations.insert(gasfree::NILE.controller.into(), "66".repeat(20));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).activate_float(&s).await.unwrap();
+
+    assert!(matches!(outcome, ActivateFloatOutcome::Refused(_)), "got {outcome:?}");
+    assert!(named(&world, "submit").is_empty());
 }

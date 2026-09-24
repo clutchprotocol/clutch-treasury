@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    activate_float_response, ActivateFloatOutcome, fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, FundFloatOutcome,
+    activate_float_response, fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, ActivateFloatOutcome, FundFloatOutcome,
     PayoutOutcome, SelfTest, SweepClient, SweepConfig,
 };
 
