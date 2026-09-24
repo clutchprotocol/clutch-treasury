@@ -28,7 +28,8 @@
 
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 
-use super::{abi_address, describe_rejection, SweepClient, SweepOutcome};
+use super::{abi_address, describe_rejection, PayoutOutcome, SweepClient, SweepOutcome};
+use crate::relay::Trace;
 use crate::keys::Signer;
 use crate::relay::{Relay, RelayConfig, RelayError};
 
@@ -194,6 +195,26 @@ fn deadline_after(secs: u64) -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         + secs
+}
+
+/// The refusals the GasFree docs list for `submit`. Each is the relay's pre-execution check
+/// failing, so for a payout it proves the permit did not pay. Any other answer to a signed payout
+/// permit is ambiguous: the permit may still execute before its deadline.
+const PRE_EXECUTION_REFUSALS: [&str; 9] = [
+    "ProviderAddressNotMatchException",
+    "DeadlineExceededException",
+    "InvalidSignatureException",
+    "UnsupportedTokenException",
+    "TooManyPendingTransferException",
+    "VersionNotSupportedException",
+    "NonceNotMatchException",
+    "MaxFeeExceededException",
+    "InsufficientBalanceException",
+];
+
+/// The wire form of a trace, in this service's own names.
+pub fn trace_response(t: &Trace) -> serde_json::Value {
+    todo!("Task 4 Step 5")
 }
 
 impl SweepClient {
@@ -385,5 +406,21 @@ impl SweepClient {
             }
         }
         Ok(self.cfg.treasury_address.clone())
+    }
+
+    /// Pay `amount_usdt` to `to` from the GasFree float, `F = gasfree(2/0)`.
+    pub(super) async fn payout_gasfree(
+        &self,
+        gf: &GasFree,
+        signer: &Signer,
+        to: &str,
+        amount_usdt: i64,
+    ) -> Result<PayoutOutcome, String> {
+        todo!("Task 4 Step 5")
+    }
+
+    /// What became of a permit, by trace id. `None` when GasFree is off.
+    pub async fn gasfree_trace(&self, trace_id: &str) -> Result<Option<Trace>, String> {
+        todo!("Task 4 Step 5")
     }
 }

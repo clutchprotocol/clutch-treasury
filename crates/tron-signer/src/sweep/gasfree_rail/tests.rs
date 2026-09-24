@@ -686,3 +686,156 @@ fn every_sweep_status_string_is_pinned() {
         serde_json::json!({"status": "fee_account_dry", "fee_address": "a", "have_sun": 1, "need_sun": 2})
     );
 }
+
+// ---- the GasFree payout ----
+
+const REDEEMER: &str = "TJM1BE5wq1VdHh3gwjUeyaVkvZp9DVYCfC";
+
+/// A world where the GasFree float is activated and holds 100 USDT.
+fn with_float(s: &Signer) -> WorldState {
+    let mut w = healthy(s);
+    w.contracts.insert(float_of(s));
+    w.usdt.insert(float_of(s), 100_000_000);
+    w
+}
+
+#[tokio::test]
+async fn a_gasfree_payout_is_a_permit_from_the_float_for_exactly_the_amount() {
+    let s = signer();
+    let (url, world) = spawn(with_float(&s)).await;
+
+    let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+    assert_eq!(outcome, PayoutOutcome::Submitted { trace_id: TRACE_ID.into() });
+    let p = &named(&world, "submit")[0];
+    assert_eq!(p["user"], s.payout_address().unwrap(), "the float's owner, 2/0 — never a deposit key");
+    assert_eq!(p["receiver"], REDEEMER);
+    assert_eq!(p["value"], 20_000_000, "the redeemer gets exactly the amount; the fee comes on top");
+    assert_eq!(p["maxFee"], TRANSFER_MAX, "an activated float pays one transfer fee, never an activation");
+    assert_eq!(p["token"], USDT);
+    assert_eq!(&signer_of(p), s.payout_signing_key().unwrap().verifying_key(), "signed by the 2/0 key");
+}
+
+#[tokio::test]
+async fn an_unactivated_float_answers_float_not_active_and_signs_nothing() {
+    let s = signer();
+    let mut w = with_float(&s);
+    w.contracts.remove(&float_of(&s));
+    let (url, world) = spawn(w).await;
+
+    assert_eq!(
+        client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap(),
+        PayoutOutcome::FloatNotActive { float_address: float_of(&s) }
+    );
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn a_float_short_of_amount_plus_fee_is_dry() {
+    let s = signer();
+    let mut w = with_float(&s);
+    w.usdt.insert(float_of(&s), 20_000_000 + TRANSFER_MAX - 1);
+    let (url, world) = spawn(w).await;
+
+    assert_eq!(
+        client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap(),
+        PayoutOutcome::FloatDry {
+            float_address: float_of(&s),
+            have_usdt: 20_000_000 + TRANSFER_MAX - 1,
+            need_usdt: 20_000_000 + TRANSFER_MAX,
+        }
+    );
+    assert!(named(&world, "submit").is_empty());
+}
+
+#[tokio::test]
+async fn a_documented_relay_refusal_is_a_provable_non_payment() {
+    let s = signer();
+    let mut w = with_float(&s);
+    w.submit_reply = serde_json::json!({
+        "code": 400, "reason": "InsufficientBalanceException", "message": "insufficient balance", "data": null,
+    })
+    .to_string();
+    let (url, _) = spawn(w).await;
+
+    let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+    assert!(matches!(outcome, PayoutOutcome::Refused(ref why) if why.contains("InsufficientBalanceException")), "got {outcome:?}");
+}
+
+#[tokio::test]
+async fn any_other_relay_answer_after_signing_is_ambiguous() {
+    let s = signer();
+    for reply in [
+        serde_json::json!({"code": 500, "reason": "RuntimeException", "message": "boom", "data": null}).to_string(),
+        serde_json::json!({"code": 400, "reason": "SomethingNewException", "message": "?", "data": null}).to_string(),
+        "Bad Gateway".to_string(),
+    ] {
+        let mut w = with_float(&s);
+        w.submit_reply = reply.clone();
+        let (url, _) = spawn(w).await;
+        // Err is a 500 on the wire, which the treasury records as ambiguous and hands to a human.
+        assert!(client(&url).payout(&s, REDEEMER, 20_000_000).await.is_err(), "{reply} must not read as a clear answer");
+    }
+}
+
+#[tokio::test]
+async fn a_changed_beacon_refuses_the_payout() {
+    let s = signer();
+    let mut w = with_float(&s);
+    w.implementations.insert(gasfree::NILE.beacon.into(), "55".repeat(20));
+    let (url, world) = spawn(w).await;
+
+    let outcome = client(&url).payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+    assert!(matches!(outcome, PayoutOutcome::Refused(_)), "got {outcome:?}");
+    assert!(named(&world, "submit").is_empty());
+}
+
+/// Redemptions by TRX stay exactly as they were: the plain 2/0 float, and not one relay call.
+#[tokio::test]
+async fn with_trx_payouts_the_gasfree_float_is_never_touched() {
+    let s = signer();
+    let (url, world) = spawn(with_float(&s)).await;
+    let c = SweepClient::new(sweep_config(&url)).with_gasfree(gasfree_config(&url, false));
+
+    let outcome = c.payout(&s, REDEEMER, 20_000_000).await.unwrap();
+
+    // The plain float holds nothing in this world, so today's path answers FloatDry for 2/0.
+    assert!(
+        matches!(outcome, PayoutOutcome::FloatDry { ref float_address, .. } if *float_address == s.payout_address().unwrap()),
+        "got {outcome:?}"
+    );
+    assert!(named(&world, "relay_account").is_empty() && named(&world, "submit").is_empty());
+}
+
+#[test]
+fn the_new_payout_status_strings_are_pinned() {
+    use crate::sweep::payout_response;
+    assert_eq!(
+        payout_response(&PayoutOutcome::Submitted { trace_id: "t".into() }),
+        serde_json::json!({"status": "submitted", "trace_id": "t"})
+    );
+    assert_eq!(
+        payout_response(&PayoutOutcome::FloatNotActive { float_address: "f".into() }),
+        serde_json::json!({"status": "float_not_active", "float_address": "f"})
+    );
+}
+
+#[tokio::test]
+async fn a_trace_is_reported_in_the_signers_own_words() {
+    let s = signer();
+    let mut w = healthy(&s);
+    w.trace_reply = serde_json::json!({"code": 200, "reason": null, "message": null, "data": {
+        "id": TRACE_ID, "state": "SUCCEED", "txnHash": "ab", "txnState": "SOLIDITY", "txnAmount": 20000000, "txnTotalFee": 300000,
+    }})
+    .to_string();
+    let (url, _) = spawn(w).await;
+
+    let trace = client(&url).gasfree_trace(TRACE_ID).await.unwrap().expect("GasFree is on");
+    assert_eq!(
+        trace_response(&trace),
+        serde_json::json!({"state": "SUCCEED", "txn_hash": "ab", "txn_state": "SOLIDITY", "txn_amount": 20000000, "txn_total_fee": 300000})
+    );
+    assert_eq!(SweepClient::new(sweep_config(&url)).gasfree_trace(TRACE_ID).await.unwrap(), None, "off means no trace");
+}

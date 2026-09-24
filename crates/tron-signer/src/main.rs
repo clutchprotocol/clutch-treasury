@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
-    fund_float_response, load_gasfree_config, payout_response, sweep_response, validate_payout_cap, FundFloatOutcome,
+    fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, FundFloatOutcome,
     PayoutOutcome, SelfTest, SweepClient, SweepConfig,
 };
 
@@ -176,6 +176,8 @@ async fn payout(
                 PayoutOutcome::CapExceeded { limit_usdt } => tracing::warn!(intent_id = %req.intent_id, amount_usdt = req.amount_usdt, limit_usdt, "payout over cap"),
                 PayoutOutcome::FloatDry { float_address, have_usdt, need_usdt } => tracing::warn!(intent_id = %req.intent_id, %float_address, have_usdt, need_usdt, "payout float dry"),
                 PayoutOutcome::NeedsTrx { tx_id, amount_sun } => tracing::info!(intent_id = %req.intent_id, %tx_id, amount_sun, "funded the payout float with TRX"),
+                PayoutOutcome::Submitted { trace_id } => tracing::info!(intent_id = %req.intent_id, to = %req.to, amount_usdt = req.amount_usdt, %trace_id, "payout permit submitted"),
+                PayoutOutcome::FloatNotActive { float_address } => tracing::warn!(intent_id = %req.intent_id, %float_address, "the GasFree float is not activated yet"),
                 PayoutOutcome::Refused(reason) => tracing::warn!(intent_id = %req.intent_id, %reason, "payout refused pre-broadcast"),
             }
             Ok(Json(payout_response(&outcome)))
@@ -183,6 +185,27 @@ async fn payout(
         Err(e) => {
             tracing::error!(intent_id = %req.intent_id, "payout failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// The relay's record of a permit, so the treasury can find a GasFree payout's transaction without
+/// holding the relay's API key. Moves nothing. The id is checked before it reaches a URL.
+async fn gasfree_trace(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(trace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    if !tron_signer::relay::is_trace_id(&trace_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match s.sweeper.gasfree_trace(&trace_id).await {
+        Ok(Some(trace)) => Ok(Json(trace_response(&trace))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::warn!(%trace_id, "trace lookup failed: {e}");
+            Err(StatusCode::BAD_GATEWAY)
         }
     }
 }
@@ -266,6 +289,7 @@ async fn main() {
         .route("/internal/addresses/:index", get(addresses))
         .route("/internal/sweep", post(sweep))
         .route("/internal/payout", post(payout))
+        .route("/internal/gasfree/trace/:trace_id", get(gasfree_trace))
         .route("/internal/fund-float", post(fund_float))
         .with_state(state);
 

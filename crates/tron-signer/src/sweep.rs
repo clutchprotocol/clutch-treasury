@@ -45,7 +45,7 @@ use crate::keys::Signer;
 
 mod gasfree_rail;
 
-pub use gasfree_rail::{load_gasfree_config, GasFreeConfig, SelfTest};
+pub use gasfree_rail::{load_gasfree_config, trace_response, GasFreeConfig, SelfTest};
 
 /// Enough TRX at a deposit address to pay for the one TRC-20 transfer that sweeps it.
 ///
@@ -181,6 +181,13 @@ pub enum PayoutOutcome {
     /// the broadcast) are, in principle, also provable non-broadcasts. Drawing the line at the
     /// call rather than inside it keeps that guarantee simple enough to trust.
     Refused(String),
+    /// A GasFree permit paying `to` is with the relay. Not yet paid: the treasury follows
+    /// `trace_id` to the on-chain transaction and confirms it there, as it confirms a TRX payout.
+    Submitted { trace_id: String },
+    /// The GasFree float has never made a transfer, so its next one would also pay the activation
+    /// fee, which a redemption's fee does not cover. Provably nothing was signed. Only the one-time
+    /// activation (`/internal/activate-float`) resolves it.
+    FloatNotActive { float_address: String },
 }
 
 /// What one fund-float attempt did. Same reason the other two exist: whoever reads the reply must
@@ -264,6 +271,8 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
         PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
         }
+        PayoutOutcome::Submitted { .. } => todo!("Task 4 Step 5"),
+        PayoutOutcome::FloatNotActive { .. } => todo!("Task 4 Step 5"),
         PayoutOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
     }
 }
@@ -639,6 +648,12 @@ impl SweepClient {
         // reads and can trigger a real TRX funding broadcast before failing at transfer_parameter.
         if amount_usdt <= 0 {
             return Ok(PayoutOutcome::Refused(format!("payout amount must be positive, got {amount_usdt}")));
+        }
+
+        // The GasFree float pays when redemptions are on that rail. Same two checks above, first,
+        // for both rails.
+        if let Some(gf) = self.gasfree.as_ref().filter(|gf| gf.cfg.payouts) {
+            return self.payout_gasfree(gf, signer, to, amount_usdt).await;
         }
 
         // Everything from here down to the call to `sign_and_broadcast` is provably pre-broadcast:
