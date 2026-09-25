@@ -711,10 +711,15 @@ async fn the_ledger_records_the_usdt_that_actually_left() {
 
 // --- GasFree payouts (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §4, §5) ---
 
-/// `config().payout_float_address`: on this rail, F = gasfree(2/0).
-const FLOAT: &str = "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY";
-/// The plain 2/0 address that owns the float, as the signer's /internal/xpub names it.
+/// The plain 2/0 address that owns the float, as the signer's /internal/xpub names it. It is
+/// `PAYOUT_FLOAT_ADDRESS` on both rails; `gasfree_config` sets it.
 const FLOAT_OWNER: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+
+/// F = gasfree(2/0), which GasFree payouts leave from: derived here as the treasury and the signer
+/// derive it, never written down, so this fixture cannot drift from the derivation.
+fn float() -> String {
+    gasfree::gasfree_address(&gasfree::NILE, FLOAT_OWNER).unwrap()
+}
 /// `pending_redemption`'s payout address.
 const REDEEMER: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
 const PAYOUT_TRACE: &str = "6ab4c27c-f66b-4328-b40f-ffdc6cf1ca60";
@@ -736,6 +741,7 @@ fn gasfree_config(trongrid_url: String) -> treasury_service::configuration::AppC
     let mut cfg = config();
     cfg.trongrid_url = trongrid_url;
     cfg.gasfree = Some(nile());
+    cfg.payout_float_address = FLOAT_OWNER.into();
     cfg
 }
 
@@ -747,7 +753,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// The signer's GasFree reads, faked: the relay's record names `txn_hash`, and FLOAT_OWNER owns FLOAT.
+/// The signer's GasFree reads, faked: the relay's record names `txn_hash`, and FLOAT_OWNER owns `float()`.
 struct GasFreeReads {
     txn_hash: Option<&'static str>,
 }
@@ -761,7 +767,7 @@ impl PayoutSigner for GasFreeReads {
         Ok(Trace { state: "SUCCEED".into(), txn_hash: self.txn_hash.map(str::to_string), txn_amount: None })
     }
     async fn float_owner(&self) -> Result<(String, Option<String>), String> {
-        Ok((FLOAT_OWNER.into(), Some(FLOAT.into())))
+        Ok((FLOAT_OWNER.into(), Some(float().into())))
     }
 }
 
@@ -787,13 +793,14 @@ async fn permit_out(pool: &PgPool, amount: i64, trace: Option<&str>, nonce: i64,
 /// The float's confirmed USDT history: one GasFree payout is two transfers from the float in one
 /// transaction, the redeemer's and the relay's fee.
 async fn mount_float_history(server: &MockServer, tx_id: &str, to: &str, value: i64) {
+    let float = float();
     let at = chrono::Utc::now().timestamp_millis();
     Mock::given(method("GET"))
-        .and(path(format!("/v1/accounts/{FLOAT}/transactions/trc20")))
+        .and(path(format!("/v1/accounts/{float}/transactions/trc20")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [
-            {"transaction_id": tx_id, "from": FLOAT, "to": to, "value": value.to_string(), "type": "Transfer",
+            {"transaction_id": tx_id, "from": float.as_str(), "to": to, "value": value.to_string(), "type": "Transfer",
              "token_info": {"address": USDT}, "block_timestamp": at},
-            {"transaction_id": tx_id, "from": FLOAT, "to": "TLntW9Z59LYY5KEi9cmwk3PKjQga828ird", "value": "300000",
+            {"transaction_id": tx_id, "from": float.as_str(), "to": "TLntW9Z59LYY5KEi9cmwk3PKjQga828ird", "value": "300000",
              "type": "Transfer", "token_info": {"address": USDT}, "block_timestamp": at},
         ]})))
         .mount(server)
@@ -848,8 +855,8 @@ async fn the_gasfree_payout_answers_are_read_field_by_field() {
             },
         ),
         (
-            serde_json::json!({"status": "float_not_active", "float_address": FLOAT}),
-            PayoutReply::FloatNotActive { float_address: FLOAT.into() },
+            serde_json::json!({"status": "float_not_active", "float_address": float()}),
+            PayoutReply::FloatNotActive { float_address: float() },
         ),
     ] {
         let (_s, signer) = signer_replying(200, body.clone()).await;
@@ -871,12 +878,12 @@ async fn the_gasfree_payout_answers_are_read_field_by_field() {
     Mock::given(method("GET"))
         .and(path("/internal/xpub"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "account_xpub": "xpub-unused", "fee_address": "TFee", "payout_address": FLOAT_OWNER, "payout_gasfree_address": FLOAT,
+            "account_xpub": "xpub-unused", "fee_address": "TFee", "payout_address": FLOAT_OWNER, "payout_gasfree_address": float(),
         })))
         .mount(&server)
         .await;
     let signer = HttpPayoutSigner { http: reqwest::Client::new(), base_url: server.uri(), token: "t".into() };
-    assert_eq!(signer.float_owner().await, Ok((FLOAT_OWNER.to_string(), Some(FLOAT.to_string()))));
+    assert_eq!(signer.float_owner().await, Ok((FLOAT_OWNER.to_string(), Some(float().to_string()))));
 }
 
 /// One GasFree payout permit alive at a time: a second would carry the same nonce.
@@ -1057,7 +1064,7 @@ async fn redemptions_wait_for_the_gasfree_floats_activation_and_it_is_said_once(
     let pool = pool().await;
     let first = pending_redemption(&pool, 10_000_000).await;
     let second = pending_redemption(&pool, 5_000_000).await;
-    let signer = counting(PayoutReply::FloatNotActive { float_address: FLOAT.into() });
+    let signer = counting(PayoutReply::FloatNotActive { float_address: float().into() });
     let cfg = gasfree_config("http://unused".into());
 
     for _ in 0..3 {
@@ -1093,6 +1100,9 @@ async fn an_ambiguous_gasfree_payout_holds_the_float_for_the_longest_deadline() 
     let held = deadline.expect("a deadline holds the float") - now();
     assert!((890..=910).contains(&held), "held for the longest deadline plus the grace, about 900 s, got {held}");
     assert_eq!(payout_alerts(&pool, "p1", "do not return this intent").await, 1, "the page says when the intent may be returned");
+    // A human resolves this intent from the page: it must name the float the permit leaves from, F,
+    // not the plain float, or they search the wrong address before returning it to payout_pending.
+    assert_eq!(payout_alerts(&pool, "p1", &float()).await, 1, "the page names the GasFree float");
 }
 
 /// Spec §4: a redemption is refused before anything exists to burn against while the float's next
@@ -1131,6 +1141,7 @@ async fn a_redemption_is_refused_until_the_gasfree_float_is_activated() {
     let activated = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/wallet/getcontract"))
+        .and(body_string_contains(float().as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"contract_address": "41ab", "bytecode": ""})))
         .mount(&activated)
         .await;
@@ -1166,4 +1177,51 @@ async fn a_transaction_that_already_paid_another_redemption_is_not_taken_as_this
     assert_eq!(paid, 0);
     assert_eq!(state_of(&pool, second).await, ("payout_submitted".into(), None, Some(4)));
     assert_eq!(payout_alerts(&pool, "p1", "already paid").await, 1);
+}
+
+/// Spec §4: the treasury derives the GasFree float the way the signer does, from the plain float it
+/// is given. With GasFree off there is no GasFree float.
+#[test]
+fn the_gasfree_float_is_the_gasfree_account_of_the_plain_float() {
+    assert_eq!(gasfree_config("http://unused".into()).gasfree_float(), Some(float()));
+    assert_eq!(config().gasfree_float(), None);
+}
+
+/// The signer names a GasFree float other than the one this treasury derives and counts: nothing is
+/// settled against it, and it pages.
+#[tokio::test]
+async fn a_gasfree_float_the_signer_does_not_share_pages_and_settles_nothing() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_nonce(&server, 4).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 400).await;
+
+    payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &OtherFloat,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)), "not returned, not paid");
+    assert_eq!(payout_alerts(&pool, "p1", "derives").await, 1);
+}
+
+/// The signer's reads, with a GasFree float that is not `float()`.
+struct OtherFloat;
+
+#[async_trait::async_trait]
+impl PayoutSigner for OtherFloat {
+    async fn pay(&self, _intent_id: Uuid, _to: &str, _amount_usdt: i64) -> PayoutReply {
+        panic!("settling a payout must never sign another")
+    }
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Ok(Trace { state: "SUCCEED".into(), txn_hash: None, txn_amount: None })
+    }
+    async fn float_owner(&self) -> Result<(String, Option<String>), String> {
+        Ok((FLOAT_OWNER.into(), Some(REDEEMER.into())))
+    }
 }

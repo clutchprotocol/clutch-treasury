@@ -82,8 +82,9 @@ async fn xpub(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serd
         tracing::error!("payout address derivation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    // Where redemptions are paid from on the GasFree rail, and what provisioning writes into the
-    // treasury's PAYOUT_FLOAT_ADDRESS so the reserve counts the same float the signer spends from.
+    // Where redemptions are paid from on the GasFree rail. The treasury derives the same address
+    // from its PAYOUT_FLOAT_ADDRESS, which is the plain float above (payout_address), so the reserve
+    // counts the float the signer spends from.
     let payout_gasfree_address = s.sweeper.gasfree_address_for(&payout_address).map_err(|e| {
         tracing::error!("GasFree float address derivation failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -302,7 +303,7 @@ async fn main() {
         sweeper = sweeper.with_gasfree(cfg);
     }
     let sweeper = Arc::new(sweeper);
-    match sweeper.gasfree_self_test(&signer).await {
+    match sweeper.gasfree_self_test_within(&signer, std::time::Duration::from_secs(30)).await {
         SelfTest::Passed => {}
         SelfTest::Failed(e) => panic!("GasFree self-test failed: {e}"),
         SelfTest::Unreachable(e) => tracing::warn!(

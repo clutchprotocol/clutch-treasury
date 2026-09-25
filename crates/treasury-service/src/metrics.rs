@@ -114,6 +114,44 @@ pub async fn render(pool: &PgPool) -> String {
     );
     out.push_str(&format!("clutch_treasury_unswept_deposit_addresses {unswept}\n"));
 
+    // Two ages, because a count cannot see a stall: one deposit stuck for a day moves no count.
+    //
+    // A GasFree account is swept on the next one-minute pass after its deposit is credited, so its
+    // oldest credited, unswept deposit is minutes old unless something stopped it: the relay refusing
+    // or busy for good, GasFree's code changing, a live fee above the maximum, or the signer's
+    // settings disagreeing. Plain addresses wait for the sweep threshold by design and are left out.
+    let unswept_gasfree_age: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(EXTRACT(EPOCH FROM now() - MIN(m.verified_at)), 0)::BIGINT
+           FROM mint_intents m JOIN gasfree_accounts g ON g.gasfree_address = m.deposit_address
+          WHERE m.swept_at IS NULL AND m.status IN ('credited', 'submitted')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    header(
+        &mut out,
+        "clutch_treasury_oldest_unswept_gasfree_seconds",
+        "Age of the oldest credited deposit at a GasFree account that is not yet swept. Sweeps run every minute; an hour means sweeping has stopped.",
+        "gauge",
+    );
+    out.push_str(&format!("clutch_treasury_oldest_unswept_gasfree_seconds {unswept_gasfree_age}\n"));
+
+    // A redemption whose CLT is burned and whose USDT is not yet paid, on either rail.
+    let unpaid_redemption_age: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(EXTRACT(EPOCH FROM now() - MIN(created_at)), 0)::BIGINT
+           FROM redemption_intents WHERE status IN ('burn_confirmed', 'payout_pending', 'payout_submitted')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    header(
+        &mut out,
+        "clutch_treasury_oldest_unpaid_redemption_seconds",
+        "Age of the oldest redemption whose CLT is burned and whose USDT is not yet paid.",
+        "gauge",
+    );
+    out.push_str(&format!("clutch_treasury_oldest_unpaid_redemption_seconds {unpaid_redemption_age}\n"));
+
     // Published so it can be compared against the chain head, which is the only way this number
     // means anything. The cursor lives in Postgres and outlives the chain it was counting, so a
     // reset or a deep reorg strands it ABOVE the head — and `process_range` then returns None

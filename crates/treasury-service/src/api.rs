@@ -304,11 +304,14 @@ async fn create_redemption_intent_handler(
     // exists to burn against, and 503 because it is "not yet", not "never". The orchestrator shows it
     // as redemptions not being available yet.
     if state.config.gasfree.as_ref().is_some_and(|s| s.rail) {
+        let Some(float) = state.config.gasfree_float() else {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        };
         let client = crate::tron_verifier::TronClient::new(
             state.config.trongrid_url.clone(),
             state.config.trongrid_api_key.clone(),
         );
-        match client.has_contract(&state.config.payout_float_address).await {
+        match client.has_contract(&float).await {
             Ok(true) => {}
             Ok(false) => return Err(StatusCode::SERVICE_UNAVAILABLE),
             Err(e) => {
