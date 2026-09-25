@@ -295,8 +295,11 @@ async fn main() {
             // exactly that conservatively, so it must also not be unbounded: confirm_payouts_once
             // runs right after drain_once in this same loop tick, so a hung signer call would
             // otherwise stall on-chain confirmation checks too, forever.
+            // A GasFree payout makes two relay calls, each bounded at 20 s in the signer, and several
+            // TronGrid reads before it answers; at 30 s a slow success would read as Ambiguous and
+            // page, holding the float for its longest deadline.
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(if config.gasfree.is_some() { 60 } else { 30 }))
                 .build()
                 .expect("reqwest client builder"),
             base_url: config.signer_url.clone(),

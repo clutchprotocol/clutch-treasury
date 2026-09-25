@@ -353,7 +353,9 @@ impl SweepClient {
     /// at all. Given up is `Unreachable`, not `Failed`: every permit is still checked before it is
     /// signed.
     pub async fn gasfree_self_test_within(&self, signer: &Signer, limit: std::time::Duration) -> SelfTest {
-        todo!("Plan 4 Task 3: bound the self-test by {limit:?} for {}", signer.address_at(0).is_ok())
+        tokio::time::timeout(limit, self.gasfree_self_test(signer))
+            .await
+            .unwrap_or_else(|_| SelfTest::Unreachable(format!("TronGrid gave no answer within {} s", limit.as_secs())))
     }
 
     /// The next nonce the controller will accept from `user`: the chain's count, not the relay's.
