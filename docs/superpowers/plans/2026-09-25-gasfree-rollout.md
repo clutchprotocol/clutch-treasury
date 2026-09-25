@@ -2795,6 +2795,20 @@ No code. The design's §9, "In order, with reconciliation reading OK after **eve
 
 After each step, the gate is the same: `PROBE=treasury` shows the latest reconciliation run `ok`, the breaker clear, and no new P1 alert. A failed gate stops the rollout; nothing later is attempted until it is understood.
 
+**Execution notes (2026-09-25, from the final reviews). Where they differ from the steps below, they win.**
+
+- **The gate is `PROBE=sweeper`, not `PROBE=treasury`.** `sweeper` prints the open alerts, the breaker, the last reconciliation runs, the mint intents and (from #104) the redemptions not yet paid. `treasury` prints the settings, the deposit intents and the fee account. Read every `PROBE=treasury` below that looks for a reconciliation run, the breaker, an alert or a redemption as `PROBE=sweeper`.
+
+- **A merge does not move the treasury images.** Since clutch-deploy #103 every image is pinned to `sha-<7>`, and the treasury's move only by hand. Step 1 is, in this order:
+  1. Merge the clutch-treasury PR (#55). Its `docker-build-push.yml` publishes the three images as `sha-<first 7 of the merge commit>`.
+  2. Run "Deploy stage (VPS)" with `set_images` = `clutch-treasury=sha-X clutch-orchestrator=sha-X clutch-tron-signer=sha-X`. The compose on main does not map the GasFree key into tron-signer yet, so this deploy is safe with the key still in `.env`.
+  3. Before merging the clutch-deploy PR (#104), on the host: comment out `GASFREE_API_KEY` and `GASFREE_API_SECRET` in `.env` (#104 maps the key into tron-signer, which turns GasFree on by the key alone and then refuses to start without `GASFREE_NETWORK`); run `bash scripts/check-cap-invariants.sh`, which must end with `All invariants hold`; and check that no redemption waits in `burn_confirmed`, `payout_pending` or `payout_submitted` (#104's `TreasuryRedemptionUnpaid` fires at once on one over 2 hours old). No probe on main shows redemptions yet, so this is read on the host: `docker exec clutch-stage-treasury-postgres-1 psql -U treasury -d treasury -c "select status, count(*) from redemption_intents group by status;"`.
+  4. Merge #104. Its deploy runs `check-cap-invariants.sh` first, and its health check now includes tron-signer.
+  5. Merge the clutch-hub PR (#20). Its image dispatch carries its own pin.
+- **Step 2.2:** the key and the secret are commented out since step 1. Uncomment them in the same edit as the rest of the block, never alone.
+- **Stage reconciles every hour** (`APP_RECONCILIATION_INTERVAL_SECS=3600`, from #104), not once a day. A gate that needs a run after its step waits for the next one, at most an hour; `PROBE=treasury` prints each run's time.
+- **Step 4.1:** `activate-float.sh` runs its own reconciliation before it decides, and counts what burned, unpaid redemptions are owed as liability (there should be none, per step 2.1). If the surplus is short, the maintainer sends the difference to `CUSTODY_TRON_ADDRESS` and dispatches `activate-float.yml` again; there is no run to wait for.
+
 - [ ] **Step 1: Merge everything, GasFree still off**
 
 1. The maintainer merges the clutch-treasury pull request (Tasks 1-3). Its `docker-build-push.yml` publishes the three images; it does not deploy.
