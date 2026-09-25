@@ -112,12 +112,30 @@ impl PayoutSigner for HttpPayoutSigner {
                 PayoutReply::CapExceeded { limit_usdt: body["limit_usdt"].as_i64().unwrap_or(0) }
             }
             Some("needs_trx") => PayoutReply::NeedsTrx,
-            // The signer proved this happened before it ever attempted a broadcast (a bad
-            // recipient, a key derivation failure, a TronGrid read that never got a response) —
-            // see sweep.rs's `PayoutOutcome::Refused` doc comment for exactly which class this is.
-            Some("refused") => PayoutReply::Refused(
-                body["reason"].as_str().unwrap_or("signer reported refused with no reason").to_string(),
-            ),
+            // A GasFree permit is with the relay. Without its trace id, nonce and deadline nothing
+            // here could follow it, so it is not a clear answer.
+            Some("submitted") => match (body["trace_id"].as_str(), body["nonce"].as_u64(), body["deadline"].as_u64()) {
+                (Some(trace_id), Some(nonce), Some(deadline)) => {
+                    PayoutReply::Submitted { trace_id: trace_id.to_string(), nonce, deadline }
+                }
+                _ => PayoutReply::Ambiguous(format!("signer reported submitted without the permit's trace id, nonce and deadline: {body}")),
+            },
+            Some("float_not_active") => PayoutReply::FloatNotActive {
+                float_address: body["float_address"].as_str().unwrap_or("unknown").to_string(),
+            },
+            // Without a nonce and a deadline: the signer proved this happened before it ever
+            // attempted a broadcast (a bad recipient, a key derivation failure, a TronGrid read that
+            // never got a response) — see sweep.rs's `PayoutOutcome::Refused`. With both: the relay
+            // refused a signed GasFree permit (`PayoutOutcome::RelayRefused`). With one of the two,
+            // the answer is not one the signer gives, so it is not a clear one.
+            Some("refused") => {
+                let reason = body["reason"].as_str().unwrap_or("signer reported refused with no reason").to_string();
+                match (body["nonce"].as_u64(), body["deadline"].as_u64()) {
+                    (None, None) => PayoutReply::Refused(reason),
+                    (Some(nonce), Some(deadline)) => PayoutReply::RelayRefused { reason, nonce, deadline },
+                    _ => PayoutReply::Ambiguous(format!("signer reported a refusal with half a permit: {body}")),
+                }
+            }
             // An unknown status from a newer signer might describe a broadcast this version does
             // not understand. Ambiguous, never Refused.
             other => PayoutReply::Ambiguous(format!("unrecognised signer status {other:?}")),
@@ -129,7 +147,22 @@ impl PayoutSigner for HttpPayoutSigner {
     }
 
     async fn float_owner(&self) -> Result<(String, Option<String>), String> {
-        todo!("Task 4 Step 5")
+        let resp = self
+            .http
+            .get(format!("{}/internal/xpub", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("signer unreachable: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("signer returned {}", resp.status()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| format!("unreadable signer response: {e}"))?;
+        let owner = body["payout_address"]
+            .as_str()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| format!("the signer named no payout address: {body}"))?;
+        Ok((owner.to_string(), body["payout_gasfree_address"].as_str().map(str::to_string)))
     }
 }
 
@@ -173,6 +206,14 @@ fn failed_transfer_alerted() -> &'static Mutex<HashSet<Uuid>> {
     ALERTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// The signer refuses `APP_GASFREE_DEADLINE_SECS` above 600, so no payout permit it signs is valid
+/// for longer than this after it was sent.
+const LONGEST_PERMIT_SECS: i64 = 600;
+
+/// After a permit's deadline the controller refuses it, but a block at the deadline may take this
+/// long to show in what TronGrid answers.
+const DEADLINE_GRACE_SECS: i64 = 60;
+
 /// Pays each due `payout_pending` intent against its ALREADY-CONFIRMED burn.
 ///
 /// Burn first, payout second, always — `watcher::confirm_burn` is the sole path into
@@ -204,6 +245,23 @@ pub async fn drain_once(
             .map_err(|e| e.to_string())?;
     if halted {
         tracing::warn!(halt_reason, "payouts blocked: treasury is halted");
+        return Ok(0);
+    }
+
+    // GasFree: one payout permit alive at a time. While a permit may still run, a second would carry
+    // the same nonce, and after a refusal the chain could no longer say which of the two ran. So
+    // nothing is signed until every permit is settled by `confirm_gasfree_payouts_once`, or, for one
+    // whose nonce is unknown, until it can no longer run. On the TRX rail no row carries a permit.
+    let (permit_in_doubt,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM redemption_intents
+                         WHERE status = 'payout_submitted' AND payout_ref IS NULL
+                           AND (payout_permit_nonce IS NOT NULL OR payout_permit_deadline > $1))",
+    )
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if permit_in_doubt {
         return Ok(0);
     }
 
@@ -310,8 +368,85 @@ pub async fn drain_once(
                 }
                 processed += 1;
             }
-            PayoutReply::Submitted { .. } | PayoutReply::RelayRefused { .. } | PayoutReply::FloatNotActive { .. } => {
-                todo!("Task 4 Step 5")
+            PayoutReply::Submitted { trace_id, nonce, deadline } => {
+                // The float may pay from now on, so it counts against today's budget now.
+                day_total += amount_clt;
+                if let Err(e) = sqlx::query(
+                    "UPDATE redemption_intents
+                        SET payout_trace_id = $2, payout_permit_nonce = $3, payout_permit_deadline = $4, updated_at = now()
+                      WHERE id = $1",
+                )
+                .bind(intent_id)
+                .bind(&trace_id)
+                .bind(nonce as i64)
+                .bind(deadline as i64)
+                .execute(pool)
+                .await
+                {
+                    alert(pool, "p1", "payout", &format!(
+                        "redemption {intent_id}: GasFree permit {trace_id} (nonce {nonce}, valid until {deadline}) is \
+                         with the relay, but recording it failed ({e}). Left payout_submitted with no payout_ref: find \
+                         the float's transfer for that trace and set payout_ref by hand, or, after the deadline, return \
+                         it to payout_pending if the float's nonce is still {nonce}."
+                    )).await;
+                }
+                processed += 1;
+                break; // one permit at a time
+            }
+            PayoutReply::RelayRefused { reason, nonce, deadline } => {
+                // Refused on the relay's word; the signed permit stays valid until its deadline, so it
+                // may still pay and counts against today's budget.
+                day_total += amount_clt;
+                match sqlx::query(
+                    "UPDATE redemption_intents
+                        SET payout_trace_id = NULL, payout_permit_nonce = $2, payout_permit_deadline = $3, updated_at = now()
+                      WHERE id = $1",
+                )
+                .bind(intent_id)
+                .bind(nonce as i64)
+                .bind(deadline as i64)
+                .execute(pool)
+                .await
+                {
+                    Ok(_) => alert(pool, "warn", "payout", &format!(
+                        "redemption {intent_id}: {reason}. The signed permit stays valid until {deadline}, so nothing \
+                         is paid before then; after it, the float's nonce says whether it ran."
+                    )).await,
+                    Err(e) => alert(pool, "p1", "payout", &format!(
+                        "redemption {intent_id}: {reason}, and recording the refused permit (nonce {nonce}, valid until \
+                         {deadline}) failed ({e}). Left payout_submitted: after the deadline, return it to \
+                         payout_pending by hand if the float's nonce is still {nonce}."
+                    )).await,
+                }
+                break; // one permit at a time
+            }
+            PayoutReply::FloatNotActive { float_address } => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE redemption_intents SET status = 'payout_pending', updated_at = now()
+                     WHERE id = $1 AND status = 'payout_submitted'",
+                )
+                .bind(intent_id)
+                .execute(pool)
+                .await
+                {
+                    alert(pool, "p1", "payout", &format!(
+                        "redemption {intent_id}: the signer proved nothing was signed (the GasFree float is not \
+                         activated), but returning it to payout_pending failed ({e}). It carries no payout_ref, so it \
+                         is safe to move back by hand."
+                    )).await;
+                }
+                alert_once(
+                    pool,
+                    "warn",
+                    "payout",
+                    &format!(
+                        "redemptions are not available yet: the GasFree float {float_address} has never made a transfer, \
+                         so its next one would also pay its activation. Its one-time activation comes first."
+                    ),
+                    chrono::Duration::hours(1),
+                )
+                .await;
+                break; // every redemption would get the same answer
             }
             // Proven non-broadcast: hand it back for a later pass.
             reply @ (PayoutReply::FloatDry { .. }
@@ -363,6 +498,19 @@ pub async fn drain_once(
                 // daily_payout_total counts every payout_submitted row as spent from the next
                 // pass onward regardless — this just makes the CURRENT pass agree with that.
                 day_total += amount_clt;
+                // On the GasFree rail a permit may be with the relay. It cannot run past the longest
+                // deadline the signer signs, so no other permit is signed before then.
+                let gasfree_payouts = config.gasfree.as_ref().is_some_and(|s| s.rail);
+                if gasfree_payouts {
+                    if let Err(e) = sqlx::query("UPDATE redemption_intents SET payout_permit_deadline = $2 WHERE id = $1")
+                        .bind(intent_id)
+                        .bind(chrono::Utc::now().timestamp() + LONGEST_PERMIT_SECS)
+                        .execute(pool)
+                        .await
+                    {
+                        tracing::error!(%intent_id, "could not hold the float after an unclear GasFree payout: {e}");
+                    }
+                }
                 alert(pool, "p1", "payout", &format!(
                     "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted \
                      and NOT retried — retrying could pay this burn twice. Claimed at {claimed_at}: \
@@ -372,6 +520,9 @@ pub async fn drain_once(
                      Found nothing? Return the intent to payout_pending by hand.",
                     float = config.payout_float_address
                 )).await;
+                if gasfree_payouts {
+                    break; // one permit at a time
+                }
             }
         }
     }
@@ -479,7 +630,124 @@ pub async fn confirm_gasfree_payouts_once(
     client: &TronClient,
     signer: &dyn PayoutSigner,
 ) -> Result<u32, String> {
-    todo!("Task 4 Step 5")
+    let rows: Vec<(Uuid, String, i64, Option<String>, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, payout_address, payout_amount_usdt, payout_trace_id, payout_permit_nonce,
+                payout_permit_deadline, payout_submitted_at
+         FROM redemption_intents
+         WHERE status = 'payout_submitted' AND payout_ref IS NULL AND payout_permit_nonce IS NOT NULL
+         ORDER BY payout_submitted_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut paid = 0u32;
+    for (intent_id, to, amount, trace_id, nonce, deadline, submitted_at) in rows {
+        // The relay's record names the transaction; the chain says whether it paid THIS redemption.
+        if let Some(trace_id) = &trace_id {
+            match signer.trace(trace_id).await {
+                Ok(Trace { txn_hash: Some(hash), .. }) => {
+                    // Ten minutes before the claim, for clock skew between this host and the chain.
+                    let since_ms = (submitted_at - chrono::Duration::minutes(10)).timestamp_millis();
+                    match client
+                        .confirmed_transfer(&hash, &config.payout_float_address, &to, &config.usdt_contract, amount, since_ms)
+                        .await
+                    {
+                        Ok(true) => {
+                            match pay_intent(pool, intent_id, amount, &hash).await {
+                                Ok(()) => paid += 1,
+                                Err(e) => {
+                                    alert(pool, "p1", "payout", &format!(
+                                        "redemption {intent_id}: GasFree payout {hash} is confirmed on chain, but recording \
+                                         it as paid failed ({e}). Safe to retry: the next pass picks it up."
+                                    )).await;
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(false) => {} // not confirmed yet, or not a transfer that pays this redemption
+                        Err(e) => {
+                            tracing::warn!(%intent_id, %hash, "could not read the float's transfers: {e}");
+                            continue;
+                        }
+                    }
+                }
+                Ok(_) => {} // no transaction yet
+                Err(e) => tracing::warn!(%intent_id, %trace_id, "the relay's record of the payout permit is unreadable: {e}"),
+            }
+        }
+
+        // Until its deadline, and a margin for the last block, the permit may still run.
+        if chrono::Utc::now().timestamp() <= deadline + DEADLINE_GRACE_SECS {
+            continue;
+        }
+        let owner = match signer.float_owner().await {
+            Ok((owner, float)) if float.as_deref() == Some(config.payout_float_address.as_str()) => owner,
+            Ok((_, float)) => {
+                alert_once(
+                    pool,
+                    "p1",
+                    "payout",
+                    &format!(
+                        "the signer's GasFree float is {float:?}, but PAYOUT_FLOAT_ADDRESS is {}: the reserve counts a \
+                         different float than the one redemptions are paid from, and GasFree payouts cannot be settled \
+                         until the two agree",
+                        config.payout_float_address
+                    ),
+                    chrono::Duration::hours(1),
+                )
+                .await;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(%intent_id, "could not ask the signer for the float's owner: {e}");
+                continue;
+            }
+        };
+        let chain_nonce = match client.gasfree_nonce(settings.chain.controller, &owner).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(%intent_id, "the float's nonce is unreadable: {e}");
+                continue;
+            }
+        };
+        if chain_nonce <= nonce as u64 {
+            // It can no longer run, and it did not: the redemption is paid again on a later pass.
+            match sqlx::query(
+                "UPDATE redemption_intents
+                    SET status = 'payout_pending', payout_trace_id = NULL, payout_permit_nonce = NULL,
+                        payout_permit_deadline = NULL, updated_at = now()
+                  WHERE id = $1 AND status = 'payout_submitted' AND payout_ref IS NULL",
+            )
+            .bind(intent_id)
+            .execute(pool)
+            .await
+            {
+                Ok(_) => tracing::info!(%intent_id, "GasFree payout permit (nonce {nonce}) expired without running; paid again on a later pass"),
+                Err(e) => tracing::error!(%intent_id, "could not return an expired GasFree payout to payout_pending: {e}"),
+            }
+        } else {
+            // One permit at a time, so the nonce moved because this permit ran, or because something
+            // else spent from the float (its activation, or a hand-made transfer). No transfer paying
+            // this redemption was found either way, so it may be paid, and must not be paid again.
+            alert(pool, "p1", "payout", &format!(
+                "redemption {intent_id}: the GasFree float's nonce moved past this payout's permit (nonce {nonce}), but \
+                 no confirmed transfer of {amount} micro-USDT from the float to {to} was found{}. It may have been paid. \
+                 Left payout_submitted and NOT retried: find the float's transfer to {to} and set payout_ref, or return \
+                 it to payout_pending by hand.",
+                trace_id.as_deref().map(|t| format!(" (trace {t})")).unwrap_or_default()
+            )).await;
+            // A human's now: no longer a permit this service settles, or one that holds the float.
+            if let Err(e) = sqlx::query("UPDATE redemption_intents SET payout_permit_nonce = NULL WHERE id = $1")
+                .bind(intent_id)
+                .execute(pool)
+                .await
+            {
+                tracing::error!(%intent_id, "could not hand the GasFree payout to a human: {e}");
+            }
+        }
+    }
+    Ok(paid)
 }
 
 /// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past

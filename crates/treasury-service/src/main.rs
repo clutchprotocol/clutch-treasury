@@ -314,6 +314,13 @@ async fn main() {
                 if let Err(e) = payout::confirm_payouts_once(&pool, &tron_client).await {
                     tracing::error!("payout confirmation failed: {e}");
                 }
+                if let Some(settings) = &cfg.gasfree {
+                    if let Err(e) =
+                        payout::confirm_gasfree_payouts_once(&pool, &cfg, settings, &tron_client, &payout_signer).await
+                    {
+                        tracing::error!("GasFree payout confirmation failed: {e}");
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(cfg.outbox_poll_ms)).await;
             }
         });

@@ -463,7 +463,27 @@ impl TronClient {
     /// `contract_address`, not `bytecode`: an activated GasFree account answers with an EMPTY
     /// bytecode (2026-09-24). Only `{}` means no; any other answer is an error, never "no".
     pub async fn has_contract(&self, address: &str) -> Result<bool, String> {
-        todo!("Task 4 Step 5")
+        let resp = self
+            .http
+            .post(format!("{}/wallet/getcontract", self.base_url))
+            .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&serde_json::json!({"value": address, "visible": true}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("trongrid getcontract failed: {status} {text}"));
+        }
+        let parsed: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if parsed["contract_address"].as_str().is_some_and(|a| !a.is_empty()) {
+            return Ok(true);
+        }
+        if parsed.as_object().is_some_and(|o| o.is_empty()) {
+            return Ok(false);
+        }
+        Err(format!("getcontract for {address} gave neither a contract nor {{}}: {parsed}"))
     }
 
     /// Whether `tx_id` carries a confirmed USDT `Transfer` of exactly `amount` from `from` to `to`.
@@ -480,7 +500,15 @@ impl TronClient {
         amount: i64,
         since_ms: i64,
     ) -> Result<bool, String> {
-        todo!("Task 4 Step 5")
+        let transfers = self.trc20_transfers(from, usdt_contract, Some(since_ms)).await?;
+        Ok(transfers.iter().any(|t| {
+            t.transaction_id.eq_ignore_ascii_case(tx_id)
+                && t.event_type == TRC20_TRANSFER_EVENT
+                && t.from == from
+                && t.to == to
+                && t.token_info.address == usdt_contract
+                && t.value.parse::<i64>() == Ok(amount)
+        }))
     }
 }
 
