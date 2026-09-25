@@ -100,11 +100,13 @@ async fn main() {
         // and a pass that came round before the funding landed would read a zero balance and fund
         // the same address again. An hour is not a latency requirement (the deposit is already
         // credited; this is only consolidation), so there is no reason to shorten it.
-        tokio::spawn(treasury_service::sweeper::run(
-            pool.clone(),
-            config.clone(),
-            config.reconciliation_interval_secs.min(3600),
-        ));
+        //
+        // GasFree deposits are swept as soon as they are credited (spec §3), and a permit is valid
+        // for minutes, so while GasFree is on the pass runs every minute. The TRX rail keeps the
+        // hour, for the funding reason above; with GasFree on, the plain addresses get the same
+        // minute, which is still far above a block.
+        let sweep_interval_secs = if config.gasfree.is_some() { 60 } else { config.reconciliation_interval_secs.min(3600) };
+        tokio::spawn(treasury_service::sweeper::run(pool.clone(), config.clone(), sweep_interval_secs));
 
         tokio::spawn(async move {
             loop {

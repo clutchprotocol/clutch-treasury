@@ -404,18 +404,54 @@ impl TronClient {
 
     /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
     pub async fn view_word(&self, contract: &str, selector: &str, parameter: Option<&str>) -> Result<String, String> {
-        todo!("Task 3 Step 5")
+        // A constant call runs nothing and costs nothing. TronGrid wants an `owner_address`, and a
+        // view does not care who asks, so the contract is named as its own caller.
+        let mut body = serde_json::json!({
+            "owner_address": contract,
+            "contract_address": contract,
+            "function_selector": selector,
+            "visible": true,
+        });
+        if let Some(p) = parameter {
+            body["parameter"] = serde_json::Value::from(p);
+        }
+        let resp = self
+            .http
+            .post(format!("{}/wallet/triggerconstantcontract", self.base_url))
+            .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("trongrid {selector} on {contract} failed: {status} {text}"));
+        }
+        let parsed: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let word = parsed["constant_result"][0]
+            .as_str()
+            .ok_or_else(|| format!("{selector} on {contract} returned nothing: {parsed}"))?;
+        if word.len() != 64 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{selector} on {contract} returned {word:?}, not one 32-byte word"));
+        }
+        Ok(word.to_ascii_lowercase())
     }
 
     /// The next nonce the GasFree controller accepts from `owner`: the chain's count of the permits
     /// it has run for them. Moving past a permit's nonce is how a GasFree sweep is known to have run.
     pub async fn gasfree_nonce(&self, controller: &str, owner: &str) -> Result<u64, String> {
-        todo!("Task 3 Step 5")
+        let word = self.view_word(controller, "nonces(address)", Some(&abi_encode_address(owner)?)).await?;
+        let (high, low) = word.split_at(48);
+        if high.bytes().any(|b| b != b'0') {
+            return Err(format!("nonces({owner}) returned 0x{word}, more than a u64"));
+        }
+        u64::from_str_radix(low, 16).map_err(|e| format!("nonces({owner}) returned 0x{word}: {e}"))
     }
 
     /// An upgradeable proxy's `implementation()`, as 40 lowercase hex characters.
     pub async fn implementation(&self, proxy: &str) -> Result<String, String> {
-        todo!("Task 3 Step 5")
+        Ok(self.view_word(proxy, "implementation()", None).await?[24..].to_string())
     }
 }
 

@@ -46,13 +46,28 @@ pub struct Trace {
 
 /// The signer's trace reply, read field by field.
 pub fn parse_trace(body: &serde_json::Value) -> Result<Trace, String> {
-    todo!("Task 3 Step 5")
+    let state = body["state"].as_str().ok_or_else(|| format!("a trace with no state: {body}"))?;
+    Ok(Trace {
+        state: state.to_string(),
+        txn_hash: body["txn_hash"].as_str().filter(|h| !h.is_empty()).map(str::to_string),
+        txn_amount: body["txn_amount"].as_i64(),
+    })
 }
 
 /// `GET /internal/gasfree/trace/:trace_id` on the signer. The signer holds the relay's API key;
 /// this service does not.
 pub async fn fetch_trace(http: &reqwest::Client, base_url: &str, token: &str, trace_id: &str) -> Result<Trace, String> {
-    todo!("Task 3 Step 5")
+    let resp = http
+        .get(format!("{base_url}/internal/gasfree/trace/{trace_id}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("signer unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("signer returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("unreadable trace: {e}"))?;
+    parse_trace(&body)
 }
 
 /// Why GasFree must stop, when its code is not the reviewed code; `None` when it is (spec §5). Both
@@ -62,7 +77,17 @@ pub async fn code_changed(
     client: &crate::tron_verifier::TronClient,
     settings: &gasfree::Settings,
 ) -> Result<Option<String>, String> {
-    todo!("Task 3 Step 5")
+    let checks = [
+        ("beacon", settings.chain.beacon, &settings.expected_beacon_implementation),
+        ("controller", settings.chain.controller, &settings.expected_controller_implementation),
+    ];
+    for (what, proxy, expected) in checks {
+        let now = client.implementation(proxy).await?;
+        if now != *expected {
+            return Ok(Some(format!("the GasFree {what} {proxy} now runs 0x{now}, not the reviewed 0x{expected}")));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
