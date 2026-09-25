@@ -28,9 +28,10 @@ pub(super) async fn code_unchanged(pool: &PgPool, settings: &gasfree::Settings, 
     match crate::gasfree_rail::code_changed(client, settings).await {
         Ok(None) => true,
         Ok(Some(reason)) => {
-            // Minting stops too: CLT minted against a GasFree account whose code nobody has reviewed
-            // may never reach custody (the GasFree design's §2 rule). Only a breaker that is not set
-            // already is set, so an earlier reason stays for whoever is reading it.
+            // Minting stops too, and with it every payout (drain_once honours the same breaker): CLT
+            // minted against a GasFree account whose code nobody has reviewed may never reach custody
+            // (the GasFree design's §2 rule). Only a breaker that is not set already is set, so an
+            // earlier reason stays for whoever is reading it.
             if let Err(e) = sqlx::query(
                 "UPDATE breaker_state SET minting_halted = TRUE, halt_reason = $1, updated_at = now()
                   WHERE NOT minting_halted",
@@ -46,9 +47,9 @@ pub(super) async fn code_unchanged(pool: &PgPool, settings: &gasfree::Settings, 
                 "p1",
                 "sweeper",
                 &format!(
-                    "{reason}. GasFree sweeps and all minting have stopped until someone reviews the new code, \
-                     updates the setting, and resumes minting (resume-minting.yml). Money already in GasFree \
-                     accounts is exposed either way; no more should go in."
+                    "{reason}. GasFree sweeps, all minting and all redemption payouts have stopped until someone \
+                     reviews the new code, updates the setting, and resumes minting (resume-minting.yml, which also \
+                     resumes payouts). Money already in GasFree accounts is exposed either way; no more should go in."
                 ),
                 hourly(),
             )

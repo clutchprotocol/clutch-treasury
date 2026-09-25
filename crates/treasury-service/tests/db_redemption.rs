@@ -1100,6 +1100,9 @@ async fn an_ambiguous_gasfree_payout_holds_the_float_for_the_longest_deadline() 
     let held = deadline.expect("a deadline holds the float") - now();
     assert!((890..=910).contains(&held), "held for the longest deadline plus the grace, about 900 s, got {held}");
     assert_eq!(payout_alerts(&pool, "p1", "do not return this intent").await, 1, "the page says when the intent may be returned");
+    // A human resolves this intent from the page: it must name the float the permit leaves from, F,
+    // not the plain float, or they search the wrong address before returning it to payout_pending.
+    assert_eq!(payout_alerts(&pool, "p1", &float()).await, 1, "the page names the GasFree float");
 }
 
 /// Spec §4: a redemption is refused before anything exists to burn against while the float's next
