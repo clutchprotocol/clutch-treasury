@@ -344,9 +344,11 @@ impl TronClient {
         &self,
         main_address: &str,
         unswept_addresses: &[String],
-        float_address: &str,
+        float_addresses: &[String],
         usdt_contract: &str,
     ) -> Result<i64, String> {
+        // Plan 4 Task 1 stub: the first float only, as before.
+        let float_address = float_addresses.first().map(String::as_str).unwrap_or_default();
         // Custody and the float first, and again after the walk. USDT moving between them and an
         // address read in between (a fund-float into the float, a sweep into custody) would be
         // counted twice, so a walk that saw either of them change is not a sum of one moment.

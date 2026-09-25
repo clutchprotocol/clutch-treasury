@@ -117,10 +117,12 @@ pub struct AppConfig {
     pub trongrid_url: String,
     pub trongrid_api_key: String,
     pub custody_tron_address: String,
-    /// The payout float address, read off tron-signer's /internal/xpub.
+    /// The plain payout float at 2/0, read off tron-signer's /internal/xpub (`payout_address`), on
+    /// both rails.
     ///
     /// Configured rather than derived: this service holds no key material and must not be able to
     /// derive spending addresses. It only needs to know where to LOOK, so it is given the address.
+    /// Its GasFree account is derived from it, key-free, by `gasfree_float`.
     pub payout_float_address: String,
     pub usdt_contract: String,
     pub deposit_confirmations: u32,
@@ -181,6 +183,16 @@ impl AppConfig {
     /// Signatures a Mint needs. 0 and 1 both mean one, matching the node.
     pub fn effective_mint_threshold(&self) -> usize {
         self.mint_threshold.max(1) as usize
+    }
+
+    /// The payout float's GasFree account, `F = gasfree(payout_float_address)`, while GasFree is on;
+    /// `None` while it is off.
+    ///
+    /// Derived, key-free, with the crate the signer uses, so the two services cannot name different
+    /// floats (GasFree design §4). GasFree payouts are paid from it and sweeps may fill it, so the
+    /// reserve counts it beside the plain float, which keeps whatever it held before.
+    pub fn gasfree_float(&self) -> Option<String> {
+        todo!("Plan 4 Task 1: derive the GasFree float")
     }
 
     pub fn load(env: &str) -> Result<Self, ConfigError> {

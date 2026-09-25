@@ -219,7 +219,7 @@ pub async fn run_once(
         .get_reserve_balance(
             &config.custody_tron_address,
             &unswept,
-            &config.payout_float_address,
+            &[config.payout_float_address.clone()],
             &config.usdt_contract,
         )
         .await

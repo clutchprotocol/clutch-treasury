@@ -31,6 +31,9 @@ const REAL_UNSWEPT_B: &str = "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx";
 /// The payout float's address — also genuinely valid base58check, since it goes through the same
 /// balanceOf/abi_encode_address path as the addresses above.
 const FLOAT: &str = "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY";
+/// A second float, as the GasFree account of the plain one would be. Any valid address: the mocks
+/// answer by address.
+const GASFREE_FLOAT: &str = "TRhVWK5XEDkQBDevcdCWW7RW51aRncty4W";
 
 async fn pool() -> PgPool {
     // Each test BINARY gets its own database. --test-threads=1 only serialises tests WITHIN a
@@ -961,12 +964,12 @@ async fn reserve_balance_sums_the_main_address_and_every_unswept_deposit_address
     mount_balance_of(&server, "00000000000000000000000000000000000000000000000000000000000f4240").await;
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
 
-    let only_main = client.get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT).await.unwrap();
+    let only_main = client.get_reserve_balance(REAL_MAIN, &[], &[FLOAT.to_string()], USDT).await.unwrap();
     assert_eq!(only_main, 2_000_000, "with nothing unswept the reserve is main + float");
 
     // Four addresses now, each answering the same mocked balance.
     let with_unswept = client
-        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string(), REAL_UNSWEPT_B.to_string()], FLOAT, USDT)
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string(), REAL_UNSWEPT_B.to_string()], &[FLOAT.to_string()], USDT)
         .await
         .unwrap();
     assert_eq!(with_unswept, 4_000_000, "main + two unswept addresses + float must all be counted");
@@ -980,7 +983,7 @@ async fn a_single_unreadable_address_fails_the_whole_reserve_sum() {
     // No balanceOf mock mounted at all, so the very first read fails.
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into());
     let err = client
-        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string()], FLOAT, USDT)
+        .get_reserve_balance(REAL_MAIN, &[REAL_UNSWEPT_A.to_string()], &[FLOAT.to_string()], USDT)
         .await
         .expect_err("an unreadable address must not yield a partial total");
     assert!(!err.is_empty(), "the failure must be reported, not swallowed into a smaller number");
@@ -996,7 +999,7 @@ async fn the_reserve_includes_the_payout_float() {
     mount_balance(&server, FLOAT, 300).await;
 
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
-    let total = client.get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT).await.unwrap();
+    let total = client.get_reserve_balance(REAL_MAIN, &[], &[FLOAT.to_string()], USDT).await.unwrap();
 
     assert_eq!(total, 1000, "float USDT is reserve backing CLT, not spare money");
 }
@@ -1018,9 +1021,53 @@ async fn a_reserve_walk_that_saw_custody_move_is_refused() {
 
     let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
     let err = client
-        .get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT)
+        .get_reserve_balance(REAL_MAIN, &[], &[FLOAT.to_string()], USDT)
         .await
         .expect_err("a walk that saw custody move is not a sum");
+
+    assert!(err.contains("moved while the reserve was read"), "{err}");
+}
+
+/// While GasFree is on there are two floats: the plain one keeps what it held, and GasFree payouts
+/// leave from its GasFree account. Both are the treasury's money, so both are counted.
+#[tokio::test]
+async fn the_reserve_counts_every_float() {
+    let server = MockServer::start().await;
+    mount_balance(&server, REAL_MAIN, 700).await;
+    mount_balance(&server, FLOAT, 300).await;
+    mount_balance(&server, GASFREE_FLOAT, 200).await;
+
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+    let total = client
+        .get_reserve_balance(REAL_MAIN, &[], &[FLOAT.to_string(), GASFREE_FLOAT.to_string()], USDT)
+        .await
+        .unwrap();
+
+    assert_eq!(total, 1200, "custody + the plain float + the GasFree float");
+}
+
+/// A sweep into the GasFree float while the walk reads the deposit addresses would count that USDT
+/// twice, once at the deposit address and once in the float: a walk that saw any float move is refused.
+#[tokio::test]
+async fn a_reserve_walk_that_saw_the_gasfree_float_move_is_refused() {
+    let server = MockServer::start().await;
+    mount_balance(&server, REAL_MAIN, 700).await;
+    mount_balance(&server, FLOAT, 300).await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains(GASFREE_FLOAT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [format!("{:064x}", 200)]})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_balance(&server, GASFREE_FLOAT, 900).await;
+
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+    let err = client
+        .get_reserve_balance(REAL_MAIN, &[], &[FLOAT.to_string(), GASFREE_FLOAT.to_string()], USDT)
+        .await
+        .expect_err("a walk that saw a float move is not a sum");
 
     assert!(err.contains("moved while the reserve was read"), "{err}");
 }
