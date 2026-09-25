@@ -3038,6 +3038,7 @@ dependencies = [
  "clutch-chain",
  "config",
  "dotenv",
+ "gasfree",
  "hex",
  "reqwest",
  "serde",

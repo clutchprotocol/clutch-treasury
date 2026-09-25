@@ -515,6 +515,9 @@ struct DepositBackedIntent {
     /// choosing would defeat the point of the four-eyes split.
     deposit_address: Option<String>,
     deposit_tx_id: Option<String>,
+    /// The BIP32 index the orchestrator reported for `deposit_address`. With GasFree on, the signer
+    /// is asked which of that index's two addresses the deposit was paid to.
+    derivation_index: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -642,50 +645,66 @@ async fn evaluate(
     }
 }
 
-/// Approve + `verified_at` + outbox row + `ledger::append_event("custody_deposit", ...)` in
-/// ONE transaction (brief's exactly-once requirement). `WHERE status = 'created'` on the
-/// UPDATE is what makes a rerun after a crash safe: if a prior run already flipped this intent
-/// to `approved` (crashed AFTER commit, e.g. mid-outbox-processing later), this UPDATE affects
-/// zero rows and the function returns Ok(false) — no second `approved_by` write, no second
-/// outbox row, no second ledger event. If the crash was BEFORE commit, the whole transaction
-/// never happened and this rerun performs the one real attempt. There is no window where a
-/// rerun can observe a half-committed state, because all four writes share one transaction.
+/// Approve (or hold for a human) + `verified_at` + outbox row + `ledger::append_event("custody_deposit", ...)`
+/// in ONE transaction (brief's exactly-once requirement). `WHERE status = 'created'` on the UPDATE
+/// is what makes a rerun after a crash safe: if a prior run already moved this intent on, this
+/// UPDATE affects zero rows and the function returns Ok(false) — no second `approved_by` write, no
+/// second outbox row, no second ledger event. If the crash was BEFORE commit, the whole transaction
+/// never happened and this rerun performs the one real attempt.
+///
+/// `status` is `approved`, or `needs_manual` for a GasFree deposit below the minimum: recorded and
+/// ledgered the same way, with no outbox row, so nothing mints until a human approves it.
+///
+/// `cap` is set for a deposit to a GasFree account (spec §2): the mint drops to it when the
+/// orchestrator proposed more, and what was held back is stored beside it.
 async fn approve_and_ledger(
     pool: &PgPool,
     intent_id: Uuid,
     observed_amount_usdt: i64,
     tx_id: &str,
+    status: &str,
+    cap: Option<i64>,
 ) -> Result<bool, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
+    // Postgres evaluates every SET expression against the row as it was, so both CASE lines read the
+    // amount the orchestrator proposed.
     let updated = sqlx::query(
         "UPDATE mint_intents
-         SET status = 'approved', approved_by = 'tron-verifier', verified_at = now(), updated_at = now()
+         SET status = $2, approved_by = 'tron-verifier', verified_at = now(), updated_at = now(),
+             amount_clt = CASE WHEN $3::BIGINT IS NULL THEN amount_clt ELSE LEAST(amount_clt, $3::BIGINT) END,
+             fee_held_usdt = CASE WHEN $3::BIGINT IS NULL THEN NULL
+                                  ELSE $4::BIGINT - LEAST(amount_clt, $3::BIGINT) END
          WHERE id = $1 AND status = 'created'",
     )
     .bind(intent_id)
+    .bind(status)
+    .bind(cap)
+    .bind(observed_amount_usdt)
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
     if updated.rows_affected() == 0 {
-        // Already approved by a prior run (or otherwise no longer `created`) — rerun-safe
-        // no-op. Roll back rather than commit an empty transaction; either is harmless here,
-        // but rollback makes "nothing happened" true of the DB log too.
+        // Already moved on by a prior run — rerun-safe no-op. Roll back rather than commit an empty
+        // transaction; either is harmless here, but rollback makes "nothing happened" true of the DB
+        // log too.
         tx.rollback().await.map_err(|e| e.to_string())?;
         return Ok(false);
     }
 
-    sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
-        .bind(intent_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+    if status == "approved" {
+        sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // Custody enters the ledger ONLY here — independent verification is what makes the
-    // backing-ratio breaker meaningful (brief). OBSERVED amount, not amount_clt: includes the
-    // discriminator and any overpay surplus, so the ledger agrees with real custody and
-    // backing sits slightly above par, not exactly at it.
+    // backing-ratio breaker meaningful (brief). OBSERVED amount, not amount_clt: everything that
+    // arrived, so the ledger agrees with real custody. A GasFree deposit's fee is spent only when it
+    // is swept, and reconciliation judges the reserve on chain.
     sqlx::query(
         "INSERT INTO treasury_events (kind, amount_clt, amount_usdt, intent_id, chain_tx_hash, description)
          VALUES ('custody_deposit', 0, $1, $2, $3, 'TronGrid-verified deposit')
@@ -700,6 +719,29 @@ async fn approve_and_ledger(
 
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// What a verified deposit may do.
+enum Verdict {
+    /// Approve and mint. `cap`, for a GasFree account, is the most it may mint.
+    Approve { cap: Option<i64> },
+    /// Record the deposit, mint nothing, and page a human.
+    Hold { cap: i64, reason: String },
+    Reject(String),
+    /// Nothing is decided this pass; the intent stays `created`.
+    Wait(String),
+}
+
+/// With GasFree on: a plain address mints as before, a GasFree account holds back the relay's fee
+/// (spec §2), and an address its own index does not lead to is one no sweep could ever move.
+async fn gasfree_verdict(
+    pool: &PgPool,
+    settings: &gasfree::Settings,
+    signer: &crate::sweeper::HttpSigner,
+    intent: &DepositBackedIntent,
+    observed_amount_usdt: i64,
+) -> Verdict {
+    todo!("Task 2 Step 7")
 }
 
 /// Hard mismatch: `rejected` + alert. `WHERE status = 'created'` for the same rerun-safety
@@ -784,9 +826,19 @@ async fn stuck_intent_sweep(pool: &PgPool, intents: &[DepositBackedIntent]) {
 /// evaluating or acting on ONE intent are alerted and skipped rather than aborting the batch.
 pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, String> {
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
-    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+    // With GasFree on, the signer is asked which of an index's two addresses a deposit went to.
+    let signer = crate::sweeper::HttpSigner {
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?,
+        base_url: config.signer_url.clone(),
+        token: config.signer_token.clone(),
+    };
+    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>, Option<i64>)> =
         sqlx::query_as(
-            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at FROM mint_intents
+            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index
+             FROM mint_intents
              WHERE status = 'created' AND client_ref IS NOT NULL
              ORDER BY created_at",
         )
@@ -796,12 +848,8 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
-        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at)| DepositBackedIntent {
-            id,
-            expected_amount_usdt,
-            deposit_address,
-            deposit_tx_id,
-            created_at,
+        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index)| {
+            DepositBackedIntent { id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index }
         })
         .collect();
 
@@ -846,11 +894,41 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 if !may_approve {
                     continue;
                 }
-                match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id).await {
-                    Ok(true) => approved += 1,
-                    Ok(false) => {} // already approved by a prior run — rerun-safe no-op
-                    Err(e) => {
-                        alert(pool, "p1", "tron_verifier", &format!("intent {}: approval write failed: {e}", intent.id)).await;
+                let verdict = match &config.gasfree {
+                    // The TRX rail: the whole deposit reaches custody, so the intent mints what it says.
+                    None => Verdict::Approve { cap: None },
+                    Some(settings) => gasfree_verdict(pool, settings, &signer, intent, observed_amount_usdt).await,
+                };
+                match verdict {
+                    Verdict::Approve { cap } => {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap).await {
+                            Ok(true) => approved += 1,
+                            Ok(false) => {} // already approved by a prior run — rerun-safe no-op
+                            Err(e) => {
+                                alert(pool, "p1", "tron_verifier", &format!("intent {}: approval write failed: {e}", intent.id)).await;
+                            }
+                        }
+                    }
+                    Verdict::Hold { cap, reason } => {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap)).await {
+                            Ok(true) => {
+                                alert(pool, "p1", "tron_verifier", &format!("mint intent {} needs manual review: {reason}", intent.id)).await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                alert(pool, "p1", "tron_verifier", &format!("intent {}: recording it for manual review failed: {e}", intent.id)).await;
+                            }
+                        }
+                    }
+                    Verdict::Reject(reason) => {
+                        if let Err(e) = reject_and_alert(pool, intent.id, &reason).await {
+                            alert(pool, "p1", "tron_verifier", &format!("intent {}: reject write failed: {e}", intent.id)).await;
+                        }
+                    }
+                    // Nothing decided: the intent stays `created`, the next tick retries it, and the
+                    // stuck-intent sweep pages a human if it stays that way.
+                    Verdict::Wait(reason) => {
+                        tracing::debug!(intent_id = %intent.id, reason, "tron_verifier: verified, not yet approvable; retrying next tick");
                     }
                 }
             }

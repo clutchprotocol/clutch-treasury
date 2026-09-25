@@ -2,6 +2,7 @@ pub mod api;
 pub mod breakers;
 pub mod chain_sync;
 pub mod configuration;
+pub mod gasfree_rail;
 pub mod ledger;
 pub mod metrics;
 pub mod intents;

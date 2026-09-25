@@ -374,6 +374,24 @@ impl SweepSigner for HttpSigner {
     }
 }
 
+/// Both deposit addresses of an index, as the signer derives them.
+#[derive(Debug, PartialEq)]
+pub struct IndexAddresses {
+    pub plain: String,
+    /// `None` when GasFree is off in the signer.
+    pub gasfree: Option<String>,
+}
+
+impl HttpSigner {
+    /// `GET /internal/addresses/:index`: both addresses of an index. Moves nothing. The treasury
+    /// asks here, where the addresses are derived, instead of trusting the address the
+    /// orchestrator reported, because whether a deposit pays a relay fee must not be the
+    /// orchestrator's choice.
+    pub async fn addresses(&self, index: i64) -> Result<IndexAddresses, String> {
+        todo!("Task 2 Step 7")
+    }
+}
+
 /// Spawned once from `main.rs`.
 pub async fn run(pool: PgPool, config: AppConfig, interval_secs: u64) {
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
