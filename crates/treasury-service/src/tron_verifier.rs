@@ -48,6 +48,11 @@ use crate::ledger::{alert, alert_once};
 struct Trc20Transfer {
     transaction_id: String,
     to: String,
+    /// Who paid. Only the payout check reads it (`confirmed_transfer`): a GasFree payout's
+    /// transaction carries two transfers from the float, the redeemer's and the relay's fee. A
+    /// missing field fails that check, closed.
+    #[serde(default)]
+    from: String,
     value: String,
     token_info: TokenInfo,
     /// The TRC-20 event kind. Only `"Transfer"` moves value — an `Approval` event carries a
@@ -452,6 +457,30 @@ impl TronClient {
     /// An upgradeable proxy's `implementation()`, as 40 lowercase hex characters.
     pub async fn implementation(&self, proxy: &str) -> Result<String, String> {
         Ok(self.view_word(proxy, "implementation()", None).await?[24..].to_string())
+    }
+
+    /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
+    /// `contract_address`, not `bytecode`: an activated GasFree account answers with an EMPTY
+    /// bytecode (2026-09-24). Only `{}` means no; any other answer is an error, never "no".
+    pub async fn has_contract(&self, address: &str) -> Result<bool, String> {
+        todo!("Task 4 Step 5")
+    }
+
+    /// Whether `tx_id` carries a confirmed USDT `Transfer` of exactly `amount` from `from` to `to`.
+    ///
+    /// Read from `from`'s confirmed TRC-20 history since `since_ms`, so the event is checked field by
+    /// field: a GasFree payout's transaction holds two transfers from the float, and only the one to
+    /// the redeemer pays the redemption.
+    pub async fn confirmed_transfer(
+        &self,
+        tx_id: &str,
+        from: &str,
+        to: &str,
+        usdt_contract: &str,
+        amount: i64,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        todo!("Task 4 Step 5")
     }
 }
 
@@ -1142,6 +1171,7 @@ mod tests {
     fn transfer(to: &str, contract: &str, value: &str) -> Trc20Transfer {
         Trc20Transfer {
             transaction_id: "tx1".to_string(),
+            from: String::new(),
             to: to.to_string(),
             value: value.to_string(),
             token_info: TokenInfo { address: contract.to_string() },

@@ -5,7 +5,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
-use crate::ledger::alert;
+use crate::gasfree_rail::Trace;
+use crate::ledger::{alert, alert_once};
 use crate::tron_verifier::TronClient;
 
 /// What the signer reported for one payout.
@@ -14,7 +15,7 @@ use crate::tron_verifier::TronClient;
 /// means the signer told us it did not broadcast, so retrying is free. `Ambiguous` means we do not
 /// know, and a TRC-20 transfer has no memo to dedupe against, so retrying risks paying twice for a
 /// burn that only happened once. Never widen `Refused` to cover a case you are not certain about.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PayoutReply {
     Paid { tx_id: String },
     FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
@@ -25,6 +26,16 @@ pub enum PayoutReply {
     Refused(String),
     /// No usable answer. MAY have broadcast. Not retryable by any automation.
     Ambiguous(String),
+    /// A GasFree permit paying this redemption is with the relay. Not paid until its transfer from
+    /// the float is found confirmed on chain (`confirm_gasfree_payouts_once`).
+    Submitted { trace_id: String, nonce: u64, deadline: u64 },
+    /// The relay refused a signed permit with one of the refusals its docs list as pre-execution
+    /// checks. That is the relay's word, not proof: the permit stays valid until `deadline`, so
+    /// nothing is signed before then, and after it the chain decides.
+    RelayRefused { reason: String, nonce: u64, deadline: u64 },
+    /// The GasFree float has never made a transfer, so its next one would also pay its activation.
+    /// Provably nothing was signed. Redemptions wait for the one-time activation (spec §4).
+    FloatNotActive { float_address: String },
 }
 
 /// The signer boundary, as a trait so the worker is testable without a live service or real keys —
@@ -32,6 +43,18 @@ pub enum PayoutReply {
 #[async_trait::async_trait]
 pub trait PayoutSigner: Send + Sync {
     async fn pay(&self, intent_id: Uuid, to: &str, amount_usdt: i64) -> PayoutReply;
+
+    /// The relay's record of a GasFree permit. Only used to find its transaction; the chain decides
+    /// whether that paid the redemption.
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Err("this signer cannot read GasFree traces".into())
+    }
+
+    /// The plain address that owns the payout float (`2/0`), and the GasFree float it owns. The
+    /// float's nonce on the GasFree controller is its owner's.
+    async fn float_owner(&self) -> Result<(String, Option<String>), String> {
+        Err("this signer cannot name the float's owner".into())
+    }
 }
 
 /// The real signer, over HTTP. Modelled on `sweeper::HttpSigner` — same shape, same reasoning.
@@ -99,6 +122,14 @@ impl PayoutSigner for HttpPayoutSigner {
             // not understand. Ambiguous, never Refused.
             other => PayoutReply::Ambiguous(format!("unrecognised signer status {other:?}")),
         }
+    }
+
+    async fn trace(&self, trace_id: &str) -> Result<Trace, String> {
+        crate::gasfree_rail::fetch_trace(&self.http, &self.base_url, &self.token, trace_id).await
+    }
+
+    async fn float_owner(&self) -> Result<(String, Option<String>), String> {
+        todo!("Task 4 Step 5")
     }
 }
 
@@ -279,6 +310,9 @@ pub async fn drain_once(
                 }
                 processed += 1;
             }
+            PayoutReply::Submitted { .. } | PayoutReply::RelayRefused { .. } | PayoutReply::FloatNotActive { .. } => {
+                todo!("Task 4 Step 5")
+            }
             // Proven non-broadcast: hand it back for a later pass.
             reply @ (PayoutReply::FloatDry { .. }
             | PayoutReply::CapExceeded { .. }
@@ -429,6 +463,23 @@ pub async fn confirm_payouts_once(pool: &PgPool, client: &TronClient) -> Result<
         }
     }
     Ok(confirmed)
+}
+
+/// Settles GasFree payouts (spec §4, §5).
+///
+/// A permit returns a trace id. The relay's record of it names the transaction, and the payout is
+/// paid only when that transaction's transfer — from the float, to the redeemer, of exactly the
+/// quoted amount — is confirmed on chain. After a permit's deadline, the float's nonce says whether
+/// it can have run: still at the permit's nonce, it never did, and the redemption goes back to be
+/// paid again.
+pub async fn confirm_gasfree_payouts_once(
+    pool: &PgPool,
+    config: &AppConfig,
+    settings: &gasfree::Settings,
+    client: &TronClient,
+    signer: &dyn PayoutSigner,
+) -> Result<u32, String> {
+    todo!("Task 4 Step 5")
 }
 
 /// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past
