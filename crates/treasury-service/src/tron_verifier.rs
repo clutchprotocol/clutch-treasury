@@ -319,10 +319,11 @@ impl TronClient {
     ///
     /// `balanceOf` asks the token's own ledger, so account activation is irrelevant.
     ///
-    /// Custody + every unswept deposit address + the payout float.
+    /// Custody + every unswept deposit address + every payout float: the plain one, and its GasFree
+    /// account while GasFree is on.
     ///
-    /// Custody and the float are read before and after the addresses; if either changed, the walk is
-    /// refused, because a transfer between two reads would be counted twice.
+    /// Custody and every float are read before and after the addresses; if any of them changed, the
+    /// walk is refused, because a transfer between two reads would be counted twice.
     ///
     /// Reading only the main address would report a reserve near zero while deposits sit on derived
     /// addresses awaiting a sweep. That is not a halt risk — `judge` keys on the LEDGER's
@@ -334,8 +335,8 @@ impl TronClient {
     /// custody, so leaving it out means the first top-up reads as the reserve shrinking, and
     /// reconciliation halts minting over money that never left.
     ///
-    /// `float_address` is a separate parameter rather than another entry in `unswept_addresses` so a
-    /// failure reading it is attributed to the float, not misreported as a deposit problem.
+    /// `float_addresses` is a separate parameter rather than more entries in `unswept_addresses` so a
+    /// failure reading one is attributed to the float, not misreported as a deposit problem.
     ///
     /// A failure on ANY address fails the whole sum. A partial total would understate the reserve
     /// and look exactly like a shortfall, which is the one direction a reserve figure must never
@@ -347,18 +348,14 @@ impl TronClient {
         float_addresses: &[String],
         usdt_contract: &str,
     ) -> Result<i64, String> {
-        // Plan 4 Task 1 stub: the first float only, as before.
-        let float_address = float_addresses.first().map(String::as_str).unwrap_or_default();
-        // Custody and the float first, and again after the walk. USDT moving between them and an
-        // address read in between (a fund-float into the float, a sweep into custody) would be
-        // counted twice, so a walk that saw either of them change is not a sum of one moment.
+        // Custody and every float first, and again after the walk. USDT moving between them and an
+        // address read in between (a fund-float into the plain float, a sweep into custody or into
+        // the GasFree float) would be counted twice, so a walk that saw any of them change is not a
+        // sum of one moment.
         let main = self.get_custody_balance(main_address, usdt_contract).await?;
-        let float = self
-            .get_custody_balance(float_address, usdt_contract)
-            .await
-            .map_err(|e| format!("payout float {float_address}: {e}"))?;
+        let floats = self.float_balances(float_addresses, usdt_contract).await?;
         // Saturating: a corrupt balance must not wrap the reserve into something small.
-        let mut total = main.saturating_add(float);
+        let mut total = floats.iter().fold(main, |sum, f| sum.saturating_add(*f));
         for addr in unswept_addresses {
             let bal = self
                 .get_custody_balance(addr, usdt_contract)
@@ -367,17 +364,27 @@ impl TronClient {
             total = total.saturating_add(bal);
         }
         let main_after = self.get_custody_balance(main_address, usdt_contract).await?;
-        let float_after = self
-            .get_custody_balance(float_address, usdt_contract)
-            .await
-            .map_err(|e| format!("payout float {float_address}: {e}"))?;
-        if main_after != main || float_after != float {
+        let floats_after = self.float_balances(float_addresses, usdt_contract).await?;
+        if main_after != main || floats_after != floats {
             return Err(format!(
-                "custody or the payout float moved while the reserve was read (custody {main} then {main_after}, \
-                 float {float} then {float_after}); not a sum of one moment"
+                "custody or a payout float moved while the reserve was read (custody {main} then {main_after}, \
+                 floats {floats:?} then {floats_after:?}); not a sum of one moment"
             ));
         }
         Ok(total)
+    }
+
+    /// Each float's balance, in order; an unreadable one fails the whole walk.
+    async fn float_balances(&self, float_addresses: &[String], usdt_contract: &str) -> Result<Vec<i64>, String> {
+        let mut balances = Vec::with_capacity(float_addresses.len());
+        for addr in float_addresses {
+            balances.push(
+                self.get_custody_balance(addr, usdt_contract)
+                    .await
+                    .map_err(|e| format!("payout float {addr}: {e}"))?,
+            );
+        }
+        Ok(balances)
     }
 
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {

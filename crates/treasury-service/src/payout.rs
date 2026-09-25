@@ -554,7 +554,11 @@ pub async fn drain_once(
                      (micro-USDT: the quoted net, below the {amount_clt} burned when a fee is set) to {payout_address} around that time. Found it? Set \
                      payout_ref to that tx hash — confirm_payouts_once will pick it up from there. \
                      Found nothing? Return the intent to payout_pending by hand.{not_before}",
-                    float = config.payout_float_address
+                    float = if gasfree_payouts {
+                        config.gasfree_float().unwrap_or_default()
+                    } else {
+                        config.payout_float_address.clone()
+                    }
                 )).await;
                 if gasfree_payouts {
                     break; // one permit at a time
@@ -677,6 +681,10 @@ pub async fn confirm_gasfree_payouts_once(
     .await
     .map_err(|e| e.to_string())?;
 
+    // GasFree payouts leave from the float's GasFree account, derived from the plain float.
+    let Some(float) = config.gasfree_float() else {
+        return Ok(0);
+    };
     let mut paid = 0u32;
     for (intent_id, to, amount, trace_id, nonce, deadline, submitted_at) in rows {
         // The relay's record names the transaction; the chain says whether it paid THIS redemption.
@@ -686,7 +694,7 @@ pub async fn confirm_gasfree_payouts_once(
                     // Ten minutes before the claim, for clock skew between this host and the chain.
                     let since_ms = (submitted_at - chrono::Duration::minutes(10)).timestamp_millis();
                     match client
-                        .confirmed_transfer(&hash, &config.payout_float_address, &to, &config.usdt_contract, amount, since_ms)
+                        .confirmed_transfer(&hash, &float, &to, &config.usdt_contract, amount, since_ms)
                         .await
                     {
                         Ok(true) => {
@@ -743,16 +751,16 @@ pub async fn confirm_gasfree_payouts_once(
             continue;
         }
         let owner = match signer.float_owner().await {
-            Ok((owner, float)) if float.as_deref() == Some(config.payout_float_address.as_str()) => owner,
-            Ok((_, float)) => {
+            Ok((owner, signers)) if signers.as_deref() == Some(float.as_str()) => owner,
+            Ok((_, signers)) => {
                 alert_once(
                     pool,
                     "p1",
                     "payout",
                     &format!(
-                        "the signer's GasFree float is {float:?}, but PAYOUT_FLOAT_ADDRESS is {}: the reserve counts a \
-                         different float than the one redemptions are paid from, and GasFree payouts cannot be settled \
-                         until the two agree",
+                        "the signer's GasFree float is {signers:?}, but this treasury derives {float} from \
+                         PAYOUT_FLOAT_ADDRESS {}: the reserve counts a different float than the one redemptions are \
+                         paid from, and GasFree payouts cannot be settled until the two agree",
                         config.payout_float_address
                     ),
                     chrono::Duration::hours(1),

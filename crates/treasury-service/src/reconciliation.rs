@@ -215,13 +215,12 @@ pub async fn run_once(
     // Returning Err leaves NO row, which is the honest state — the run did not happen. main.rs
     // retries in 30 seconds, and if the outage persists the existing "no reconciliation run in 48h
     // — refusing to mint blind" gate stops minting on its own.
+    // The plain float and, while GasFree is on, its GasFree account: GasFree payouts leave from the
+    // second and sweeps may fill it, while the first keeps whatever it held (GasFree design §4).
+    let mut floats = vec![config.payout_float_address.clone()];
+    floats.extend(config.gasfree_float());
     let custody_reported = client
-        .get_reserve_balance(
-            &config.custody_tron_address,
-            &unswept,
-            &[config.payout_float_address.clone()],
-            &config.usdt_contract,
-        )
+        .get_reserve_balance(&config.custody_tron_address, &unswept, &floats, &config.usdt_contract)
         .await
         .map_err(|e| format!("reserve balance unreadable, not recording a run: {e}"))?;
 

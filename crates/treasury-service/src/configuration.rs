@@ -192,7 +192,8 @@ impl AppConfig {
     /// floats (GasFree design §4). GasFree payouts are paid from it and sweeps may fill it, so the
     /// reserve counts it beside the plain float, which keeps whatever it held before.
     pub fn gasfree_float(&self) -> Option<String> {
-        todo!("Plan 4 Task 1: derive the GasFree float")
+        let settings = self.gasfree.as_ref()?;
+        gasfree::gasfree_address(settings.chain, &self.payout_float_address).ok()
     }
 
     pub fn load(env: &str) -> Result<Self, ConfigError> {
@@ -269,6 +270,12 @@ impl AppConfig {
         // From the environment only, like the secrets above: the three services read the same
         // variables from one env file (spec §6), and a half-set rail stops the service here.
         cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+        // At boot, not at the first payout: with no GasFree float there is nothing to pay from and
+        // nothing to count, and every GasFree payout would be refused while the reserve reads low.
+        assert!(
+            cfg.gasfree.is_none() || cfg.gasfree_float().is_some(),
+            "APP_PAYOUT_FLOAT_ADDRESS must be a TRON address while GasFree is on: the GasFree float is derived from it"
+        );
         Ok(cfg)
     }
 }
