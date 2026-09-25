@@ -149,10 +149,10 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
 /// - `credited` → deposit `credited`.
 /// - `rejected`/`failed` → deposit `needs_manual` + a P1 alert naming the fact that funds are
 ///   unminted in custody and that re-minting needs a brand-new treasury intent.
-/// - `needs_manual` → deposit `needs_manual` + a P1 that says the opposite about recovery:
-///   the treasury intent is over the per-transaction mint cap and is approvable again once a
-///   human raises the cap, so this bridge keeps polling and credits the deposit when the
-///   treasury does.
+/// - `needs_manual` → deposit `needs_manual` + a P1 that says the opposite about recovery: the
+///   treasury is holding the intent for a human — over the per-transaction mint cap, or a GasFree
+///   deposit below the minimum after the fee — and it is approvable again, so this bridge keeps
+///   polling and credits the deposit when the treasury does.
 /// - anything else (`created`/`approved`/`submitted`) → still in flight, nothing to do yet.
 async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &DepositIntent) {
     let Some(treasury_id) = intent.treasury_intent_id else {
@@ -207,7 +207,7 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
                     "p1",
                     "treasury_bridge",
                     &format!(
-                        "deposit {} treasury mint intent {treasury_id} needs manual review: it is over the per-transaction mint cap. The user's USDT is at their deposit address, unswept and still counted in the reserve; no CLT has been minted. To release it, raise the cap (set-mint-caps) and approve intent {treasury_id} again (mint-intent-approve). This bridge keeps polling and credits the deposit when the treasury does.",
+                        "deposit {} treasury mint intent {treasury_id} needs manual review on the treasury side: it is over the per-transaction mint cap, or it is a GasFree deposit below the minimum after the fee (the treasury's own alert says which). The user's USDT is at their deposit address, still counted in the reserve; no CLT has been minted. Over the cap: raise the cap (set-mint-caps) and approve intent {treasury_id} again (mint-intent-approve). Below the minimum: approving it mints at most what arrived less the fee. This bridge keeps polling and credits the deposit when the treasury does.",
                         intent.id
                     ),
                 )
@@ -226,10 +226,13 @@ async fn poll_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &D
                     "treasury_bridge",
                     &format!(
                         "deposit {} treasury mint intent {treasury_id} was {s} — the user's funds are \
-                         SITTING IN CUSTODY WITH NO MINTED CLAIM against them. This deposit's client_ref \
-                         is burned and CANNOT be reused; re-minting requires a human to create a BRAND-NEW \
-                         treasury mint intent (human initiator) that references this deposit ({}) in its \
-                         description. Do NOT retry this bridge — it will only replay the same {s} intent.",
+                         SITTING IN CUSTODY WITH NO MINTED CLAIM against them. Read the treasury's own \
+                         alert for why first: a GasFree deposit no larger than the relay's fee can never \
+                         be minted, and a new mint for it would not be backed. Otherwise: this deposit's \
+                         client_ref is burned and CANNOT be reused; re-minting requires a human to create a \
+                         BRAND-NEW treasury mint intent (human initiator) that references this deposit ({}) \
+                         in its description, for at most what arrived less any GasFree fee. Do NOT retry \
+                         this bridge — it will only replay the same {s} intent.",
                         intent.id, intent.id
                     ),
                 )

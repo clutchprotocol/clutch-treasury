@@ -34,17 +34,23 @@ pub async fn address_for_user(
 
     let index_u32 =
         u32::try_from(index).map_err(|_| format!("derivation index {index} is out of range"))?;
-    let address = deriver.address_at(index_u32)?;
-    let _ = gasfree_for_new_users; // Task 5 Step 4
+    let plain = deriver.address_at(index_u32)?;
+    // G = gasfree(D) (spec §1): computed from the plain address and public constants, with no key.
+    // Only one of the two is stored, so the poller never watches both addresses of one index.
+    let (address, is_gasfree) = match gasfree_for_new_users {
+        Some(chain) => (gasfree::gasfree_address(chain, &plain)?, true),
+        None => (plain, false),
+    };
 
     sqlx::query(
-        "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address)
-         VALUES ($1, $2, $3, $4) ON CONFLICT (user_pk) DO NOTHING",
+        "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address, gasfree)
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_pk) DO NOTHING",
     )
     .bind(user_pk)
     .bind(index)
     .bind(&address)
     .bind(clt_address)
+    .bind(is_gasfree)
     .execute(pool)
     .await
     .map_err(|e| format!("storing the deposit address: {e}"))?;

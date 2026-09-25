@@ -33,26 +33,125 @@ impl GasFreeChain {
         Self { http, base_url, api_key }
     }
 
+    async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("trongrid {path} returned {}", resp.status()));
+        }
+        resp.json().await.map_err(|e| e.to_string())
+    }
+
     /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
     /// Only `{}` means no: an activated GasFree account answers with its contract record and an
     /// EMPTY bytecode (2026-09-24), and any other answer is an error, never "no".
     pub async fn has_contract(&self, address: &str) -> Result<bool, String> {
-        todo!("Task 5 Step 4")
+        let v = self.post("/wallet/getcontract", serde_json::json!({"value": address, "visible": true})).await?;
+        if v["contract_address"].as_str().is_some_and(|a| !a.is_empty()) {
+            return Ok(true);
+        }
+        if v.as_object().is_some_and(|o| o.is_empty()) {
+            return Ok(false);
+        }
+        Err(format!("getcontract for {address} gave neither a contract nor {{}}: {v}"))
+    }
+
+    /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
+    async fn view_word(&self, contract: &str, selector: &str, parameter: Option<&str>) -> Result<String, String> {
+        // TronGrid wants an `owner_address`, and a view does not care who asks, so the contract is
+        // named as its own caller.
+        let mut body = serde_json::json!({
+            "owner_address": contract,
+            "contract_address": contract,
+            "function_selector": selector,
+            "visible": true,
+        });
+        if let Some(p) = parameter {
+            body["parameter"] = serde_json::Value::from(p);
+        }
+        let v = self.post("/wallet/triggerconstantcontract", body).await?;
+        let word = v["constant_result"][0]
+            .as_str()
+            .ok_or_else(|| format!("{selector} on {contract} returned nothing: {v}"))?;
+        if word.len() != 64 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{selector} on {contract} returned {word:?}, not one 32-byte word"));
+        }
+        Ok(word.to_ascii_lowercase())
     }
 
     /// Why no GasFree address may be handed out, when GasFree's code is not the reviewed code;
     /// `None` when it is (spec §5). Both proxies: the beacon behind every account, and the
     /// controller that moves money out of them.
     pub async fn code_changed(&self, settings: &gasfree::Settings) -> Result<Option<String>, String> {
-        todo!("Task 5 Step 4")
+        let checks = [
+            ("beacon", settings.chain.beacon, &settings.expected_beacon_implementation),
+            ("controller", settings.chain.controller, &settings.expected_controller_implementation),
+        ];
+        for (what, proxy, expected) in checks {
+            let word = self.view_word(proxy, "implementation()", None).await?;
+            let now = &word[24..];
+            if now != expected.as_str() {
+                return Ok(Some(format!("the GasFree {what} {proxy} now runs 0x{now}, not the reviewed 0x{expected}")));
+            }
+        }
+        Ok(None)
     }
 
     /// Once at boot: are these GasFree constants the ones deployed where this TronGrid points, and
     /// does the controller put index 0's account where this service derives it? A Nile setting on a
     /// mainnet TronGrid fails here, instead of showing users addresses nobody controls.
     pub async fn self_test(&self, settings: &gasfree::Settings, deriver: &AddressDeriver) -> SelfTest {
-        todo!("Task 5 Step 4")
+        let controller = settings.chain.controller;
+        match self.has_contract(controller).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return SelfTest::Failed(format!(
+                    "the GasFree controller {controller} is not a contract on this TronGrid: APP_GASFREE_NETWORK does \
+                     not match APP_TRONGRID_URL"
+                ))
+            }
+            Err(e) => return SelfTest::Unreachable(e),
+        }
+        let owner = match deriver.address_at(0) {
+            Ok(a) => a,
+            Err(e) => return SelfTest::Failed(e),
+        };
+        let ours = match gasfree::gasfree_address(settings.chain, &owner).and_then(|g| abi_address(&g)) {
+            Ok(word) => word,
+            Err(e) => return SelfTest::Failed(e),
+        };
+        let parameter = match abi_address(&owner) {
+            Ok(p) => p,
+            Err(e) => return SelfTest::Failed(e),
+        };
+        match self.view_word(controller, "getGasFreeAddress(address)", Some(&parameter)).await {
+            Ok(word) if word[24..] == ours[24..] => SelfTest::Passed,
+            Ok(word) => SelfTest::Failed(format!(
+                "the controller puts the GasFree account of {owner} at 0x{}, this service derives 0x{}",
+                &word[24..],
+                &ours[24..]
+            )),
+            Err(e) => SelfTest::Unreachable(e),
+        }
     }
+}
+
+/// A TRON address as one 32-byte ABI word, after its base58check checksum is checked.
+fn abi_address(address: &str) -> Result<String, String> {
+    let bytes = bs58::decode(address)
+        .with_check(Some(0x41))
+        .into_vec()
+        .map_err(|e| format!("address {address} failed base58check: {e}"))?;
+    if bytes.len() != 21 {
+        return Err(format!("address {address} decoded to {} bytes, want 21", bytes.len()));
+    }
+    Ok(format!("{:0>64}", hex::encode(&bytes[1..])))
 }
 
 #[cfg(test)]

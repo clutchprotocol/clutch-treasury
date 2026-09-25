@@ -133,13 +133,50 @@ async fn create_deposit_handler(
         }
     };
 
-    let (address, _) =
-        addresses::address_for_user(&state.pool, state.deriver.as_ref(), None, &user_pk, &clt_address)
-            .await
-            .map_err(|e| {
-                tracing::error!("deposit address for {user_pk}: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    // GasFree (spec §1, §5). A user keeps the kind of address they were given; a new user is given
+    // the GasFree account of their address while the rail is on. A GasFree address is handed out
+    // only while GasFree's code is the reviewed code: after a change, that code could take what is
+    // paid in, and the tripwire exists to put no more in.
+    let stored = addresses::existing(&state.pool, &user_pk).await.map_err(|e| {
+        tracing::error!("deposit address for {user_pk}: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let wants_gasfree = match &stored {
+        Some((_, is_gasfree)) => *is_gasfree,
+        None => state.config.gasfree.as_ref().is_some_and(|s| s.rail),
+    };
+    let settings = if wants_gasfree {
+        let Some(settings) = state.config.gasfree.as_ref() else {
+            tracing::error!("{user_pk} has a GasFree deposit address, but GasFree is not configured in this service");
+            return Ok(deposits_unavailable());
+        };
+        match state.gasfree_chain.code_changed(settings).await {
+            Ok(None) => Some(settings),
+            Ok(Some(reason)) => {
+                tracing::error!("not handing out a GasFree address: {reason}");
+                return Ok(deposits_unavailable());
+            }
+            Err(e) => {
+                tracing::warn!("not handing out a GasFree address: GasFree's code could not be read: {e}");
+                return Ok(deposits_unavailable());
+            }
+        }
+    } else {
+        None
+    };
+
+    let (address, _) = addresses::address_for_user(
+        &state.pool,
+        state.deriver.as_ref(),
+        settings.map(|s| s.chain),
+        &user_pk,
+        &clt_address,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("deposit address for {user_pk}: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if let Err(e) =
         addresses::mark_hot(&state.pool, &user_pk, state.config.deposit_hot_window_hours).await
@@ -150,7 +187,21 @@ async fn create_deposit_handler(
         tracing::error!("marking {user_pk} hot: {e}");
     }
 
-    Ok((StatusCode::OK, Json(serde_json::json!({ "address": address }))))
+    let mut body = json!({ "address": address });
+    if let Some(settings) = settings {
+        // "Up to", never a fixed fee (spec §2): the treasury holds back the configured maximum, and
+        // the relay may take less. Read from the chain, so a returning user whose account is
+        // activated sees one transfer fee; unreadable, the larger fee is shown.
+        let activated = state.gasfree_chain.has_contract(&address).await.unwrap_or(false);
+        body["fee_up_to_usdt"] =
+            json!(gasfree::fee_to_hold(activated, settings.activate_fee_max_usdt, settings.transfer_fee_max_usdt));
+        body["min_deposit_usdt"] = json!(settings.min_deposit_usdt);
+    }
+    Ok((StatusCode::OK, Json(body)))
+}
+
+fn deposits_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "deposits are temporarily unavailable"})))
 }
 
 /// `GET /api/v1/deposits/:id` — owner-checked: a JWT that authenticates fine but names a

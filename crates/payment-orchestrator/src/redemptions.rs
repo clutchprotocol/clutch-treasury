@@ -126,6 +126,12 @@ pub async fn create_redemption(
 
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
+        // The treasury says "not yet": with GasFree payouts, its float has not made its first
+        // transfer (spec §4). The user is told redemptions are not available yet.
+        Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+            tracing::warn!("redemptions: the treasury is not taking redemptions yet (503)");
+            return RedemptionOutcome::Disabled;
+        }
         Ok(r) => {
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
