@@ -7,9 +7,10 @@
 
 use async_trait::async_trait;
 use sqlx::PgPool;
+use treasury_service::gasfree_rail::Trace;
 use treasury_service::sweeper::{self, SignerReply, SweepSigner};
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ADDR: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
@@ -36,7 +37,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE treasury_events, mint_intents, chain_outbox, alerts RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE treasury_events, mint_intents, chain_outbox, alerts, gasfree_accounts RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -96,11 +97,13 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
 struct FakeSigner {
     reply: SignerReply,
     asked: std::sync::Mutex<Vec<i64>>,
+    /// What the relay's record of any permit says reached the receiver. `None`: not known yet.
+    trace_amount: Option<i64>,
 }
 
 impl FakeSigner {
     fn new(reply: SignerReply) -> Self {
-        Self { reply, asked: std::sync::Mutex::new(Vec::new()) }
+        Self { reply, asked: std::sync::Mutex::new(Vec::new()), trace_amount: None }
     }
     fn asked(&self) -> Vec<i64> {
         self.asked.lock().unwrap().clone()
@@ -111,19 +114,11 @@ impl FakeSigner {
 impl SweepSigner for FakeSigner {
     async fn sweep(&self, index: i64) -> SignerReply {
         self.asked.lock().unwrap().push(index);
-        match &self.reply {
-            SignerReply::Swept { tx_id } => SignerReply::Swept { tx_id: tx_id.clone() },
-            SignerReply::NothingToSweep => SignerReply::NothingToSweep,
-            SignerReply::Funded { tx_id, amount_sun } => {
-                SignerReply::Funded { tx_id: tx_id.clone(), amount_sun: *amount_sun }
-            }
-            SignerReply::FeeAccountDry { fee_address, have_sun, need_sun } => SignerReply::FeeAccountDry {
-                fee_address: fee_address.clone(),
-                have_sun: *have_sun,
-                need_sun: *need_sun,
-            },
-            SignerReply::Failed(e) => SignerReply::Failed(e.clone()),
-        }
+        self.reply.clone()
+    }
+
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Ok(Trace { state: "SUCCEED".into(), txn_hash: Some("tx-permit".into()), txn_amount: self.trace_amount })
     }
 }
 
@@ -388,4 +383,436 @@ async fn a_credited_row_missing_derivation_index_is_reported_and_left_unswept() 
 
 fn tron(server: &MockServer) -> treasury_service::tron_verifier::TronClient {
     treasury_service::tron_verifier::TronClient::new(server.uri(), "k".into())
+}
+
+/// Several deposits at one address are one sweep of its whole balance: the signer is asked once,
+/// and every row is marked. Asking per row swept the address, then read it empty for the next row,
+/// which then stayed unswept for good.
+#[tokio::test]
+async fn every_deposit_at_one_index_is_asked_for_once_and_marked_together() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_balance(&server, 500_000_000).await;
+    let first = seed(&pool, "credited", 7, 2).await;
+    let second = seed(&pool, "credited", 7, 1).await;
+
+    let signer = FakeSigner::new(SignerReply::Swept { tx_id: "tx-both".into() });
+    sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![7], "one request for the index, not one per deposit");
+    assert!(swept_at(&pool, first).await.is_some());
+    assert!(swept_at(&pool, second).await.is_some());
+}
+
+// --- GasFree (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §3, §5) ---
+
+/// Plain addresses of indexes 7 and 8: the permits' owners, as the verifier recorded them.
+const OWNER_7: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+const OWNER_8: &str = "TRhVWK5XEDkQBDevcdCWW7RW51aRncty4W";
+/// Nile's reviewed implementations (Plan 2, facts 3 and 4).
+const BEACON_OK: &str = "b8eda40b467b45af107f198e94cc2fa1378adf50";
+const CONTROLLER_OK: &str = "2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441";
+const TRACE: &str = "6ab4c27c-f66b-4328-b40f-ffdc6cf1ca60";
+
+fn account_of(owner: &str) -> String {
+    gasfree::gasfree_address(&gasfree::NILE, owner).unwrap()
+}
+
+fn nile() -> gasfree::Settings {
+    gasfree::Settings {
+        chain: &gasfree::NILE,
+        rail: true,
+        activate_fee_max_usdt: 1_500_000,
+        transfer_fee_max_usdt: 500_000,
+        min_deposit_usdt: 1_000_000,
+        expected_beacon_implementation: BEACON_OK.into(),
+        expected_controller_implementation: CONTROLLER_OK.into(),
+    }
+}
+
+/// GasFree on, with the TRX threshold left at $100: a GasFree account ignores it.
+fn gasfree_config(server: &MockServer) -> treasury_service::configuration::AppConfig {
+    let mut config = config(server.uri(), 100_000_000);
+    config.gasfree = Some(nile());
+    config
+}
+
+fn in_three_minutes() -> u64 {
+    (chrono::Utc::now().timestamp() + 180) as u64
+}
+
+fn pending(value_usdt: i64, max_fee_usdt: i64, nonce: u64) -> SignerReply {
+    SignerReply::Pending {
+        trace_id: TRACE.into(),
+        gasfree_address: account_of(OWNER_7),
+        value_usdt,
+        max_fee_usdt,
+        nonce,
+        deadline: in_three_minutes(),
+    }
+}
+
+/// `balanceOf` for one address only.
+async fn mount_usdt_balance(server: &MockServer, address: &str, micro_usdt: i64) {
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains("balanceOf(address)"))
+        .and(body_string_contains(address))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"constant_result": [format!("{micro_usdt:064x}")]})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Both GasFree proxies' `implementation()`: the beacon as given, the controller as reviewed.
+async fn mount_implementations(server: &MockServer, beacon: &str) {
+    for (proxy, implementation) in [(gasfree::NILE.beacon, beacon), (gasfree::NILE.controller, CONTROLLER_OK)] {
+        Mock::given(method("POST"))
+            .and(path("/wallet/triggerconstantcontract"))
+            .and(body_string_contains("implementation()"))
+            .and(body_string_contains(proxy))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"constant_result": [format!("{implementation:0>64}")]})),
+            )
+            .mount(server)
+            .await;
+    }
+}
+
+/// TronGrid as a GasFree pass reads it: one account's USDT balance, the owner's nonce, and both
+/// proxies. Each mock answers its own call only.
+async fn mount_gasfree_chain(server: &MockServer, account: &str, balance: i64, nonce: u64, beacon: &str) {
+    mount_usdt_balance(server, account, balance).await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains("nonces(address)"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"constant_result": [format!("{nonce:064x}")]})),
+        )
+        .mount(server)
+        .await;
+    mount_implementations(server, beacon).await;
+}
+
+/// A credited deposit at a GasFree account, as the verifier leaves one: its fee held back, verified a minute ago.
+async fn seed_gasfree_deposit(pool: &PgPool, index: i64, account: &str, fee_held_usdt: i64) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, approved_by, client_ref,
+             expected_amount_usdt, deposit_address, derivation_index, status, verified_at, fee_held_usdt)
+         VALUES ($1, 'TBene', $2, $3, 'orchestrator', 'tron-verifier', $4, 10000000, $5, $6,
+                 'credited', now() - interval '1 minute', $7)",
+    )
+    .bind(id)
+    .bind(10_000_000 - fee_held_usdt)
+    .bind(format!("ref-{id}"))
+    .bind(format!("client-{id}"))
+    .bind(account)
+    .bind(index)
+    .bind(fee_held_usdt)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn seed_account(pool: &PgPool, index: i64, owner: &str, seen_first_transfer: bool) {
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address, first_transfer_at)
+         VALUES ($1, $2, $3, CASE WHEN $4 THEN now() END)",
+    )
+    .bind(index)
+    .bind(account_of(owner))
+    .bind(owner)
+    .bind(seen_first_transfer)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A permit already in flight for index 7.
+async fn seed_pending_7(pool: &PgPool, trace_id: &str, nonce: i64, deadline: i64, value_usdt: i64) {
+    sqlx::query(
+        "UPDATE gasfree_accounts
+            SET pending_trace_id = $1, pending_nonce = $2, pending_deadline = $3,
+                pending_value_usdt = $4, pending_requested_at = now()
+          WHERE derivation_index = 7",
+    )
+    .bind(trace_id)
+    .bind(nonce)
+    .bind(deadline)
+    .bind(value_usdt)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// (trace id in flight, its nonce, first transfer seen) for an index.
+async fn account_state(pool: &PgPool, index: i64) -> (Option<String>, Option<i64>, bool) {
+    sqlx::query_as(
+        "SELECT pending_trace_id, pending_nonce, first_transfer_at IS NOT NULL FROM gasfree_accounts WHERE derivation_index = $1",
+    )
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn sweeper_alerts(pool: &PgPool, severity: &str, containing: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM alerts WHERE source = 'sweeper' AND severity = $1 AND message LIKE '%' || $2 || '%'",
+    )
+    .bind(severity)
+    .bind(containing)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Spec §3 and §5: a sweep by permit is not a sweep until the chain says so. The account keeps the
+/// relay's unused margin, so its balance never says it; the owner's nonce moving past the permit's does.
+#[tokio::test]
+async fn a_gasfree_deposit_is_swept_by_permit_and_counted_swept_only_once_the_nonce_moves() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+    let signer = FakeSigner::new(pending(8_000_000, 2_000_000, 0));
+    let cfg = gasfree_config(&server);
+
+    sweeper::sweep_once(&pool, &cfg, &tron(&server), &signer).await;
+    assert_eq!(signer.asked(), vec![7], "a credited deposit above the fee is swept at once, whatever the threshold");
+    assert!(swept_at(&pool, id).await.is_none(), "a permit with the relay is not a sweep");
+    assert_eq!(account_state(&pool, 7).await, (Some(TRACE.into()), Some(0), false));
+
+    sweeper::sweep_once(&pool, &cfg, &tron(&server), &signer).await;
+    assert_eq!(signer.asked(), vec![7], "one permit at a time: none while one may still run");
+
+    server.reset().await;
+    mount_gasfree_chain(&server, &account, 700_000, 1, BEACON_OK).await;
+    sweeper::sweep_once(&pool, &cfg, &tron(&server), &signer).await;
+    assert!(swept_at(&pool, id).await.is_some(), "the nonce moved past the permit's, so it ran");
+    assert_eq!(account_state(&pool, 7).await, (None, None, true), "the treasury saw its own first sweep run");
+    assert_eq!(ledger_events(&pool).await, 0, "a sweep must NOT touch the ledger");
+    assert_eq!(signer.asked(), vec![7], "nothing is left to ask for");
+}
+
+/// Past its deadline and a grace minute, a permit that did not run never can: a fresh one replaces it.
+#[tokio::test]
+async fn an_expired_permit_that_did_not_run_is_replaced() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 3, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, true).await;
+    seed_pending_7(&pool, "11111111-1111-4111-8111-111111111111", 3, chrono::Utc::now().timestamp() - 120, 9_500_000).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 500_000).await;
+    let signer = FakeSigner::new(pending(9_500_000, 500_000, 3));
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![7], "the dead permit is dropped and a fresh one asked for in the same pass");
+    assert_eq!(account_state(&pool, 7).await, (Some(TRACE.into()), Some(3), true));
+    assert!(swept_at(&pool, id).await.is_none());
+}
+
+/// Spec §5: after GasFree's code changes, no more money goes in or moves by permit until a human looks.
+#[tokio::test]
+async fn a_changed_gasfree_implementation_stops_gasfree_sweeps_and_pages_once() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, "00000000000000000000000000000000000000ff").await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+    let signer = FakeSigner::new(pending(8_000_000, 2_000_000, 0));
+    let cfg = gasfree_config(&server);
+
+    sweeper::sweep_once(&pool, &cfg, &tron(&server), &signer).await;
+    sweeper::sweep_once(&pool, &cfg, &tron(&server), &signer).await;
+
+    assert!(signer.asked().is_empty(), "no permit is asked for while GasFree's code is not the reviewed code");
+    assert_eq!(sweeper_alerts(&pool, "p1", "not the reviewed").await, 1, "paged once, not every pass");
+    assert!(swept_at(&pool, id).await.is_none());
+}
+
+#[tokio::test]
+async fn a_relay_refusal_pages_and_leaves_the_deposit_where_it_is() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+    let signer = FakeSigner::new(SignerReply::Rejected { reason: "MaxFeeExceededException max fee exceeded".into() });
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![7]);
+    assert!(swept_at(&pool, id).await.is_none());
+    assert_eq!(account_state(&pool, 7).await, (None, None, false), "nothing is in flight");
+    assert_eq!(sweeper_alerts(&pool, "p1", "refused").await, 1);
+}
+
+/// Spec §2: "Never sign a higher `maxFee` than was held back". The permit is signed by then, so paging is what is left.
+#[tokio::test]
+async fn a_permit_whose_max_fee_is_above_what_was_held_pages() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 4, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, true).await;
+    seed_gasfree_deposit(&pool, 7, &account, 500_000).await;
+    let signer = FakeSigner::new(pending(8_000_000, 2_000_000, 4));
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert_eq!(sweeper_alerts(&pool, "p1", "held back").await, 1);
+    assert_eq!(account_state(&pool, 7).await, (Some(TRACE.into()), Some(4), true), "the permit exists, so it is followed");
+}
+
+/// A balance no larger than what the relay may take would move nothing (spec §3). The fee is sized on
+/// the treasury's own record, so activation counts until its own first sweep of the account ran.
+#[tokio::test]
+async fn a_gasfree_account_is_swept_only_when_it_holds_more_than_the_fee() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_gasfree_chain(&server, &account_of(OWNER_7), 2_000_000, 0, BEACON_OK).await;
+    mount_usdt_balance(&server, &account_of(OWNER_8), 2_000_001).await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    seed_account(&pool, 8, OWNER_8, false).await;
+    seed_gasfree_deposit(&pool, 7, &account_of(OWNER_7), 2_000_000).await;
+    seed_gasfree_deposit(&pool, 8, &account_of(OWNER_8), 2_000_000).await;
+    let signer = FakeSigner::new(SignerReply::Busy);
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![8], "exactly the fee is not enough; one micro-USDT more is");
+}
+
+/// Open question 1, checked on every sweep: the receiver must get exactly the permit's `value`, with
+/// the relay's fee on top of it.
+#[tokio::test]
+async fn the_relays_record_of_what_reached_the_receiver_is_checked() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 700_000, 1, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+    seed_pending_7(&pool, TRACE, 0, chrono::Utc::now().timestamp() + 180, 8_000_000).await;
+    let mut signer = FakeSigner::new(SignerReply::Busy);
+    signer.trace_amount = Some(7_700_000);
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert!(swept_at(&pool, id).await.is_some());
+    assert_eq!(sweeper_alerts(&pool, "p1", "reached the receiver").await, 1);
+}
+
+/// The fee account is empty by design on this rail. Plain addresses still waiting on it must not stop
+/// the GasFree accounts, which need no TRX.
+#[tokio::test]
+async fn with_gasfree_on_a_dry_fee_account_does_not_stop_the_pass() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_implementations(&server, BEACON_OK).await;
+    mount_usdt_balance(&server, ADDRS[0], 500_000_000).await; // index 10
+    mount_usdt_balance(&server, ADDRS[1], 500_000_000).await; // index 11
+    seed(&pool, "credited", 10, 5).await;
+    seed(&pool, "credited", 11, 1).await;
+    let signer = FakeSigner::new(SignerReply::FeeAccountDry {
+        fee_address: "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into(),
+        have_sun: 0,
+        need_sun: 31_000_000,
+    });
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert_eq!(signer.asked(), vec![10, 11], "the pass goes on");
+    let alerts: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE source = 'sweeper'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts, 1, "still one alert per pass, naming the account to top up");
+}
+
+#[tokio::test]
+async fn the_gasfree_sweep_answers_are_read_field_by_field() {
+    let cases = [
+        (
+            serde_json::json!({"status": "pending", "trace_id": TRACE, "gasfree_address": "TGasFree", "receiver": "TFloat",
+                               "value_usdt": 8_000_000, "max_fee_usdt": 2_000_000, "nonce": 4, "deadline": 1_790_000_000u64}),
+            SignerReply::Pending {
+                trace_id: TRACE.into(),
+                gasfree_address: "TGasFree".into(),
+                value_usdt: 8_000_000,
+                max_fee_usdt: 2_000_000,
+                nonce: 4,
+                deadline: 1_790_000_000,
+            },
+        ),
+        (serde_json::json!({"status": "busy", "gasfree_address": "TGasFree"}), SignerReply::Busy),
+        (
+            serde_json::json!({"status": "rejected", "reason": "MaxFeeExceededException", "message": "max fee exceeded"}),
+            SignerReply::Rejected { reason: "MaxFeeExceededException max fee exceeded".into() },
+        ),
+        (
+            serde_json::json!({"status": "halted", "reason": "GasFree's code changed"}),
+            SignerReply::Halted { reason: "GasFree's code changed".into() },
+        ),
+        (
+            serde_json::json!({"status": "below_fee", "gasfree_address": "TGasFree", "balance_usdt": 1, "max_fee_usdt": 2_000_000}),
+            SignerReply::BelowFee,
+        ),
+    ];
+    for (body, want) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sweep"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let signer = sweeper::HttpSigner { http: reqwest::Client::new(), base_url: server.uri(), token: "t".into() };
+        assert_eq!(signer.sweep(7).await, want, "{body}");
+    }
+
+    // A pending answer without its permit's fields cannot be followed, so it is not taken as one.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/sweep"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "pending", "trace_id": TRACE})))
+        .mount(&server)
+        .await;
+    let signer = sweeper::HttpSigner { http: reqwest::Client::new(), base_url: server.uri(), token: "t".into() };
+    assert!(matches!(signer.sweep(7).await, SignerReply::Failed(_)));
+}
+
+#[tokio::test]
+async fn a_trace_is_read_from_the_signer() {
+    for (body, want) in [
+        (
+            serde_json::json!({"state": "SUCCEED", "txn_hash": "abc", "txn_state": "ON_CHAIN", "txn_amount": 8_000_000, "txn_total_fee": 1_300_000}),
+            Trace { state: "SUCCEED".into(), txn_hash: Some("abc".into()), txn_amount: Some(8_000_000) },
+        ),
+        (
+            serde_json::json!({"state": "WAITING", "txn_hash": null, "txn_state": null, "txn_amount": null, "txn_total_fee": null}),
+            Trace { state: "WAITING".into(), txn_hash: None, txn_amount: None },
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/gasfree/trace/{TRACE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let signer = sweeper::HttpSigner { http: reqwest::Client::new(), base_url: server.uri(), token: "t".into() };
+        assert_eq!(signer.trace(TRACE).await, Ok(want), "{body}");
+    }
 }

@@ -33,6 +33,38 @@ pub fn deposit_mint(observed_usdt: i64, fee_usdt: i64, min_deposit_usdt: i64) ->
     }
 }
 
+/// The relay's record of a permit, as the signer passes it on (`GET /internal/gasfree/trace/:id`).
+/// Only ever a cross-check, or a pointer to a transaction: the chain decides what happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trace {
+    /// `WAITING`, `INPROGRESS`, `CONFIRMING`, `SUCCEED` or `FAILED`.
+    pub state: String,
+    pub txn_hash: Option<String>,
+    /// What reached the receiver.
+    pub txn_amount: Option<i64>,
+}
+
+/// The signer's trace reply, read field by field.
+pub fn parse_trace(body: &serde_json::Value) -> Result<Trace, String> {
+    todo!("Task 3 Step 5")
+}
+
+/// `GET /internal/gasfree/trace/:trace_id` on the signer. The signer holds the relay's API key;
+/// this service does not.
+pub async fn fetch_trace(http: &reqwest::Client, base_url: &str, token: &str, trace_id: &str) -> Result<Trace, String> {
+    todo!("Task 3 Step 5")
+}
+
+/// Why GasFree must stop, when its code is not the reviewed code; `None` when it is (spec §5). Both
+/// proxies: the beacon behind every GasFree account, and the controller that moves money out of
+/// them, which is upgradeable too.
+pub async fn code_changed(
+    client: &crate::tron_verifier::TronClient,
+    settings: &gasfree::Settings,
+) -> Result<Option<String>, String> {
+    todo!("Task 3 Step 5")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{deposit_mint, DepositMint};

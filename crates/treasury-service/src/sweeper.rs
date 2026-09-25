@@ -20,8 +20,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
-use crate::ledger::alert;
+use crate::gasfree_rail::Trace;
+use crate::ledger::{alert, alert_once};
 use crate::tron_verifier::TronClient;
+
+mod gasfree_sweep;
 
 /// Is this address worth sweeping yet?
 ///
@@ -58,7 +61,7 @@ pub fn should_sweep(
 }
 
 /// What the signer reported for one address.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SignerReply {
     Swept { tx_id: String },
     /// Address already empty — the sweep is complete by definition.
@@ -72,6 +75,26 @@ pub enum SignerReply {
     /// `fee_address` — and until they do, no address can be swept.
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
     Failed(String),
+    /// A GasFree permit is with the relay (spec §3). NOT swept yet: the chain decides that, when the
+    /// controller's `nonces(owner)` moves past `nonce`. After `deadline` it can no longer run.
+    Pending {
+        trace_id: String,
+        gasfree_address: String,
+        value_usdt: i64,
+        max_fee_usdt: i64,
+        nonce: u64,
+        deadline: u64,
+    },
+    /// A transfer from this GasFree account is already in flight. Nothing was signed.
+    Busy,
+    /// The relay refused the permit. The deposit stays where it is, still counted, and a human
+    /// decides — never with a higher maxFee than was held back.
+    Rejected { reason: String },
+    /// The signer signs nothing for GasFree until a human acts: GasFree's code changed, or the relay
+    /// and the signer disagree about an address.
+    Halted { reason: String },
+    /// The GasFree account holds no more than a sweep may pay the relay.
+    BelowFee,
 }
 
 /// The signer boundary, as a trait so the worker is testable without a live service or real keys.
@@ -80,6 +103,11 @@ pub trait SweepSigner: Send + Sync {
     /// Sweep the address at `index`. Deliberately takes ONLY an index: the destination is the
     /// signer's own config, so nothing here can redirect funds. Do not widen this signature.
     async fn sweep(&self, index: i64) -> SignerReply;
+
+    /// The relay's record of a GasFree permit. Moves nothing.
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Err("this signer cannot read GasFree traces".into())
+    }
 }
 
 /// One pass: for every unswept deposit address, decide, sweep, record. Returns the number of
@@ -239,6 +267,8 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
             SignerReply::Failed(e) => {
                 alert(pool, "warn", "sweeper", &format!("sweep of {address} (index {index}) failed: {e}")).await;
             }
+
+            other => tracing::warn!("sweeper: {address} (index {index}) got {other:?}"),
         }
     }
 
@@ -371,6 +401,10 @@ impl SweepSigner for HttpSigner {
             // in a way this version does not understand.
             other => SignerReply::Failed(format!("unrecognised signer status {other:?}")),
         }
+    }
+
+    async fn trace(&self, trace_id: &str) -> Result<Trace, String> {
+        crate::gasfree_rail::fetch_trace(&self.http, &self.base_url, &self.token, trace_id).await
     }
 }
 

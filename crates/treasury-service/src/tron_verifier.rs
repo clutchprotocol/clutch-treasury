@@ -401,6 +401,22 @@ impl TronClient {
         i64::from_str_radix(trimmed, 16)
             .map_err(|_| format!("balanceOf returned an unrepresentable uint256: 0x{word}"))
     }
+
+    /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
+    pub async fn view_word(&self, contract: &str, selector: &str, parameter: Option<&str>) -> Result<String, String> {
+        todo!("Task 3 Step 5")
+    }
+
+    /// The next nonce the GasFree controller accepts from `owner`: the chain's count of the permits
+    /// it has run for them. Moving past a permit's nonce is how a GasFree sweep is known to have run.
+    pub async fn gasfree_nonce(&self, controller: &str, owner: &str) -> Result<u64, String> {
+        todo!("Task 3 Step 5")
+    }
+
+    /// An upgradeable proxy's `implementation()`, as 40 lowercase hex characters.
+    pub async fn implementation(&self, proxy: &str) -> Result<String, String> {
+        todo!("Task 3 Step 5")
+    }
 }
 
 /// Left-pad a Tron base58check address into the 32-byte ABI word `balanceOf(address)` expects.
