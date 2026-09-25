@@ -48,8 +48,8 @@ async fn a_users_address_is_stable_across_calls() {
     let pool = pool().await;
     let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
 
-    let first = addresses::address_for_user(&pool, &deriver, "0xuser-a", "0xclt-a").await.unwrap();
-    let second = addresses::address_for_user(&pool, &deriver, "0xuser-a", "0xclt-a").await.unwrap();
+    let first = addresses::address_for_user(&pool, &deriver, None, "0xuser-a", "0xclt-a").await.unwrap();
+    let second = addresses::address_for_user(&pool, &deriver, None, "0xuser-a", "0xclt-a").await.unwrap();
 
     assert_eq!(first, second);
 }
@@ -59,8 +59,8 @@ async fn two_users_get_different_addresses() {
     let pool = pool().await;
     let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
 
-    let a = addresses::address_for_user(&pool, &deriver, "0xuser-a", "0xclt-a").await.unwrap();
-    let b = addresses::address_for_user(&pool, &deriver, "0xuser-b", "0xclt-b").await.unwrap();
+    let a = addresses::address_for_user(&pool, &deriver, None, "0xuser-a", "0xclt-a").await.unwrap();
+    let b = addresses::address_for_user(&pool, &deriver, None, "0xuser-b", "0xclt-b").await.unwrap();
 
     assert_ne!(a, b, "sharing an address between users would credit one user's deposit to another");
 }
@@ -76,7 +76,7 @@ async fn address_for_user_draws_indexes_after_any_already_burned_by_nextval() {
     let burned: i64 = sqlx::query_scalar("SELECT nextval('deposit_derivation_index_seq')")
         .fetch_one(&pool).await.unwrap();
 
-    addresses::address_for_user(&pool, &deriver, "0xuser-a", "0xclt-a").await.unwrap();
+    addresses::address_for_user(&pool, &deriver, None, "0xuser-a", "0xclt-a").await.unwrap();
     let got: i64 = sqlx::query_scalar("SELECT derivation_index FROM deposit_addresses WHERE user_pk = '0xuser-a'")
         .fetch_one(&pool).await.unwrap();
 
@@ -87,7 +87,7 @@ async fn address_for_user_draws_indexes_after_any_already_burned_by_nextval() {
 async fn marking_hot_sets_a_future_window() {
     let pool = pool().await;
     let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
-    addresses::address_for_user(&pool, &deriver, "0xuser-a", "0xclt-a").await.unwrap();
+    addresses::address_for_user(&pool, &deriver, None, "0xuser-a", "0xclt-a").await.unwrap();
 
     addresses::mark_hot(&pool, "0xuser-a", 24).await.unwrap();
 
@@ -117,8 +117,8 @@ async fn two_simultaneous_first_calls_settle_on_one_address() {
     let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
 
     let (a, b) = tokio::join!(
-        addresses::address_for_user(&pool, &deriver, "0xracer", "0xclt-r"),
-        addresses::address_for_user(&pool, &deriver, "0xracer", "0xclt-r"),
+        addresses::address_for_user(&pool, &deriver, None, "0xracer", "0xclt-r"),
+        addresses::address_for_user(&pool, &deriver, None, "0xracer", "0xclt-r"),
     );
     let (a, b) = (a.unwrap(), b.unwrap());
 
@@ -130,5 +130,36 @@ async fn two_simultaneous_first_calls_settle_on_one_address() {
 
     let stored: String = sqlx::query_scalar("SELECT address FROM deposit_addresses WHERE user_pk = '0xracer'")
         .fetch_one(&pool).await.unwrap();
-    assert_eq!(a, stored, "the returned address is the stored one, not a losing derivation");
+    assert_eq!(a.0, stored, "the returned address is the stored one, not a losing derivation");
+}
+
+#[tokio::test]
+async fn with_the_gasfree_rail_a_new_user_gets_the_gasfree_account_of_their_address() {
+    let pool = pool().await;
+    let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
+
+    let (address, is_gasfree) =
+        addresses::address_for_user(&pool, &deriver, Some(&gasfree::NILE), "0xuser-g", "0xclt-g").await.unwrap();
+
+    let (index, stored_gasfree): (i64, bool) =
+        sqlx::query_as("SELECT derivation_index, gasfree FROM deposit_addresses WHERE user_pk = '0xuser-g'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let plain = deriver.address_at(index as u32).unwrap();
+    assert_eq!(address, gasfree::gasfree_address(&gasfree::NILE, &plain).unwrap(), "G = gasfree(D), and only G is stored");
+    assert!(is_gasfree && stored_gasfree);
+}
+
+/// Deposit addresses are permanent (spec §5): switching the rail back leaves a GasFree address where it is.
+#[tokio::test]
+async fn a_user_given_a_gasfree_address_keeps_it_after_the_rail_is_switched_back() {
+    let pool = pool().await;
+    let deriver = AddressDeriver::from_account_xpub(XPUB).unwrap();
+
+    let first = addresses::address_for_user(&pool, &deriver, Some(&gasfree::NILE), "0xuser-k", "0xclt-k").await.unwrap();
+    let second = addresses::address_for_user(&pool, &deriver, None, "0xuser-k", "0xclt-k").await.unwrap();
+
+    assert!(first.1, "given a GasFree address");
+    assert_eq!(second, first);
 }

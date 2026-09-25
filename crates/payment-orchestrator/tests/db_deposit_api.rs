@@ -19,7 +19,7 @@ use sqlx::migrate::MigrateDatabase;
 use sqlx::{PgPool, Postgres};
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Account xpub for the canonical public BIP39 all-"abandon" test mnemonic (m/44'/195'/0').
@@ -100,6 +100,7 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         // High enough that these tests never trip the limiter; its own behaviour is
         // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
         rate_limit_per_minute: 1_000,
+        gasfree: None,
     }
 }
 
@@ -709,4 +710,147 @@ async fn deposit_post_refuses_a_second_request_from_the_same_identity() {
         StatusCode::OK,
         "a different identity has its own allowance"
     );
+}
+
+// --- GasFree (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §1, §2, §5) ---
+
+const REVIEWED_BEACON: &str = "b8eda40b467b45af107f198e94cc2fa1378adf50";
+
+fn nile() -> gasfree::Settings {
+    gasfree::Settings {
+        chain: &gasfree::NILE,
+        rail: true,
+        activate_fee_max_usdt: 1_500_000,
+        transfer_fee_max_usdt: 500_000,
+        min_deposit_usdt: 1_000_000,
+        expected_beacon_implementation: REVIEWED_BEACON.into(),
+        expected_controller_implementation: "2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441".into(),
+    }
+}
+
+fn gasfree_config(treasury_url: String, trongrid_url: String) -> OrchConfig {
+    let mut config = test_config(treasury_url, true);
+    config.trongrid_url = trongrid_url;
+    config.gasfree = Some(nile());
+    config
+}
+
+/// TronGrid for the deposit route: the beacon answers `implementation()` with `beacon`, the
+/// controller with its reviewed implementation, and every account answers `getcontract` with `contract`.
+async fn gasfree_trongrid(beacon: &str, contract: Value) -> MockServer {
+    let server = MockServer::start().await;
+    for (proxy, implementation) in
+        [(gasfree::NILE.beacon, beacon), (gasfree::NILE.controller, "2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441")]
+    {
+        Mock::given(method("POST"))
+            .and(path("/wallet/triggerconstantcontract"))
+            .and(body_string_contains("implementation()"))
+            .and(body_string_contains(proxy))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [format!("{implementation:0>64}")]})))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/wallet/getcontract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(contract))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn post_deposit(app: axum::Router, pk: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/deposits")
+        .header("authorization", bearer_for(pk))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, body_json(res).await)
+}
+
+/// A new user under the GasFree rail is shown G with its fee, "up to", and the minimum (spec §2).
+#[tokio::test]
+async fn a_gasfree_address_is_shown_with_its_fee_and_minimum() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let chain = gasfree_trongrid(REVIEWED_BEACON, json!({})).await;
+    let app = router_with(pool.clone(), gasfree_config(treasury.uri(), chain.uri()));
+
+    let (status, body) = post_deposit(app, USER_A).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let (index, stored, is_gasfree): (i64, String, bool) =
+        sqlx::query_as("SELECT derivation_index, address, gasfree FROM deposit_addresses WHERE user_pk = $1")
+            .bind(USER_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let plain = payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB)
+        .unwrap()
+        .address_at(index as u32)
+        .unwrap();
+    assert_eq!(stored, gasfree::gasfree_address(&gasfree::NILE, &plain).unwrap());
+    assert!(is_gasfree);
+    assert_eq!(body["address"], stored);
+    assert_eq!(body["fee_up_to_usdt"], 2_000_000, "not activated: activation and one transfer, as the most");
+    assert_eq!(body["min_deposit_usdt"], 1_000_000);
+}
+
+#[tokio::test]
+async fn an_activated_gasfree_account_shows_one_transfer_fee() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let chain = gasfree_trongrid(REVIEWED_BEACON, json!({"contract_address": "41ab", "bytecode": ""})).await;
+    let app = router_with(pool.clone(), gasfree_config(treasury.uri(), chain.uri()));
+
+    let (status, body) = post_deposit(app, USER_A).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["fee_up_to_usdt"], 500_000);
+}
+
+/// Spec §5: after GasFree's code changes, no GasFree address is handed out, so no more money goes in.
+#[tokio::test]
+async fn no_gasfree_address_is_handed_out_after_gasfree_code_changed() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let chain = gasfree_trongrid("00000000000000000000000000000000000000ff", json!({})).await;
+    let app = router_with(pool.clone(), gasfree_config(treasury.uri(), chain.uri()));
+
+    let (status, _) = post_deposit(app, USER_A).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE user_pk = $1")
+        .bind(USER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "no address was issued");
+}
+
+/// A guard, green before and after this task: GasFree never stands between a user and the plain
+/// address they already have, even with TronGrid unreachable.
+#[tokio::test]
+async fn a_user_with_a_plain_address_is_not_held_up_by_gasfree() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let deriver = payment_orchestrator::derive::AddressDeriver::from_account_xpub(TEST_XPUB).unwrap();
+    let (plain, _) = payment_orchestrator::addresses::address_for_user(
+        &pool,
+        &deriver,
+        None,
+        USER_A,
+        "0x00000000000000000000000000000000000000a1",
+    )
+    .await
+    .unwrap();
+    let app = router_with(pool.clone(), gasfree_config(treasury.uri(), "http://localhost:0".into()));
+
+    let (status, body) = post_deposit(app, USER_A).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["address"], plain);
+    assert!(body.get("fee_up_to_usdt").is_none());
 }

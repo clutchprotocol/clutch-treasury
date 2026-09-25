@@ -8,18 +8,24 @@ use sqlx::PgPool;
 
 use crate::derive::AddressDeriver;
 
-/// The user's deposit address, deriving and storing it on first call.
+/// The user's deposit address and whether it is a GasFree account, deriving and storing it on
+/// first call.
+///
+/// `gasfree_for_new_users` is the GasFree deployment whose account a NEW user is given
+/// (`APP_TRANSFER_RAIL=gasfree`): `G = gasfree(D)`, where `D` is the plain address of their index. A
+/// user who already has an address keeps it, whatever kind it is (spec §5).
 ///
 /// Idempotent by construction: the INSERT is `ON CONFLICT (user_pk) DO NOTHING` followed by a read,
 /// so two concurrent first-calls settle on whichever row won rather than deriving twice.
 pub async fn address_for_user(
     pool: &PgPool,
     deriver: &AddressDeriver,
+    gasfree_for_new_users: Option<&'static gasfree::Chain>,
     user_pk: &str,
     clt_address: &str,
-) -> Result<String, String> {
-    if let Some(addr) = existing(pool, user_pk).await? {
-        return Ok(addr);
+) -> Result<(String, bool), String> {
+    if let Some(stored) = existing(pool, user_pk).await? {
+        return Ok(stored);
     }
 
     let index = crate::deposits::allocate_derivation_index(pool)
@@ -29,6 +35,7 @@ pub async fn address_for_user(
     let index_u32 =
         u32::try_from(index).map_err(|_| format!("derivation index {index} is out of range"))?;
     let address = deriver.address_at(index_u32)?;
+    let _ = gasfree_for_new_users; // Task 5 Step 4
 
     sqlx::query(
         "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address)
@@ -50,8 +57,9 @@ pub async fn address_for_user(
         .ok_or_else(|| "deposit address vanished immediately after insert".to_string())
 }
 
-async fn existing(pool: &PgPool, user_pk: &str) -> Result<Option<String>, String> {
-    sqlx::query_scalar("SELECT address FROM deposit_addresses WHERE user_pk = $1")
+/// The user's stored deposit address, and whether it is a GasFree account.
+pub async fn existing(pool: &PgPool, user_pk: &str) -> Result<Option<(String, bool)>, String> {
+    sqlx::query_as("SELECT address, gasfree FROM deposit_addresses WHERE user_pk = $1")
         .bind(user_pk)
         .fetch_optional(pool)
         .await

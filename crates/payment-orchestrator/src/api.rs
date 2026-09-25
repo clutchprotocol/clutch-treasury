@@ -16,6 +16,7 @@ use crate::auth::authenticated_pk;
 use crate::configuration::OrchConfig;
 use crate::derive::AddressDeriver;
 use crate::deposits;
+use crate::gasfree_chain::GasFreeChain;
 use crate::ratelimit::RateLimiter;
 use crate::redemptions::{self, RedemptionOutcome};
 
@@ -29,6 +30,8 @@ pub struct AppState {
     /// request, so a limiter held by value here would give each request its own empty map and
     /// silently enforce nothing.
     pub limiter: Arc<RateLimiter>,
+    /// GasFree's reads: the tripwire and the activation record in front of a GasFree address.
+    pub gasfree_chain: Arc<GasFreeChain>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -130,8 +133,8 @@ async fn create_deposit_handler(
         }
     };
 
-    let address =
-        addresses::address_for_user(&state.pool, state.deriver.as_ref(), &user_pk, &clt_address)
+    let (address, _) =
+        addresses::address_for_user(&state.pool, state.deriver.as_ref(), None, &user_pk, &clt_address)
             .await
             .map_err(|e| {
                 tracing::error!("deposit address for {user_pk}: {e}");
@@ -402,7 +405,8 @@ async fn get_redemption_handler(
 pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) -> Router {
     let cors = build_cors(&config.allowed_origins);
     let limiter = Arc::new(RateLimiter::per_minute(config.rate_limit_per_minute));
-    let state = AppState { pool, config, deriver, limiter };
+    let gasfree_chain = Arc::new(GasFreeChain::new(config.trongrid_url.clone(), config.trongrid_api_key.clone()));
+    let state = AppState { pool, config, deriver, limiter, gasfree_chain };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler).get(list_deposits_handler))

@@ -1647,6 +1647,7 @@ dependencies = [
  "chrono",
  "config",
  "dotenv",
+ "gasfree",
  "hex",
  "jsonwebtoken",
  "rand",

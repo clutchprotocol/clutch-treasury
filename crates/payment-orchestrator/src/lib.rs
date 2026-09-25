@@ -7,6 +7,7 @@ pub mod custody;
 pub mod deposits;
 pub mod metrics;
 pub mod derive;
+pub mod gasfree_chain;
 pub mod poller;
 pub mod ratelimit;
 pub mod redemptions;
