@@ -348,6 +348,14 @@ impl SweepClient {
         }
     }
 
+    /// `gasfree_self_test`, given up after `limit`. It runs before the port binds, and a TronGrid
+    /// that accepts the connection and never answers would otherwise keep the signer from starting
+    /// at all. Given up is `Unreachable`, not `Failed`: every permit is still checked before it is
+    /// signed.
+    pub async fn gasfree_self_test_within(&self, signer: &Signer, limit: std::time::Duration) -> SelfTest {
+        todo!("Plan 4 Task 3: bound the self-test by {limit:?} for {}", signer.address_at(0).is_ok())
+    }
+
     /// The next nonce the controller will accept from `user`: the chain's count, not the relay's.
     pub(super) async fn chain_nonce(&self, chain: &gasfree::Chain, user: &str) -> Result<u64, String> {
         let word = self.view_word(chain.controller, "nonces(address)", Some(&abi_address(user)?)).await?;

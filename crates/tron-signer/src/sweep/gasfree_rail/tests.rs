@@ -346,6 +346,17 @@ async fn the_self_test_is_not_fatal_when_trongrid_is_down() {
     assert!(matches!(result, SelfTest::Unreachable(_)), "got {result:?}");
 }
 
+#[tokio::test]
+async fn the_self_test_gives_up_on_a_trongrid_that_never_answers() {
+    // Bound and never accepted: the connection is made, and no answer ever comes.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", silent.local_addr().unwrap());
+    let result = client(&url)
+        .gasfree_self_test_within(&signer(), std::time::Duration::from_millis(300))
+        .await;
+    assert!(matches!(result, SelfTest::Unreachable(_)), "got {result:?}");
+}
+
 #[test]
 fn the_gasfree_address_is_only_known_when_gasfree_is_on() {
     let s = signer();
