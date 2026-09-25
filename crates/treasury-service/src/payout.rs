@@ -210,9 +210,12 @@ fn failed_transfer_alerted() -> &'static Mutex<HashSet<Uuid>> {
 /// for longer than this after it was sent.
 const LONGEST_PERMIT_SECS: i64 = 600;
 
-/// After a permit's deadline the controller refuses it, but a block at the deadline may take this
-/// long to show in what TronGrid answers.
-const DEADLINE_GRACE_SECS: i64 = 60;
+/// After a permit's deadline the controller refuses it. Five minutes past it, a read that shows the
+/// float's nonce unmoved is taken as "it never ran", and the redemption is paid again. That is the
+/// one decision here that would pay a burn twice if the read were stale, so the margin is far
+/// longer than any TronGrid node should lag, and still short enough that a refused redemption is
+/// paid again within minutes.
+const DEADLINE_GRACE_SECS: i64 = 300;
 
 /// Pays each due `payout_pending` intent against its ALREADY-CONFIRMED burn.
 ///
@@ -369,8 +372,8 @@ pub async fn drain_once(
                 processed += 1;
             }
             PayoutReply::Submitted { trace_id, nonce, deadline } => {
-                // The float may pay from now on, so it counts against today's budget now.
-                day_total += amount_clt;
+                // Counted against today's budget from the next pass on: `daily_payout_total` counts
+                // every `payout_submitted` row, and this pass ends here.
                 if let Err(e) = sqlx::query(
                     "UPDATE redemption_intents
                         SET payout_trace_id = $2, payout_permit_nonce = $3, payout_permit_deadline = $4, updated_at = now()
@@ -394,9 +397,9 @@ pub async fn drain_once(
                 break; // one permit at a time
             }
             PayoutReply::RelayRefused { reason, nonce, deadline } => {
-                // Refused on the relay's word; the signed permit stays valid until its deadline, so it
-                // may still pay and counts against today's budget.
-                day_total += amount_clt;
+                // Refused on the relay's word. The signed permit stays valid until its deadline, so it
+                // may still pay: the row stays payout_submitted, which `daily_payout_total` counts from
+                // the next pass on.
                 match sqlx::query(
                     "UPDATE redemption_intents
                         SET payout_trace_id = NULL, payout_permit_nonce = $2, payout_permit_deadline = $3, updated_at = now()
@@ -501,23 +504,35 @@ pub async fn drain_once(
                 // On the GasFree rail a permit may be with the relay. It cannot run past the longest
                 // deadline the signer signs, so no other permit is signed before then.
                 let gasfree_payouts = config.gasfree.as_ref().is_some_and(|s| s.rail);
+                // The same margin the settlement uses, so the time named below is when the hold ends.
+                let hold_until = chrono::Utc::now().timestamp() + LONGEST_PERMIT_SECS + DEADLINE_GRACE_SECS;
                 if gasfree_payouts {
                     if let Err(e) = sqlx::query("UPDATE redemption_intents SET payout_permit_deadline = $2 WHERE id = $1")
                         .bind(intent_id)
-                        .bind(chrono::Utc::now().timestamp() + LONGEST_PERMIT_SECS)
+                        .bind(hold_until)
                         .execute(pool)
                         .await
                     {
                         tracing::error!(%intent_id, "could not hold the float after an unclear GasFree payout: {e}");
                     }
                 }
+                // A GasFree permit may still be with the relay. Returning the intent before that permit
+                // can no longer run lets the next pass sign the next nonce and pay the same burn again.
+                let not_before = if gasfree_payouts {
+                    format!(
+                        " A GasFree permit may still run until {hold_until} (unix seconds): do not return this \
+                         intent to payout_pending before then."
+                    )
+                } else {
+                    String::new()
+                };
                 alert(pool, "p1", "payout", &format!(
                     "redemption {intent_id}: payout outcome UNKNOWN ({msg}). Left payout_submitted \
                      and NOT retried — retrying could pay this burn twice. Claimed at {claimed_at}: \
                      check the payout float ({float}) for an outbound USDT transfer of {payout_amount_usdt} \
                      (micro-USDT: the quoted net, below the {amount_clt} burned when a fee is set) to {payout_address} around that time. Found it? Set \
                      payout_ref to that tx hash — confirm_payouts_once will pick it up from there. \
-                     Found nothing? Return the intent to payout_pending by hand.",
+                     Found nothing? Return the intent to payout_pending by hand.{not_before}",
                     float = config.payout_float_address
                 )).await;
                 if gasfree_payouts {
@@ -654,16 +669,41 @@ pub async fn confirm_gasfree_payouts_once(
                         .await
                     {
                         Ok(true) => {
-                            match pay_intent(pool, intent_id, amount, &hash).await {
-                                Ok(()) => paid += 1,
+                            // A transaction already recorded as another redemption's payment cannot pay
+                            // this one too. Only the relay tied it to this permit; the chain says it paid
+                            // someone else. Not taken: after the deadline the float's nonce decides.
+                            match paid_by_another(pool, intent_id, &hash).await {
+                                Ok(None) => {
+                                    match pay_intent(pool, intent_id, amount, &hash).await {
+                                        Ok(()) => paid += 1,
+                                        Err(e) => {
+                                            alert(pool, "p1", "payout", &format!(
+                                                "redemption {intent_id}: GasFree payout {hash} is confirmed on chain, but \
+                                                 recording it as paid failed ({e}). Safe to retry: the next pass picks it up."
+                                            )).await;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Ok(Some(other)) => {
+                                    alert_once(
+                                        pool,
+                                        "p1",
+                                        "payout",
+                                        &format!(
+                                            "redemption {intent_id}: the relay names transaction {hash} as its payout, but \
+                                             that transaction already paid redemption {other}. It is not taken as this \
+                                             one's payment; after the permit's deadline the float's nonce decides."
+                                        ),
+                                        chrono::Duration::hours(1),
+                                    )
+                                    .await;
+                                }
                                 Err(e) => {
-                                    alert(pool, "p1", "payout", &format!(
-                                        "redemption {intent_id}: GasFree payout {hash} is confirmed on chain, but recording \
-                                         it as paid failed ({e}). Safe to retry: the next pass picks it up."
-                                    )).await;
+                                    tracing::warn!(%intent_id, %hash, "could not check whether the transaction already paid another redemption: {e}");
+                                    continue;
                                 }
                             }
-                            continue;
                         }
                         Ok(false) => {} // not confirmed yet, or not a transfer that pays this redemption
                         Err(e) => {
@@ -748,6 +788,15 @@ pub async fn confirm_gasfree_payouts_once(
         }
     }
     Ok(paid)
+}
+
+/// The redemption, other than `intent_id`, that `tx_id` is already recorded as paying.
+async fn paid_by_another(pool: &PgPool, intent_id: Uuid, tx_id: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM redemption_intents WHERE payout_ref = $1 AND id <> $2 LIMIT 1")
+        .bind(tx_id)
+        .bind(intent_id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// The rolling 24h payout total against `daily_payout_cap_clt`. Counts every status at or past

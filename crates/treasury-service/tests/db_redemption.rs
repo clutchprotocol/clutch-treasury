@@ -958,7 +958,7 @@ async fn a_refused_permit_goes_back_to_be_paid_once_its_deadline_passed_and_it_n
     let pool = pool().await;
     let server = MockServer::start().await;
     mount_float_nonce(&server, 4).await;
-    let id = permit_out(&pool, 10_000_000, None, 4, now() - 120).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 400).await;
 
     payout::confirm_gasfree_payouts_once(
         &pool,
@@ -980,7 +980,7 @@ async fn a_permit_whose_nonce_moved_without_a_transfer_is_left_for_a_human() {
     let pool = pool().await;
     let server = MockServer::start().await;
     mount_float_nonce(&server, 5).await;
-    let id = permit_out(&pool, 10_000_000, None, 4, now() - 120).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 400).await;
 
     payout::confirm_gasfree_payouts_once(
         &pool,
@@ -1054,7 +1054,8 @@ async fn an_ambiguous_gasfree_payout_holds_the_float_for_the_longest_deadline() 
             .await
             .unwrap();
     let held = deadline.expect("a deadline holds the float") - now();
-    assert!((590..=610).contains(&held), "held for about 600 s, got {held}");
+    assert!((890..=910).contains(&held), "held for the longest deadline plus the grace, about 900 s, got {held}");
+    assert_eq!(payout_alerts(&pool, "p1", "do not return this intent").await, 1, "the page says when the intent may be returned");
 }
 
 /// Spec §4: a redemption is refused before anything exists to burn against while the float's next
@@ -1098,4 +1099,34 @@ async fn a_redemption_is_refused_until_the_gasfree_float_is_activated() {
         .await;
     let app = treasury_service::api::router(pool.clone(), gasfree_config(activated.uri()));
     assert_eq!(app.oneshot(request()).await.unwrap().status(), StatusCode::CREATED);
+}
+
+/// Two redemptions of the same amount to one address: the first one's transaction must not be taken
+/// as the second one's payment, even when the relay names it — the chain says it paid the first.
+#[tokio::test]
+async fn a_transaction_that_already_paid_another_redemption_is_not_taken_as_this_ones() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_history(&server, "tx-gf-payout", REDEEMER, 10_000_000).await;
+    let first = pending_redemption(&pool, 10_000_000).await;
+    sqlx::query("UPDATE redemption_intents SET status = 'paid', payout_ref = 'tx-gf-payout' WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let second = permit_out(&pool, 10_000_000, Some(PAYOUT_TRACE), 4, now() + 180).await;
+
+    let paid = payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: Some("tx-gf-payout") },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(paid, 0);
+    assert_eq!(state_of(&pool, second).await, ("payout_submitted".into(), None, Some(4)));
+    assert_eq!(payout_alerts(&pool, "p1", "already paid").await, 1);
 }
