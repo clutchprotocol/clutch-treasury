@@ -14,7 +14,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE treasury_events, mint_intents, chain_outbox, reconciliation_runs, alerts RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE treasury_events, mint_intents, chain_outbox, reconciliation_runs, alerts, redemption_intents, gasfree_accounts RESTART IDENTITY CASCADE")
         .execute(&pool).await.unwrap();
     sqlx::query("UPDATE breaker_state SET minting_halted = FALSE, halt_reason = NULL")
         .execute(&pool).await.unwrap();
@@ -76,4 +76,63 @@ async fn the_scrape_reports_what_the_database_holds() {
         .execute(&pool).await.unwrap();
     let body = treasury_service::metrics::render(&pool).await;
     assert!(body.contains("clutch_treasury_minting_halted 1"), "{body}");
+}
+
+/// Spec §5: a stuck relay "pages after a threshold". A count cannot see one deposit or one
+/// redemption stuck for a day; an age can. Both read 0 when nothing waits, and a plain-address
+/// deposit, which waits for the sweep threshold by design, does not count toward the GasFree age.
+#[tokio::test]
+async fn the_stall_ages_follow_the_oldest_waiting_row() {
+    let pool = pool().await;
+    let body = treasury_service::metrics::render(&pool).await;
+    assert!(body.contains("clutch_treasury_oldest_unswept_gasfree_seconds 0\n"), "{body}");
+    assert!(body.contains("clutch_treasury_oldest_unpaid_redemption_seconds 0\n"), "{body}");
+
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address)
+         VALUES (3, 'TGasFreeAccountOf3', 'TOwnerOf3')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (address, index, hours) in [("TGasFreeAccountOf3", 3_i64, 2_i32), ("TPlainAddressOf4", 4, 30)] {
+        sqlx::query(
+            "INSERT INTO mint_intents
+                (id, beneficiary, amount_clt, credit_ref, created_by, approved_by, client_ref,
+                 expected_amount_usdt, deposit_address, derivation_index, status, verified_at)
+             VALUES ($1, 'TBene', 1000000, $2, 'orchestrator', 'tron-verifier', $3, 1000000, $4, $5,
+                     'credited', now() - make_interval(hours => $6))",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(format!("ref-{address}"))
+        .bind(format!("client-{address}"))
+        .bind(address)
+        .bind(index)
+        .bind(hours)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO redemption_intents (id, redeemer_address, payout_address, amount_clt, payout_amount_usdt, status, redemption_ref, created_at)
+         VALUES ($1, '0xaaaa000000000000000000000000000000000009', 'TRedeemer', 5000000, 5000000, 'payout_pending', $2,
+                 now() - interval '3 hours')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind("a".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let body = treasury_service::metrics::render(&pool).await;
+    let gauge = |name: &str| -> i64 {
+        body.lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix(' ')))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing:\n{body}"))
+    };
+    let gasfree = gauge("clutch_treasury_oldest_unswept_gasfree_seconds");
+    assert!((7_100..=7_300).contains(&gasfree), "the GasFree deposit, two hours old, not the older plain one: {gasfree}");
+    let unpaid = gauge("clutch_treasury_oldest_unpaid_redemption_seconds");
+    assert!((10_700..=10_900).contains(&unpaid), "three hours: {unpaid}");
 }

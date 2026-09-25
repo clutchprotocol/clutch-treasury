@@ -41,6 +41,11 @@ async fn pool() -> PgPool {
         .execute(&pool)
         .await
         .unwrap();
+    // The tripwire sets the breaker; no test may inherit it from another.
+    sqlx::query("UPDATE breaker_state SET minting_halted = FALSE, halt_reason = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
     pool
 }
 
@@ -640,6 +645,47 @@ async fn a_changed_gasfree_implementation_stops_gasfree_sweeps_and_pages_once() 
     assert!(signer.asked().is_empty(), "no permit is asked for while GasFree's code is not the reviewed code");
     assert_eq!(sweeper_alerts(&pool, "p1", "not the reviewed").await, 1, "paged once, not every pass");
     assert!(swept_at(&pool, id).await.is_none());
+}
+
+/// The GasFree design's §2 rule: CLT is minted only against USDT that will reach custody. Once
+/// GasFree's code changes that is no longer known, so minting halts until a human looks.
+#[tokio::test]
+async fn a_changed_gasfree_implementation_halts_minting() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, "00000000000000000000000000000000000000ff").await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+    let signer = FakeSigner::new(pending(8_000_000, 2_000_000, 0));
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    let (halted, reason): (bool, Option<String>) =
+        sqlx::query_as("SELECT minting_halted, halt_reason FROM breaker_state").fetch_one(&pool).await.unwrap();
+    assert!(halted, "minting halts while GasFree's code is not the reviewed code");
+    assert!(reason.unwrap_or_default().starts_with("GasFree tripwire: "), "the reason names the tripwire");
+}
+
+/// A breaker already set, by a person or by a mismatch, keeps its own reason: the tripwire does not
+/// overwrite what a human is already reading.
+#[tokio::test]
+async fn the_tripwire_keeps_an_earlier_halt_reason() {
+    let pool = pool().await;
+    sqlx::query("UPDATE breaker_state SET minting_halted = TRUE, halt_reason = 'halted by hand'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, "00000000000000000000000000000000000000ff").await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &FakeSigner::new(SignerReply::Busy)).await;
+
+    let reason: Option<String> = sqlx::query_scalar("SELECT halt_reason FROM breaker_state").fetch_one(&pool).await.unwrap();
+    assert_eq!(reason.as_deref(), Some("halted by hand"));
 }
 
 #[tokio::test]
