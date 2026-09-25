@@ -11,9 +11,11 @@
 
 mod address;
 mod permit;
+mod settings;
 
 pub use address::gasfree_address;
 pub use permit::{permit_hash, Permit};
+pub use settings::{load_settings, Settings};
 
 use sha3::{Digest, Keccak256};
 
@@ -61,6 +63,17 @@ impl Chain {
     }
 }
 
+impl std::fmt::Debug for Chain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not the creation code: it is 997 bytes of hex, and it is tested byte for byte elsewhere.
+        f.debug_struct("Chain")
+            .field("chain_id", &self.chain_id)
+            .field("controller", &self.controller)
+            .field("beacon", &self.beacon)
+            .finish_non_exhaustive()
+    }
+}
+
 /// How much one transfer out of a GasFree account may pay the relay: the transfer fee, plus the
 /// activation fee when the account has never made a transfer.
 ///
@@ -84,6 +97,14 @@ mod tests {
     fn the_fee_to_hold_includes_activation_only_before_it() {
         assert_eq!(fee_to_hold(false, 1_500_000, 500_000), 2_000_000, "a first transfer also activates");
         assert_eq!(fee_to_hold(true, 1_500_000, 500_000), 500_000, "an activated account pays one transfer fee");
+    }
+
+    /// Services print their config; 997 bytes of creation code in every such line helps nobody.
+    #[test]
+    fn a_chains_debug_form_names_it_without_its_creation_code() {
+        let shown = format!("{:?}", super::NILE);
+        assert!(shown.contains("THQGuFzL87ZqhxkgqYEryRAd7gqFqL5rdc"), "{shown}");
+        assert!(shown.len() < 300, "the creation code must not be printed: {shown}");
     }
 }
 

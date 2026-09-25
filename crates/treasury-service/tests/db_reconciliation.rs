@@ -15,7 +15,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE treasury_events, mint_intents, reconciliation_runs, alerts RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE treasury_events, mint_intents, reconciliation_runs, alerts, gasfree_accounts RESTART IDENTITY CASCADE")
         .execute(&pool).await.unwrap();
     sqlx::query("UPDATE breaker_state SET minting_halted = FALSE, halt_reason = NULL")
         .execute(&pool).await.unwrap();
@@ -308,4 +308,26 @@ async fn legacy_unswept_addresses_are_still_counted() {
     let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
 
     assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "a per-intent-era row must still be counted");
+}
+
+/// Spec §2: after a GasFree sweep the relay's unused margin stays at the account, and it still backs
+/// CLT. So a recorded account is counted when none of its deposits is unswept — and only once while
+/// one is.
+#[tokio::test]
+async fn a_gasfree_account_is_counted_after_its_deposits_are_swept_and_only_once() {
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address) VALUES (7, $1, 'TOwner7')",
+    )
+    .bind(SHARED_ADDR)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "no deposit is unswept, and the account still counts");
+
+    seed_unswept_mint(&pool, SHARED_ADDR, "tx-gf", Some(7)).await;
+    let addrs = treasury_service::reconciliation::unswept_addresses(&pool).await.unwrap();
+    assert_eq!(addrs, vec![SHARED_ADDR.to_string()], "an unswept deposit at the same account does not count it twice");
 }

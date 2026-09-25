@@ -20,8 +20,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
-use crate::ledger::alert;
+use crate::gasfree_rail::Trace;
+use crate::ledger::{alert, alert_once};
 use crate::tron_verifier::TronClient;
+
+mod gasfree_sweep;
 
 /// Is this address worth sweeping yet?
 ///
@@ -58,7 +61,7 @@ pub fn should_sweep(
 }
 
 /// What the signer reported for one address.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SignerReply {
     Swept { tx_id: String },
     /// Address already empty — the sweep is complete by definition.
@@ -72,6 +75,27 @@ pub enum SignerReply {
     /// `fee_address` — and until they do, no address can be swept.
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
     Failed(String),
+    /// A GasFree permit is with the relay (spec §3). NOT swept yet: the chain decides that, when the
+    /// controller's `nonces(owner)` moves past `nonce`. After `deadline` it can no longer run.
+    Pending {
+        trace_id: String,
+        gasfree_address: String,
+        value_usdt: i64,
+        max_fee_usdt: i64,
+        nonce: u64,
+        deadline: u64,
+    },
+    /// A transfer from this GasFree account is already in flight. Nothing was signed.
+    Busy,
+    /// The relay refused the permit. The deposit stays where it is, still counted, and a human
+    /// decides — never with a higher maxFee than was held back.
+    /// `reason` is the relay's exception name; `message` is its free text.
+    Rejected { reason: String, message: String },
+    /// The signer signs nothing for GasFree until a human acts: GasFree's code changed, or the relay
+    /// and the signer disagree about an address.
+    Halted { reason: String },
+    /// The GasFree account holds no more than a sweep may pay the relay.
+    BelowFee,
 }
 
 /// The signer boundary, as a trait so the worker is testable without a live service or real keys.
@@ -80,17 +104,33 @@ pub trait SweepSigner: Send + Sync {
     /// Sweep the address at `index`. Deliberately takes ONLY an index: the destination is the
     /// signer's own config, so nothing here can redirect funds. Do not widen this signature.
     async fn sweep(&self, index: i64) -> SignerReply;
+
+    /// The relay's record of a GasFree permit. Moves nothing.
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Err("this signer cannot read GasFree traces".into())
+    }
 }
 
-/// One pass: for every unswept deposit address, decide, sweep, record. Returns the number of
-/// `approved`/`submitted`/`credited` rows that currently have NO `derivation_index` — see the
-/// warning below for why that count matters.
+/// One pass: settle GasFree permits in flight, then for every index with unswept deposits decide,
+/// sweep, record. Returns the number of `approved`/`submitted`/`credited` rows that currently have
+/// NO `derivation_index` — see the warning below for why that count matters.
 pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, signer: &dyn SweepSigner) -> usize {
-    let rows: Vec<(Uuid, String, i64, f64)> = match sqlx::query_as(
+    // GasFree first, before the rows are read: a permit that ran marks its deposits swept here, so
+    // they are not asked for again below. The tripwire is read once for the whole pass.
+    let gasfree_ready = match &config.gasfree {
+        Some(settings) => {
+            gasfree_sweep::settle(pool, settings, client, signer).await;
+            gasfree_sweep::code_unchanged(pool, settings, client).await
+        }
+        None => false,
+    };
+
+    let rows: Vec<(Uuid, String, i64, f64, bool)> = match sqlx::query_as(
         // `credited` and later only. Sweeping an address whose deposit has not yet been credited
         // would move the evidence out from under the verifier before it has finished with it.
         "SELECT id, deposit_address, derivation_index,
-                (EXTRACT(EPOCH FROM (now() - created_at)) / 3600.0)::double precision
+                (EXTRACT(EPOCH FROM (now() - created_at)) / 3600.0)::double precision,
+                fee_held_usdt IS NOT NULL
          FROM mint_intents
          WHERE deposit_address IS NOT NULL
            AND derivation_index IS NOT NULL
@@ -114,9 +154,6 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
     // that died at startup looks like. There is no way to tell them apart from outside, and the
     // difference is "no deposits to consolidate" versus "money is accumulating at addresses nothing
     // will ever sweep".
-    //
-    // The interval is an hour, so this costs 24 lines a day and buys a liveness signal that does
-    // not depend on anything going wrong first.
     tracing::info!("sweeper: pass over {} unswept address(es)", rows.len());
 
     // A credited deposit with no derivation_index can never satisfy the query above (it requires
@@ -157,11 +194,39 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         tracing::warn!("{message}");
         // Beside the log line: a plain warn! is invisible to whatever watches the alerts table, and
         // this condition is exactly as actionable as every other sweeper alert below.
-        alert(pool, "warn", "sweeper", &message).await;
+        alert_once(pool, "warn", "sweeper", &message, chrono::Duration::hours(1)).await;
     }
 
-    for (id, address, index, age_hours) in rows {
-        let balance = match client.get_custody_balance(&address, &config.usdt_contract).await {
+    let mut dry_alerted = false;
+    for group in by_index(rows) {
+        let (index, address) = (group.index, group.address.as_str());
+
+        if group.gasfree {
+            match &config.gasfree {
+                Some(settings) if gasfree_ready => {
+                    gasfree_sweep::sweep_account(pool, config, settings, client, signer, index, address).await
+                }
+                // The tripwire stopped GasFree sweeps or could not be read, and has already alerted.
+                Some(_) => {}
+                None => {
+                    alert_once(
+                        pool,
+                        "warn",
+                        "sweeper",
+                        &format!(
+                            "credited deposits wait at GasFree account {address} (index {index}), but GasFree is \
+                             off in this service. They stay there, counted in the reserve, until the GasFree \
+                             settings are back."
+                        ),
+                        chrono::Duration::hours(1),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
+        let balance = match client.get_custody_balance(address, &config.usdt_contract).await {
             Ok(b) => b,
             Err(e) => {
                 // Transient. Never mark swept on an unread balance: that would abandon real funds
@@ -174,7 +239,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         if !should_sweep(
             balance,
             config.sweep_threshold_usdt,
-            age_hours as i64,
+            group.age_hours as i64,
             config.sweep_max_age_hours,
             config.sweep_min_usdt,
         ) {
@@ -184,8 +249,9 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         match signer.sweep(index).await {
             SignerReply::Swept { tx_id } => {
                 // swept_at ONLY. No ledger event — see the module docs: the reserve did not change,
-                // and recording one here would double-count the deposit.
-                if let Err(e) = mark_swept(pool, id).await {
+                // and recording one here would double-count the deposit. Every row of the index: the
+                // sweep moved the address's whole balance.
+                if let Err(e) = mark_swept(pool, &group.ids).await {
                     // The funds moved but we failed to record it. Loud, because the next pass will
                     // find a now-empty address and resolve it as NothingToSweep — correct, but only
                     // by luck, and a human should know a write was lost.
@@ -193,7 +259,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
                         pool,
                         "p1",
                         "sweeper",
-                        &format!("swept {address} in {tx_id} but failed to record swept_at for intent {id}: {e}"),
+                        &format!("swept {address} in {tx_id} but failed to record swept_at for intents {:?}: {e}", group.ids),
                     )
                     .await;
                 } else {
@@ -204,7 +270,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
             // Already empty: nothing to move, and the address is done. Recorded so it stops being
             // polled and stops inflating the reserve walk.
             SignerReply::NothingToSweep => {
-                if let Err(e) = mark_swept(pool, id).await {
+                if let Err(e) = mark_swept(pool, &group.ids).await {
                     tracing::error!("sweeper: failed to mark empty address {address} swept: {e}");
                 }
             }
@@ -219,25 +285,47 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
                 );
             }
 
-            // The only outcome no retry resolves. Break rather than continue: every remaining
-            // address in this pass gets the same answer, and alerting once per address would bury
-            // the one fact that matters under a pass-sized burst of duplicates.
+            // The only outcome no retry resolves, and every remaining plain address gets the same
+            // answer, so one alert would be buried under a pass-sized burst of duplicates. On the TRX
+            // rail nothing else can move this pass, so it stops. With GasFree on, the fee account is
+            // empty by design and passes come every minute: the fact is said once an hour, and the
+            // pass goes on to the GasFree accounts, which need no TRX.
             SignerReply::FeeAccountDry { fee_address, have_sun, need_sun } => {
-                alert(
-                    pool,
-                    "warn",
-                    "sweeper",
-                    &format!(
-                        "TRX float exhausted: {fee_address} holds {have_sun} sun, needs {need_sun}. \
-                         No deposit can be swept until it is topped up."
-                    ),
-                )
-                .await;
-                return missing_count;
+                let message = format!(
+                    "TRX float exhausted: {fee_address} holds {have_sun} sun, needs {need_sun}. \
+                     No deposit at a plain address can be swept until it is topped up."
+                );
+                if config.gasfree.is_none() {
+                    alert(pool, "warn", "sweeper", &message).await;
+                    return missing_count;
+                }
+                if !dry_alerted {
+                    alert_once(pool, "warn", "sweeper", &message, chrono::Duration::hours(1)).await;
+                    dry_alerted = true;
+                }
             }
 
-            SignerReply::Failed(e) => {
-                alert(pool, "warn", "sweeper", &format!("sweep of {address} (index {index}) failed: {e}")).await;
+            SignerReply::Failed(e) => sweep_failed(pool, config, address, index, &e).await,
+
+            // The signer answered for this index's GasFree account: it found USDT there and asked
+            // for a permit. No deposit on the books is at that account, so nothing is recorded; the
+            // plain address is looked at again on the next pass.
+            other => {
+                tracing::warn!("sweeper: index {index} (plain address {address}) was answered for its GasFree account: {other:?}");
+                // With GasFree off here, nothing will follow what the signer did. One page an hour,
+                // whatever the index; the index and the reply are in the log.
+                if config.gasfree.is_none() {
+                    alert_once(
+                        pool,
+                        "p1",
+                        "sweeper",
+                        "the signer answers sweeps with GasFree statuses, but this treasury has GasFree off \
+                         (APP_GASFREE_NETWORK is not set). The two services disagree about the rail, and the plain \
+                         deposits it answered for are not swept: give both services the same GasFree settings.",
+                        chrono::Duration::hours(1),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -245,10 +333,57 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
     missing_count
 }
 
-async fn mark_swept(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+/// A sweep that failed. On the TRX rail passes are an hour apart and each failure is alerted. With
+/// GasFree on they are a minute apart, so one unchanged failure is said once an hour, with the
+/// reason in the log (spec §5: retried every pass, paged if it persists).
+async fn sweep_failed(pool: &PgPool, config: &AppConfig, address: &str, index: i64, e: &str) {
+    if config.gasfree.is_none() {
+        alert(pool, "warn", "sweeper", &format!("sweep of {address} (index {index}) failed: {e}")).await;
+        return;
+    }
+    tracing::warn!("sweeper: sweep of {address} (index {index}) failed: {e}");
+    alert_once(
+        pool,
+        "warn",
+        "sweeper",
+        &format!("sweep of {address} (index {index}) keeps failing; the log has the reason. It is retried every pass."),
+        chrono::Duration::hours(1),
+    )
+    .await;
+}
+
+/// The unswept deposits of one index. A user's permanent address carries every deposit they have
+/// made, so one index can have many rows, and each pass asks the signer about it once.
+struct IndexGroup {
+    index: i64,
+    address: String,
+    /// The oldest row's age: the age valve in `should_sweep` is about the oldest money waiting.
+    age_hours: f64,
+    /// A deposit to a GasFree account (`fee_held_usdt` is set).
+    gasfree: bool,
+    ids: Vec<Uuid>,
+}
+
+/// Rows grouped by index, in the order of each index's oldest row.
+fn by_index(rows: Vec<(Uuid, String, i64, f64, bool)>) -> Vec<IndexGroup> {
+    let mut groups: Vec<IndexGroup> = Vec::new();
+    let mut at: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for (id, address, index, age_hours, gasfree) in rows {
+        match at.get(&index) {
+            Some(&i) => groups[i].ids.push(id),
+            None => {
+                at.insert(index, groups.len());
+                groups.push(IndexGroup { index, address, age_hours, gasfree, ids: vec![id] });
+            }
+        }
+    }
+    groups
+}
+
+async fn mark_swept(pool: &PgPool, ids: &[Uuid]) -> Result<(), sqlx::Error> {
     // Guarded on IS NULL so a concurrent or repeated pass cannot overwrite the original timestamp.
-    sqlx::query("UPDATE mint_intents SET swept_at = now() WHERE id = $1 AND swept_at IS NULL")
-        .bind(id)
+    sqlx::query("UPDATE mint_intents SET swept_at = now() WHERE id = ANY($1) AND swept_at IS NULL")
+        .bind(ids)
         .execute(pool)
         .await
         .map(|_| ())
@@ -367,10 +502,86 @@ impl SweepSigner for HttpSigner {
                 have_sun: body["have_sun"].as_i64().unwrap_or(0),
                 need_sun: body["need_sun"].as_i64().unwrap_or(0),
             },
+            Some("pending") => match (
+                body["trace_id"].as_str(),
+                body["gasfree_address"].as_str(),
+                body["value_usdt"].as_i64(),
+                body["max_fee_usdt"].as_i64(),
+                body["nonce"].as_u64(),
+                body["deadline"].as_u64(),
+            ) {
+                (Some(trace_id), Some(gasfree_address), Some(value_usdt), Some(max_fee_usdt), Some(nonce), Some(deadline)) => {
+                    SignerReply::Pending {
+                        trace_id: trace_id.to_string(),
+                        gasfree_address: gasfree_address.to_string(),
+                        value_usdt,
+                        max_fee_usdt,
+                        nonce,
+                        deadline,
+                    }
+                }
+                // A permit is with the relay and nothing here could follow it. It can only pay the
+                // float or custody, so the deposits stay unswept on the books, still counted.
+                _ => SignerReply::Failed(format!("signer reported pending without the permit's fields: {body}")),
+            },
+            Some("busy") => SignerReply::Busy,
+            Some("rejected") => SignerReply::Rejected {
+                reason: body["reason"].as_str().unwrap_or("no reason given").to_string(),
+                message: body["message"].as_str().unwrap_or("").to_string(),
+            },
+            Some("halted") => SignerReply::Halted {
+                reason: body["reason"].as_str().unwrap_or("no reason given").to_string(),
+            },
+            Some("below_fee") => SignerReply::BelowFee,
             // An unknown status must never be treated as benign: it could mean a newer signer swept
             // in a way this version does not understand.
             other => SignerReply::Failed(format!("unrecognised signer status {other:?}")),
         }
+    }
+
+    async fn trace(&self, trace_id: &str) -> Result<Trace, String> {
+        crate::gasfree_rail::fetch_trace(&self.http, &self.base_url, &self.token, trace_id).await
+    }
+}
+
+/// Both deposit addresses of an index, as the signer derives them.
+#[derive(Debug, PartialEq)]
+pub struct IndexAddresses {
+    pub plain: String,
+    /// `None` when GasFree is off in the signer.
+    pub gasfree: Option<String>,
+}
+
+impl HttpSigner {
+    /// `GET /internal/addresses/:index`: both addresses of an index. Moves nothing. The treasury
+    /// asks here, where the addresses are derived, instead of trusting the address the
+    /// orchestrator reported, because whether a deposit pays a relay fee must not be the
+    /// orchestrator's choice.
+    pub async fn addresses(&self, index: i64) -> Result<IndexAddresses, String> {
+        let resp = self
+            .http
+            .get(format!("{}/internal/addresses/{index}", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("signer unreachable: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("signer returned {}", resp.status()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| format!("unreadable signer response: {e}"))?;
+        if body["index"].as_i64() != Some(index) {
+            return Err(format!("asked for index {index}, the signer answered for {}", body["index"]));
+        }
+        let plain = body["plain"]
+            .as_str()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| format!("the signer named no plain address: {body}"))?;
+        let gasfree = match &body["gasfree"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(a) if !a.is_empty() => Some(a.clone()),
+            other => return Err(format!("the signer gave an unreadable GasFree address: {other}")),
+        };
+        Ok(IndexAddresses { plain: plain.to_string(), gasfree })
     }
 }
 

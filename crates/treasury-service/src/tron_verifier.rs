@@ -37,6 +37,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
+use crate::gasfree_rail::{deposit_mint, DepositMint};
 use crate::ledger::{alert, alert_once};
 
 /// A single TRC-20 transfer as TronGrid's trc20 endpoint reports it. Field names VERIFIED
@@ -47,6 +48,11 @@ use crate::ledger::{alert, alert_once};
 struct Trc20Transfer {
     transaction_id: String,
     to: String,
+    /// Who paid. Only the payout check reads it (`confirmed_transfer`): a GasFree payout's
+    /// transaction carries two transfers from the float, the redeemer's and the relay's fee. A
+    /// missing field fails that check, closed.
+    #[serde(default)]
+    from: String,
     value: String,
     token_info: TokenInfo,
     /// The TRC-20 event kind. Only `"Transfer"` moves value — an `Approval` event carries a
@@ -315,6 +321,9 @@ impl TronClient {
     ///
     /// Custody + every unswept deposit address + the payout float.
     ///
+    /// Custody and the float are read before and after the addresses; if either changed, the walk is
+    /// refused, because a transfer between two reads would be counted twice.
+    ///
     /// Reading only the main address would report a reserve near zero while deposits sit on derived
     /// addresses awaiting a sweep. That is not a halt risk — `judge` keys on the LEDGER's
     /// `custody_reported`, and `trongrid_balance` is a cross-check column that plays no part in any
@@ -338,20 +347,35 @@ impl TronClient {
         float_address: &str,
         usdt_contract: &str,
     ) -> Result<i64, String> {
-        let mut total = self.get_custody_balance(main_address, usdt_contract).await?;
+        // Custody and the float first, and again after the walk. USDT moving between them and an
+        // address read in between (a fund-float into the float, a sweep into custody) would be
+        // counted twice, so a walk that saw either of them change is not a sum of one moment.
+        let main = self.get_custody_balance(main_address, usdt_contract).await?;
+        let float = self
+            .get_custody_balance(float_address, usdt_contract)
+            .await
+            .map_err(|e| format!("payout float {float_address}: {e}"))?;
+        // Saturating: a corrupt balance must not wrap the reserve into something small.
+        let mut total = main.saturating_add(float);
         for addr in unswept_addresses {
             let bal = self
                 .get_custody_balance(addr, usdt_contract)
                 .await
                 .map_err(|e| format!("unswept deposit address {addr}: {e}"))?;
-            // Saturating: a corrupt balance must not wrap the reserve into something small.
             total = total.saturating_add(bal);
         }
-        let float = self
+        let main_after = self.get_custody_balance(main_address, usdt_contract).await?;
+        let float_after = self
             .get_custody_balance(float_address, usdt_contract)
             .await
             .map_err(|e| format!("payout float {float_address}: {e}"))?;
-        Ok(total.saturating_add(float))
+        if main_after != main || float_after != float {
+            return Err(format!(
+                "custody or the payout float moved while the reserve was read (custody {main} then {main_after}, \
+                 float {float} then {float_after}); not a sum of one moment"
+            ));
+        }
+        Ok(total)
     }
 
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {
@@ -399,6 +423,110 @@ impl TronClient {
         // truncate a reserve figure into something plausible-looking.
         i64::from_str_radix(trimmed, 16)
             .map_err(|_| format!("balanceOf returned an unrepresentable uint256: 0x{word}"))
+    }
+
+    /// The first 32-byte word a view function returns, as 64 lowercase hex characters.
+    pub async fn view_word(&self, contract: &str, selector: &str, parameter: Option<&str>) -> Result<String, String> {
+        // A constant call runs nothing and costs nothing. TronGrid wants an `owner_address`, and a
+        // view does not care who asks, so the contract is named as its own caller.
+        let mut body = serde_json::json!({
+            "owner_address": contract,
+            "contract_address": contract,
+            "function_selector": selector,
+            "visible": true,
+        });
+        if let Some(p) = parameter {
+            body["parameter"] = serde_json::Value::from(p);
+        }
+        let resp = self
+            .http
+            .post(format!("{}/wallet/triggerconstantcontract", self.base_url))
+            .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("trongrid {selector} on {contract} failed: {status} {text}"));
+        }
+        let parsed: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let word = parsed["constant_result"][0]
+            .as_str()
+            .ok_or_else(|| format!("{selector} on {contract} returned nothing: {parsed}"))?;
+        if word.len() != 64 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{selector} on {contract} returned {word:?}, not one 32-byte word"));
+        }
+        Ok(word.to_ascii_lowercase())
+    }
+
+    /// The next nonce the GasFree controller accepts from `owner`: the chain's count of the permits
+    /// it has run for them. Moving past a permit's nonce is how a GasFree sweep is known to have run.
+    pub async fn gasfree_nonce(&self, controller: &str, owner: &str) -> Result<u64, String> {
+        let word = self.view_word(controller, "nonces(address)", Some(&abi_encode_address(owner)?)).await?;
+        let (high, low) = word.split_at(48);
+        if high.bytes().any(|b| b != b'0') {
+            return Err(format!("nonces({owner}) returned 0x{word}, more than a u64"));
+        }
+        u64::from_str_radix(low, 16).map_err(|e| format!("nonces({owner}) returned 0x{word}: {e}"))
+    }
+
+    /// An upgradeable proxy's `implementation()`, as 40 lowercase hex characters.
+    pub async fn implementation(&self, proxy: &str) -> Result<String, String> {
+        Ok(self.view_word(proxy, "implementation()", None).await?[24..].to_string())
+    }
+
+    /// Whether `address` holds a deployed contract; for a GasFree account, whether it is activated.
+    /// `contract_address`, not `bytecode`: an activated GasFree account answers with an EMPTY
+    /// bytecode (2026-09-24). Only `{}` means no; any other answer is an error, never "no".
+    pub async fn has_contract(&self, address: &str) -> Result<bool, String> {
+        let resp = self
+            .http
+            .post(format!("{}/wallet/getcontract", self.base_url))
+            .header("TRON-PRO-API-KEY", &self.api_key)
+            .json(&serde_json::json!({"value": address, "visible": true}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("trongrid getcontract failed: {status} {text}"));
+        }
+        let parsed: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if parsed["contract_address"].as_str().is_some_and(|a| !a.is_empty()) {
+            return Ok(true);
+        }
+        if parsed.as_object().is_some_and(|o| o.is_empty()) {
+            return Ok(false);
+        }
+        Err(format!("getcontract for {address} gave neither a contract nor {{}}: {parsed}"))
+    }
+
+    /// Whether `tx_id` carries a confirmed USDT `Transfer` of exactly `amount` from `from` to `to`.
+    ///
+    /// Read from `from`'s confirmed TRC-20 history since `since_ms`, so the event is checked field by
+    /// field: a GasFree payout's transaction holds two transfers from the float, and only the one to
+    /// the redeemer pays the redemption.
+    pub async fn confirmed_transfer(
+        &self,
+        tx_id: &str,
+        from: &str,
+        to: &str,
+        usdt_contract: &str,
+        amount: i64,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        let transfers = self.trc20_transfers(from, usdt_contract, Some(since_ms)).await?;
+        Ok(transfers.iter().any(|t| {
+            t.transaction_id.eq_ignore_ascii_case(tx_id)
+                && t.event_type == TRC20_TRANSFER_EVENT
+                && t.from == from
+                && t.to == to
+                && t.token_info.address == usdt_contract
+                && t.value.parse::<i64>() == Ok(amount)
+        }))
     }
 }
 
@@ -515,6 +643,9 @@ struct DepositBackedIntent {
     /// choosing would defeat the point of the four-eyes split.
     deposit_address: Option<String>,
     deposit_tx_id: Option<String>,
+    /// The BIP32 index the orchestrator reported for `deposit_address`. With GasFree on, the signer
+    /// is asked which of that index's two addresses the deposit was paid to.
+    derivation_index: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -642,50 +773,66 @@ async fn evaluate(
     }
 }
 
-/// Approve + `verified_at` + outbox row + `ledger::append_event("custody_deposit", ...)` in
-/// ONE transaction (brief's exactly-once requirement). `WHERE status = 'created'` on the
-/// UPDATE is what makes a rerun after a crash safe: if a prior run already flipped this intent
-/// to `approved` (crashed AFTER commit, e.g. mid-outbox-processing later), this UPDATE affects
-/// zero rows and the function returns Ok(false) — no second `approved_by` write, no second
-/// outbox row, no second ledger event. If the crash was BEFORE commit, the whole transaction
-/// never happened and this rerun performs the one real attempt. There is no window where a
-/// rerun can observe a half-committed state, because all four writes share one transaction.
+/// Approve (or hold for a human) + `verified_at` + outbox row + `ledger::append_event("custody_deposit", ...)`
+/// in ONE transaction (brief's exactly-once requirement). `WHERE status = 'created'` on the UPDATE
+/// is what makes a rerun after a crash safe: if a prior run already moved this intent on, this
+/// UPDATE affects zero rows and the function returns Ok(false) — no second `approved_by` write, no
+/// second outbox row, no second ledger event. If the crash was BEFORE commit, the whole transaction
+/// never happened and this rerun performs the one real attempt.
+///
+/// `status` is `approved`, or `needs_manual` for a GasFree deposit below the minimum: recorded and
+/// ledgered the same way, with no outbox row, so nothing mints until a human approves it.
+///
+/// `cap` is set for a deposit to a GasFree account (spec §2): the mint drops to it when the
+/// orchestrator proposed more, and what was held back is stored beside it.
 async fn approve_and_ledger(
     pool: &PgPool,
     intent_id: Uuid,
     observed_amount_usdt: i64,
     tx_id: &str,
+    status: &str,
+    cap: Option<i64>,
 ) -> Result<bool, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
+    // Postgres evaluates every SET expression against the row as it was, so both CASE lines read the
+    // amount the orchestrator proposed.
     let updated = sqlx::query(
         "UPDATE mint_intents
-         SET status = 'approved', approved_by = 'tron-verifier', verified_at = now(), updated_at = now()
+         SET status = $2, approved_by = 'tron-verifier', verified_at = now(), updated_at = now(),
+             amount_clt = CASE WHEN $3::BIGINT IS NULL THEN amount_clt ELSE LEAST(amount_clt, $3::BIGINT) END,
+             fee_held_usdt = CASE WHEN $3::BIGINT IS NULL THEN NULL
+                                  ELSE $4::BIGINT - LEAST(amount_clt, $3::BIGINT) END
          WHERE id = $1 AND status = 'created'",
     )
     .bind(intent_id)
+    .bind(status)
+    .bind(cap)
+    .bind(observed_amount_usdt)
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
     if updated.rows_affected() == 0 {
-        // Already approved by a prior run (or otherwise no longer `created`) — rerun-safe
-        // no-op. Roll back rather than commit an empty transaction; either is harmless here,
-        // but rollback makes "nothing happened" true of the DB log too.
+        // Already moved on by a prior run — rerun-safe no-op. Roll back rather than commit an empty
+        // transaction; either is harmless here, but rollback makes "nothing happened" true of the DB
+        // log too.
         tx.rollback().await.map_err(|e| e.to_string())?;
         return Ok(false);
     }
 
-    sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
-        .bind(intent_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+    if status == "approved" {
+        sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // Custody enters the ledger ONLY here — independent verification is what makes the
-    // backing-ratio breaker meaningful (brief). OBSERVED amount, not amount_clt: includes the
-    // discriminator and any overpay surplus, so the ledger agrees with real custody and
-    // backing sits slightly above par, not exactly at it.
+    // backing-ratio breaker meaningful (brief). OBSERVED amount, not amount_clt: everything that
+    // arrived, so the ledger agrees with real custody. A GasFree deposit's fee is spent only when it
+    // is swept, and reconciliation judges the reserve on chain.
     sqlx::query(
         "INSERT INTO treasury_events (kind, amount_clt, amount_usdt, intent_id, chain_tx_hash, description)
          VALUES ('custody_deposit', 0, $1, $2, $3, 'TronGrid-verified deposit')
@@ -700,6 +847,122 @@ async fn approve_and_ledger(
 
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// What a verified deposit may do.
+enum Verdict {
+    /// Approve and mint. `cap`, for a GasFree account, is the most it may mint.
+    Approve { cap: Option<i64> },
+    /// Record the deposit, mint nothing, and page a human.
+    Hold { cap: i64, reason: String },
+    Reject(String),
+    /// Nothing is decided this pass; the intent stays `created`.
+    Wait(String),
+}
+
+/// With GasFree on: a plain address mints as before, a GasFree account holds back the relay's fee
+/// (spec §2), and an address its own index does not lead to is one no sweep could ever move.
+async fn gasfree_verdict(
+    pool: &PgPool,
+    settings: &gasfree::Settings,
+    signer: &crate::sweeper::HttpSigner,
+    intent: &DepositBackedIntent,
+    observed_amount_usdt: i64,
+) -> Verdict {
+    let Some(index) = intent.derivation_index else {
+        return Verdict::Wait(format!(
+            "intent {} has no derivation_index, so its address cannot be classified; with GasFree on it is never approved without one",
+            intent.id
+        ));
+    };
+    // `evaluate` already refused an intent with no address, so a Pass always has one.
+    let deposit_address = intent.deposit_address.as_deref().unwrap_or_default();
+    let addresses = match signer.addresses(index).await {
+        Ok(a) => a,
+        Err(e) => return Verdict::Wait(format!("asking the signer for the addresses of index {index}: {e}")),
+    };
+    if deposit_address == addresses.plain {
+        return Verdict::Approve { cap: None };
+    }
+    // The signer's GasFree account must be the one this service's own settings give for the same
+    // plain address. A signer with GasFree off answers `null`, and one on another network answers a
+    // different address. Either way the two services disagree, and nothing here can say what this
+    // deposit may mint. It waits: rejecting it would hand a human a deposit to re-mint by hand, with
+    // no fee held back.
+    let ours = match gasfree::gasfree_address(settings.chain, &addresses.plain) {
+        Ok(g) => g,
+        Err(e) => return Verdict::Wait(format!("deriving the GasFree account of index {index}: {e}")),
+    };
+    if addresses.gasfree.as_deref() != Some(ours.as_str()) {
+        let message = format!(
+            "the signer puts the GasFree account of index {index} at {:?}, but this service's GasFree settings put it \
+             at {ours}: the two services' GasFree settings disagree. Deposits there wait until they agree.",
+            addresses.gasfree
+        );
+        alert_once(pool, "p1", "tron_verifier", &message, chrono::Duration::hours(1)).await;
+        return Verdict::Wait(message);
+    }
+    if deposit_address != ours {
+        return Verdict::Reject(format!(
+            "deposit address {deposit_address} is neither the plain address {} nor the GasFree account {ours} of index \
+             {index}: no sweep of that index could move it",
+            addresses.plain
+        ));
+    }
+    let seen_first_transfer = match record_account(pool, index, deposit_address, &addresses.plain).await {
+        Ok(seen) => seen,
+        Err(e) => return Verdict::Wait(e),
+    };
+    let fee = gasfree::fee_to_hold(seen_first_transfer, settings.activate_fee_max_usdt, settings.transfer_fee_max_usdt);
+    match deposit_mint(observed_amount_usdt, fee, settings.min_deposit_usdt) {
+        DepositMint::Mint { cap } => Verdict::Approve { cap: Some(cap) },
+        DepositMint::BelowMinimum { cap } => Verdict::Hold {
+            cap,
+            reason: format!(
+                "{observed_amount_usdt} micro-USDT arrived at GasFree account {deposit_address}. After the {fee} held \
+                 for the relay's fee, {cap} is below the minimum deposit of {}, so nothing was minted. The USDT stays \
+                 at the account, counted in the reserve, and is swept with the user's next deposit. Approving this \
+                 intent (mint-intent-approve) mints at most {cap}.",
+                settings.min_deposit_usdt
+            ),
+        },
+        DepositMint::NothingToMint => Verdict::Reject(format!(
+            "{observed_amount_usdt} micro-USDT arrived at GasFree account {deposit_address}, no more than the {fee} a \
+             sweep may pay the relay, so nothing can ever be minted for it. The USDT stays at the account, counted in \
+             the reserve, and is swept with the user's next deposit."
+        )),
+    }
+}
+
+/// Record the GasFree account of `index`, and say whether the treasury has seen its own first sweep
+/// of it run.
+///
+/// That record, not the chain's contract record, decides the hold (spec §2; Plan 2's final review,
+/// I2). A sweep asked for some other way can activate the account before a deposit it moved was
+/// credited. That permit paid activation, and a hold sized from the chain would have kept back only
+/// one transfer fee. The record implies contract code, so a hold sized from it is never below the
+/// `maxFee` the signer sizes from the chain.
+async fn record_account(pool: &PgPool, index: i64, gasfree_address: &str, owner: &str) -> Result<bool, String> {
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address)
+         VALUES ($1, $2, $3) ON CONFLICT (derivation_index) DO NOTHING",
+    )
+    .bind(index)
+    .bind(gasfree_address)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("recording GasFree account {gasfree_address}: {e}"))?;
+    let seen: Option<bool> = sqlx::query_scalar(
+        "SELECT first_transfer_at IS NOT NULL FROM gasfree_accounts
+         WHERE derivation_index = $1 AND gasfree_address = $2",
+    )
+    .bind(index)
+    .bind(gasfree_address)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("reading GasFree account {gasfree_address}: {e}"))?;
+    seen.ok_or_else(|| format!("index {index} is recorded with a different GasFree account than {gasfree_address}"))
 }
 
 /// Hard mismatch: `rejected` + alert. `WHERE status = 'created'` for the same rerun-safety
@@ -784,9 +1047,19 @@ async fn stuck_intent_sweep(pool: &PgPool, intents: &[DepositBackedIntent]) {
 /// evaluating or acting on ONE intent are alerted and skipped rather than aborting the batch.
 pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, String> {
     let client = TronClient::new(config.trongrid_url.clone(), config.trongrid_api_key.clone());
-    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+    // With GasFree on, the signer is asked which of an index's two addresses a deposit went to.
+    let signer = crate::sweeper::HttpSigner {
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?,
+        base_url: config.signer_url.clone(),
+        token: config.signer_token.clone(),
+    };
+    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>, Option<i64>)> =
         sqlx::query_as(
-            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at FROM mint_intents
+            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index
+             FROM mint_intents
              WHERE status = 'created' AND client_ref IS NOT NULL
              ORDER BY created_at",
         )
@@ -796,12 +1069,8 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
-        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at)| DepositBackedIntent {
-            id,
-            expected_amount_usdt,
-            deposit_address,
-            deposit_tx_id,
-            created_at,
+        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index)| {
+            DepositBackedIntent { id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index }
         })
         .collect();
 
@@ -846,11 +1115,41 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 if !may_approve {
                     continue;
                 }
-                match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id).await {
-                    Ok(true) => approved += 1,
-                    Ok(false) => {} // already approved by a prior run — rerun-safe no-op
-                    Err(e) => {
-                        alert(pool, "p1", "tron_verifier", &format!("intent {}: approval write failed: {e}", intent.id)).await;
+                let verdict = match &config.gasfree {
+                    // The TRX rail: the whole deposit reaches custody, so the intent mints what it says.
+                    None => Verdict::Approve { cap: None },
+                    Some(settings) => gasfree_verdict(pool, settings, &signer, intent, observed_amount_usdt).await,
+                };
+                match verdict {
+                    Verdict::Approve { cap } => {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap).await {
+                            Ok(true) => approved += 1,
+                            Ok(false) => {} // already approved by a prior run — rerun-safe no-op
+                            Err(e) => {
+                                alert(pool, "p1", "tron_verifier", &format!("intent {}: approval write failed: {e}", intent.id)).await;
+                            }
+                        }
+                    }
+                    Verdict::Hold { cap, reason } => {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap)).await {
+                            Ok(true) => {
+                                alert(pool, "p1", "tron_verifier", &format!("mint intent {} needs manual review: {reason}", intent.id)).await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                alert(pool, "p1", "tron_verifier", &format!("intent {}: recording it for manual review failed: {e}", intent.id)).await;
+                            }
+                        }
+                    }
+                    Verdict::Reject(reason) => {
+                        if let Err(e) = reject_and_alert(pool, intent.id, &reason).await {
+                            alert(pool, "p1", "tron_verifier", &format!("intent {}: reject write failed: {e}", intent.id)).await;
+                        }
+                    }
+                    // Nothing decided: the intent stays `created`, the next tick retries it, and the
+                    // stuck-intent sweep pages a human if it stays that way.
+                    Verdict::Wait(reason) => {
+                        tracing::debug!(intent_id = %intent.id, reason, "tron_verifier: verified, not yet approvable; retrying next tick");
                     }
                 }
             }
@@ -918,6 +1217,7 @@ mod tests {
     fn transfer(to: &str, contract: &str, value: &str) -> Trc20Transfer {
         Trc20Transfer {
             transaction_id: "tx1".to_string(),
+            from: String::new(),
             to: to.to_string(),
             value: value.to_string(),
             token_info: TokenInfo { address: contract.to_string() },

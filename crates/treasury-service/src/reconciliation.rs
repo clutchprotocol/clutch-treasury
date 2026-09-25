@@ -157,22 +157,30 @@ async fn in_flight_mint_amount(pool: &PgPool) -> Result<i64, sqlx::Error> {
     Ok(sum.unwrap_or(0))
 }
 
-/// Every address still holding an unswept deposit, each counted ONCE.
+/// Every address besides custody and the float whose USDT backs CLT, each counted ONCE: every
+/// address still holding an unswept deposit, and every GasFree account the treasury has recorded.
 ///
 /// DISTINCT is load-bearing, not tidiness. `get_reserve_balance` sums every entry it is handed, and
 /// per-user deposit addresses mean one address legitimately appears on many unswept rows. Summing
 /// per row inflates the reserve — and an over-backed reading is the dangerous direction, because it
-/// licenses minting that nothing backs. Under-counting merely halts minting, loudly.
+/// licenses minting that nothing backs. Under-counting merely halts minting, loudly. UNION removes
+/// duplicates the same way.
+///
+/// GasFree accounts count after their deposits are swept (spec §2): a sweep leaves the relay's
+/// unused margin at the account, and that still backs CLT.
+/// ponytail: one balance read per recorded account per run, so the walk grows with users; count only
+/// accounts that may hold something if that ever matters.
 pub async fn unswept_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT DISTINCT deposit_address FROM mint_intents
-         WHERE deposit_address IS NOT NULL AND swept_at IS NULL
-           AND status IN ('approved', 'submitted', 'credited', 'needs_manual')",
-        // `needs_manual` counts on purpose: it is a verified deposit waiting on a human
-        // (over the per-transaction cap), its custody_deposit event is already in the
-        // ledger, and its USDT is still at the address. Leaving it out would read the
+        // `needs_manual` counts on purpose: it is a verified deposit waiting on a human (over the
+        // per-transaction cap, or a GasFree deposit below the minimum), its custody_deposit event is
+        // already in the ledger, and its USDT is still at the address. Leaving it out would read the
         // reserve short and halt minting over money that is present.
-
+        "SELECT deposit_address FROM mint_intents
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL
+           AND status IN ('approved', 'submitted', 'credited', 'needs_manual')
+         UNION
+         SELECT gasfree_address FROM gasfree_accounts",
     )
     .fetch_all(pool)
     .await

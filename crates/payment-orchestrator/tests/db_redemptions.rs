@@ -113,6 +113,7 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         // High enough that these tests never trip the limiter; its own behaviour is
         // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
         rate_limit_per_minute: 1_000,
+        gasfree: None,
     }
 }
 
@@ -871,4 +872,25 @@ async fn the_create_response_tells_the_caller_what_they_will_actually_receive() 
     assert_eq!(body["amount_clt"], 2_000_000, "the burn is still the full amount");
     assert_eq!(body["payout_amount_usdt"], 1_500_000, "the caller must see the net before burning");
     assert_eq!(body["fee_usdt"], 500_000, "and what it cost them");
+}
+
+/// With GasFree payouts the treasury answers 503 until its float has made its first transfer (spec
+/// §4). That is "not yet", and the user is told so — not that the treasury refused them.
+#[tokio::test]
+async fn a_treasury_not_taking_redemptions_yet_reads_as_not_yet_available() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/redemption-intents"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let app = router_with(pool, test_config(server.uri(), true));
+
+    let res = app.oneshot(post_redemption_request(&bearer_for(FRANK_ADDR), VALID_TRON_ADDRESS, 2_000_000)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("not yet available"), "{body}");
 }

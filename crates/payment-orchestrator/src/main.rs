@@ -27,6 +27,27 @@ async fn main() {
             .expect("APP_DEPOSIT_ACCOUNT_XPUB must be a valid account-level xpub (m/44'/195'/0')"),
     );
 
+    // GasFree's boot check (spec §1): its constants must be the ones deployed where this TronGrid
+    // points, or users would be shown addresses nobody controls. A chain that answers wrong stops the
+    // service. One that does not answer leaves it to the code check before each GasFree address,
+    // which also fails on the wrong network, where the proxies are not contracts.
+    if let Some(settings) = &config.gasfree {
+        let chain = payment_orchestrator::gasfree_chain::GasFreeChain::new(
+            config.trongrid_url.clone(),
+            config.trongrid_api_key.clone(),
+        );
+        match chain.self_test(settings, &deriver).await {
+            payment_orchestrator::gasfree_chain::SelfTest::Passed => {
+                tracing::info!(chain_id = settings.chain.chain_id, rail = settings.rail, "GasFree self-test passed")
+            }
+            payment_orchestrator::gasfree_chain::SelfTest::Failed(e) => panic!("GasFree self-test failed: {e}"),
+            payment_orchestrator::gasfree_chain::SelfTest::Unreachable(e) => tracing::warn!(
+                "GasFree self-test could not reach TronGrid, so it did not run; the code check before each GasFree \
+                 address still runs: {e}"
+            ),
+        }
+    }
+
     let watcher: Arc<dyn CustodyWatcher> = Arc::new(TronGridWatcher::new(
         config.trongrid_url.clone(),
         config.trongrid_api_key.clone(),

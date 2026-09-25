@@ -67,5 +67,8 @@ jobs:
       # --test-threads=1: the DB tests share one Postgres and TRUNCATE each other's tables, so
       # parallel threads inside a binary race. Serial is fine at this size, and running them
       # in parallel produces failures that look like logic bugs but are not.
+      #
+      # --no-fail-fast: without it cargo stops at the first test binary that fails, and the
+      # binaries after it never run, so a red run could not show which of their tests fail.
       - name: cargo test
-        run: cargo test --workspace -- --test-threads=1
+        run: cargo test --workspace --no-fail-fast -- --test-threads=1

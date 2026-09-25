@@ -141,6 +141,7 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         redemption_fee_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
+        gasfree: None,
     }
 }
 

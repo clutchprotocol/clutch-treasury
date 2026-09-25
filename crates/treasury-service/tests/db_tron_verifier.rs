@@ -46,7 +46,7 @@ async fn pool() -> PgPool {
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     sqlx::query(
-        "TRUNCATE treasury_events, mint_intents, chain_outbox, reconciliation_runs, alerts RESTART IDENTITY CASCADE",
+        "TRUNCATE treasury_events, mint_intents, chain_outbox, reconciliation_runs, alerts, gasfree_accounts RESTART IDENTITY CASCADE",
     )
     .execute(&pool)
     .await
@@ -102,6 +102,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         redemption_fee_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
+        gasfree: None,
     }
 }
 
@@ -998,4 +999,331 @@ async fn the_reserve_includes_the_payout_float() {
     let total = client.get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT).await.unwrap();
 
     assert_eq!(total, 1000, "float USDT is reserve backing CLT, not spare money");
+}
+
+/// A transfer between two reads of the walk would be counted twice: a walk that saw custody move is refused.
+#[tokio::test]
+async fn a_reserve_walk_that_saw_custody_move_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains(REAL_MAIN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [format!("{:064x}", 700)]})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_balance(&server, REAL_MAIN, 900).await;
+    mount_balance(&server, FLOAT, 300).await;
+
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+    let err = client
+        .get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT)
+        .await
+        .expect_err("a walk that saw custody move is not a sum");
+
+    assert!(err.contains("moved while the reserve was read"), "{err}");
+}
+
+// --- GasFree (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §2) ---
+//
+// With GasFree on, a deposit at a user's GasFree account mints what arrived less the most a sweep
+// may pay the relay. The signer, which derives both addresses of an index, says which one the
+// deposit was paid to; the same wiremock server stands in for it and for TronGrid.
+
+/// The plain address of index 7 in these tests. The treasury never derives it.
+const PLAIN_7: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+/// A valid address that is neither of index 7's.
+const NOT_OF_7: &str = "TYJPRrdB5APNeRs4R7fYZSwW3TcrTKw2gx";
+
+fn gasfree_7() -> String {
+    gasfree::gasfree_address(&gasfree::NILE, PLAIN_7).unwrap()
+}
+
+/// Nile, with the maxima the design sizes against Nile's live fees (1.00 and 0.30).
+fn nile() -> gasfree::Settings {
+    gasfree::Settings {
+        chain: &gasfree::NILE,
+        rail: true,
+        activate_fee_max_usdt: 1_500_000,
+        transfer_fee_max_usdt: 500_000,
+        min_deposit_usdt: 1_000_000,
+        expected_beacon_implementation: "b8eda40b467b45af107f198e94cc2fa1378adf50".into(),
+        expected_controller_implementation: "2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441".into(),
+    }
+}
+
+fn gasfree_config(server: &MockServer) -> treasury_service::configuration::AppConfig {
+    let mut config = test_config(server.uri());
+    config.signer_url = server.uri();
+    config.gasfree = Some(nile());
+    config
+}
+
+/// The signer's `GET /internal/addresses/7`.
+async fn mount_addresses_of_7(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/internal/addresses/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"index": 7, "plain": PLAIN_7, "gasfree": gasfree_7()})))
+        .mount(server)
+        .await;
+}
+
+/// A confirmed deposit of `observed` at `address`, as TronGrid shows it.
+async fn mount_confirmed_deposit(server: &MockServer, address: &str, tx_id: &str, observed: i64) {
+    mount_trc20_list_for(server, address, vec![trc20_transfer_json(tx_id, address, USDT, &observed.to_string())]).await;
+    mount_transaction_confirmed(server, tx_id, true).await;
+}
+
+/// A `created` deposit-backed intent at `address`, with the index the orchestrator reported.
+async fn seed_indexed_intent(pool: &PgPool, amount_clt: i64, expected: i64, tx_id: &str, address: &str, index: Option<i64>) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
+             deposit_address, derivation_index)
+         VALUES ($1, 'TBeneficiary1111111111111111111111', $2, $3, 'orchestrator', $4, $5, $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(amount_clt)
+    .bind(format!("ref-{id}"))
+    .bind(format!("client-{id}"))
+    .bind(tx_id)
+    .bind(expected)
+    .bind(address)
+    .bind(index)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// (amount_clt, fee_held_usdt) of an intent.
+async fn minted_and_held(pool: &PgPool, id: Uuid) -> (i64, Option<i64>) {
+    sqlx::query_as("SELECT amount_clt, fee_held_usdt FROM mint_intents WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn outbox_rows(pool: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM chain_outbox WHERE intent_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn gasfree_accounts(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM gasfree_accounts").fetch_one(pool).await.unwrap()
+}
+
+/// A first deposit holds back activation and one transfer: 10.00 in, 8.00 minted, 2.00 held.
+#[tokio::test]
+async fn a_first_gasfree_deposit_mints_what_arrived_less_activation_and_one_transfer() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-first", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-first", &gasfree_7(), Some(7)).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(approved, 1);
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(minted_and_held(&pool, id).await, (8_000_000, Some(2_000_000)));
+    assert_eq!(outbox_rows(&pool, id).await, 1);
+    let custody: i64 = sqlx::query_scalar(
+        "SELECT amount_usdt FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_deposit'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(custody, 10_000_000, "the ledger records everything that arrived");
+    let (owner, seen): (String, bool) = sqlx::query_as(
+        "SELECT owner_address, first_transfer_at IS NOT NULL FROM gasfree_accounts WHERE derivation_index = 7",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, PLAIN_7, "the permit's owner is recorded for the sweeper's nonce check");
+    assert!(!seen, "no sweep of this account has run yet");
+}
+
+/// Once the treasury's own sweeper saw a sweep of this account run, one transfer fee is enough.
+#[tokio::test]
+async fn once_the_treasury_saw_its_own_first_sweep_one_transfer_fee_is_held() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-later", 10_000_000).await;
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address, first_transfer_at)
+         VALUES (7, $1, $2, now())",
+    )
+    .bind(gasfree_7())
+    .bind(PLAIN_7)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-later", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(minted_and_held(&pool, id).await, (9_500_000, Some(500_000)));
+}
+
+/// The orchestrator proposes the mint and cannot raise it: anything above what arrived less the fee is capped.
+#[tokio::test]
+async fn the_orchestrator_cannot_mint_more_than_arrived_less_the_fee() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-greedy", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 25_000_000, 10_000_000, "tx-gf-greedy", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(minted_and_held(&pool, id).await, (8_000_000, Some(2_000_000)));
+}
+
+/// Spec §2: below the minimum after the fee, nothing is minted and a human decides. The amount is
+/// lowered first, so an approval can never mint more than arrived less the fee.
+#[tokio::test]
+async fn a_gasfree_deposit_below_the_minimum_is_held_for_a_human_and_mints_nothing() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-small", 2_500_000).await;
+    let id = seed_indexed_intent(&pool, 2_500_000, 2_500_000, "tx-gf-small", &gasfree_7(), Some(7)).await;
+
+    let approved = treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(approved, 0);
+    assert_eq!(status_of(&pool, id).await, "needs_manual");
+    assert_eq!(minted_and_held(&pool, id).await, (500_000, Some(2_000_000)));
+    assert_eq!(outbox_rows(&pool, id).await, 0, "nothing mints until a human approves it");
+    let custody: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_deposit'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(custody, 1, "the deposit arrived, so the ledger records it");
+    let pages: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alerts WHERE severity = 'p1' AND source = 'tron_verifier' AND message LIKE '%below the minimum%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pages, 1);
+}
+
+#[tokio::test]
+async fn a_gasfree_deposit_the_fee_takes_whole_is_rejected() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-dust", 2_000_000).await;
+    let id = seed_indexed_intent(&pool, 2_000_000, 2_000_000, "tx-gf-dust", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "rejected");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+    assert_eq!(gasfree_accounts(&pool).await, 1, "the account is recorded, so its USDT is still counted in the reserve");
+}
+
+/// With GasFree on, a user who still has a plain address is minted in full, as before.
+#[tokio::test]
+async fn a_deposit_to_the_plain_address_mints_in_full_with_gasfree_on() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, PLAIN_7, "tx-plain", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-plain", PLAIN_7, Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(minted_and_held(&pool, id).await, (10_000_000, None));
+    assert_eq!(gasfree_accounts(&pool).await, 0);
+}
+
+#[tokio::test]
+async fn an_address_its_index_does_not_lead_to_is_rejected() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, NOT_OF_7, "tx-stray", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-stray", NOT_OF_7, Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "rejected");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+}
+
+#[tokio::test]
+async fn while_the_signer_cannot_classify_it_the_deposit_waits() {
+    let pool = pool().await;
+    let server = MockServer::start().await; // no /internal/addresses mock: the signer answers 404
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-wait", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-wait", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "created", "retried on the next tick, never approved blind");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+}
+
+#[tokio::test]
+async fn with_gasfree_on_a_deposit_without_an_index_waits() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_addresses_of_7(&server).await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-noindex", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-noindex", &gasfree_7(), None).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "created");
+    let asked = server.received_requests().await.unwrap_or_default();
+    assert!(
+        asked.iter().all(|r| !r.url.path().starts_with("/internal/addresses")),
+        "without an index there is nothing to ask the signer"
+    );
+}
+
+/// A signer with GasFree off answers `null` for the GasFree account, while this service's settings
+/// say the deposit sits at one. The two services disagree, so the deposit waits and a human is
+/// paged once, rather than being rejected into a hand-made mint with no fee held back.
+#[tokio::test]
+async fn a_gasfree_deposit_waits_while_the_signer_disagrees_about_its_account() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/addresses/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"index": 7, "plain": PLAIN_7, "gasfree": null})))
+        .mount(&server)
+        .await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-off", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-off", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "created", "never rejected, never approved");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+    let pages: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alerts WHERE severity = 'p1' AND source = 'tron_verifier' AND message LIKE '%disagree%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pages, 1, "paged once, not every pass");
 }

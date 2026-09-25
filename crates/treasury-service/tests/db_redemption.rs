@@ -1,12 +1,16 @@
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use sqlx::PgPool;
+use tower::ServiceExt;
+use treasury_service::gasfree_rail::Trace;
 use treasury_service::intents::create_redemption_intent;
 use treasury_service::payout::{self, HttpPayoutSigner, PayoutReply, PayoutSigner};
 use treasury_service::tron_verifier::TronClient;
 use treasury_service::watcher::confirm_burn;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn pool() -> PgPool {
@@ -175,18 +179,7 @@ impl PayoutSigner for CountingSigner {
     async fn pay(&self, _intent_id: Uuid, _to: &str, amount_usdt: i64) -> PayoutReply {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.last_amount.store(amount_usdt, Ordering::SeqCst);
-        match &self.reply {
-            PayoutReply::Paid { tx_id } => PayoutReply::Paid { tx_id: tx_id.clone() },
-            PayoutReply::Ambiguous(m) => PayoutReply::Ambiguous(m.clone()),
-            PayoutReply::CapExceeded { limit_usdt } => PayoutReply::CapExceeded { limit_usdt: *limit_usdt },
-            PayoutReply::FloatDry { float_address, have_usdt, need_usdt } => PayoutReply::FloatDry {
-                float_address: float_address.clone(),
-                have_usdt: *have_usdt,
-                need_usdt: *need_usdt,
-            },
-            PayoutReply::NeedsTrx => PayoutReply::NeedsTrx,
-            PayoutReply::Refused(m) => PayoutReply::Refused(m.clone()),
-        }
+        self.reply.clone()
     }
 }
 
@@ -260,6 +253,7 @@ fn config() -> treasury_service::configuration::AppConfig {
         redemption_fee_usdt: 0,
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
+        gasfree: None,
     }
 }
 
@@ -713,4 +707,463 @@ async fn the_ledger_records_the_usdt_that_actually_left() {
         "SELECT amount_usdt FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'")
         .bind(id).fetch_one(&pool).await.unwrap();
     assert_eq!(amount_usdt, 9_500_000, "the ledger must record the net, or the reserve reads low by the fee");
+}
+
+// --- GasFree payouts (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §4, §5) ---
+
+/// `config().payout_float_address`: on this rail, F = gasfree(2/0).
+const FLOAT: &str = "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY";
+/// The plain 2/0 address that owns the float, as the signer's /internal/xpub names it.
+const FLOAT_OWNER: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+/// `pending_redemption`'s payout address.
+const REDEEMER: &str = "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK";
+const PAYOUT_TRACE: &str = "6ab4c27c-f66b-4328-b40f-ffdc6cf1ca60";
+const USDT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+
+fn nile() -> gasfree::Settings {
+    gasfree::Settings {
+        chain: &gasfree::NILE,
+        rail: true,
+        activate_fee_max_usdt: 1_500_000,
+        transfer_fee_max_usdt: 500_000,
+        min_deposit_usdt: 1_000_000,
+        expected_beacon_implementation: "b8eda40b467b45af107f198e94cc2fa1378adf50".into(),
+        expected_controller_implementation: "2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441".into(),
+    }
+}
+
+fn gasfree_config(trongrid_url: String) -> treasury_service::configuration::AppConfig {
+    let mut cfg = config();
+    cfg.trongrid_url = trongrid_url;
+    cfg.gasfree = Some(nile());
+    cfg
+}
+
+fn counting(reply: PayoutReply) -> CountingSigner {
+    CountingSigner { reply, calls: AtomicUsize::new(0), last_amount: AtomicI64::new(0) }
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The signer's GasFree reads, faked: the relay's record names `txn_hash`, and FLOAT_OWNER owns FLOAT.
+struct GasFreeReads {
+    txn_hash: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl PayoutSigner for GasFreeReads {
+    async fn pay(&self, _intent_id: Uuid, _to: &str, _amount_usdt: i64) -> PayoutReply {
+        panic!("settling a payout must never sign another")
+    }
+    async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
+        Ok(Trace { state: "SUCCEED".into(), txn_hash: self.txn_hash.map(str::to_string), txn_amount: None })
+    }
+    async fn float_owner(&self) -> Result<(String, Option<String>), String> {
+        Ok((FLOAT_OWNER.into(), Some(FLOAT.into())))
+    }
+}
+
+/// A redemption whose GasFree permit is out: claimed, with the permit's trace (if any), nonce and deadline.
+async fn permit_out(pool: &PgPool, amount: i64, trace: Option<&str>, nonce: i64, deadline: i64) -> Uuid {
+    let id = pending_redemption(pool, amount).await;
+    sqlx::query(
+        "UPDATE redemption_intents
+            SET status = 'payout_submitted', payout_submitted_at = now(),
+                payout_trace_id = $2, payout_permit_nonce = $3, payout_permit_deadline = $4
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(trace)
+    .bind(nonce)
+    .bind(deadline)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// The float's confirmed USDT history: one GasFree payout is two transfers from the float in one
+/// transaction, the redeemer's and the relay's fee.
+async fn mount_float_history(server: &MockServer, tx_id: &str, to: &str, value: i64) {
+    let at = chrono::Utc::now().timestamp_millis();
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{FLOAT}/transactions/trc20")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [
+            {"transaction_id": tx_id, "from": FLOAT, "to": to, "value": value.to_string(), "type": "Transfer",
+             "token_info": {"address": USDT}, "block_timestamp": at},
+            {"transaction_id": tx_id, "from": FLOAT, "to": "TLntW9Z59LYY5KEi9cmwk3PKjQga828ird", "value": "300000",
+             "type": "Transfer", "token_info": {"address": USDT}, "block_timestamp": at},
+        ]})))
+        .mount(server)
+        .await;
+}
+
+async fn mount_float_nonce(server: &MockServer, nonce: u64) {
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains("nonces(address)"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"constant_result": [format!("{nonce:064x}")]})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// (status, payout_ref, payout_permit_nonce)
+async fn state_of(pool: &PgPool, id: Uuid) -> (String, Option<String>, Option<i64>) {
+    sqlx::query_as("SELECT status, payout_ref, payout_permit_nonce FROM redemption_intents WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn payout_alerts(pool: &PgPool, severity: &str, containing: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM alerts WHERE source = 'payout' AND severity = $1 AND message LIKE '%' || $2 || '%'",
+    )
+    .bind(severity)
+    .bind(containing)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_gasfree_payout_answers_are_read_field_by_field() {
+    for (body, want) in [
+        (
+            serde_json::json!({"status": "submitted", "trace_id": PAYOUT_TRACE, "nonce": 4, "deadline": 1_790_000_000u64}),
+            PayoutReply::Submitted { trace_id: PAYOUT_TRACE.into(), nonce: 4, deadline: 1_790_000_000 },
+        ),
+        (
+            serde_json::json!({"status": "refused", "reason": "the relay refused the payout permit: NonceNotMatchException",
+                               "nonce": 4, "deadline": 1_790_000_000u64}),
+            PayoutReply::RelayRefused {
+                reason: "the relay refused the payout permit: NonceNotMatchException".into(),
+                nonce: 4,
+                deadline: 1_790_000_000,
+            },
+        ),
+        (
+            serde_json::json!({"status": "float_not_active", "float_address": FLOAT}),
+            PayoutReply::FloatNotActive { float_address: FLOAT.into() },
+        ),
+    ] {
+        let (_s, signer) = signer_replying(200, body.clone()).await;
+        assert_eq!(signer.pay(Uuid::new_v4(), REDEEMER, 5).await, want, "{body}");
+    }
+
+    // A permit this service could not follow is not a clear answer.
+    for body in [
+        serde_json::json!({"status": "submitted", "trace_id": PAYOUT_TRACE}),
+        serde_json::json!({"status": "refused", "reason": "x", "nonce": 4}),
+    ] {
+        let (_s, signer) = signer_replying(200, body.clone()).await;
+        let reply = signer.pay(Uuid::new_v4(), REDEEMER, 5).await;
+        assert!(matches!(reply, PayoutReply::Ambiguous(_)), "{body} gave {reply:?}");
+    }
+
+    // The float's owner, from the signer's /internal/xpub.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/xpub"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "account_xpub": "xpub-unused", "fee_address": "TFee", "payout_address": FLOAT_OWNER, "payout_gasfree_address": FLOAT,
+        })))
+        .mount(&server)
+        .await;
+    let signer = HttpPayoutSigner { http: reqwest::Client::new(), base_url: server.uri(), token: "t".into() };
+    assert_eq!(signer.float_owner().await, Ok((FLOAT_OWNER.to_string(), Some(FLOAT.to_string()))));
+}
+
+/// One GasFree payout permit alive at a time: a second would carry the same nonce.
+#[tokio::test]
+async fn a_gasfree_payout_permit_holds_every_other_payout_until_it_is_settled() {
+    let pool = pool().await;
+    let first = pending_redemption(&pool, 10_000_000).await;
+    let second = pending_redemption(&pool, 5_000_000).await;
+    let signer = counting(PayoutReply::Submitted { trace_id: PAYOUT_TRACE.into(), nonce: 4, deadline: (now() + 180) as u64 });
+    let cfg = gasfree_config("http://unused".into());
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let (trace, nonce): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT payout_trace_id, payout_permit_nonce FROM redemption_intents WHERE id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((trace.as_deref(), nonce), (Some(PAYOUT_TRACE), Some(4)));
+    assert_eq!(state_of(&pool, second).await.0, "payout_pending");
+}
+
+#[tokio::test]
+async fn a_gasfree_payout_is_paid_once_its_transfer_from_the_float_is_confirmed() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_history(&server, "tx-gf-payout", REDEEMER, 10_000_000).await;
+    let id = permit_out(&pool, 10_000_000, Some(PAYOUT_TRACE), 4, now() + 180).await;
+
+    let paid = payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: Some("tx-gf-payout") },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(paid, 1);
+    assert_eq!(state_of(&pool, id).await, ("paid".into(), Some("tx-gf-payout".into()), Some(4)));
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT amount_usdt FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_withdrawal'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(withdrawn, 10_000_000);
+}
+
+#[tokio::test]
+async fn a_transfer_that_does_not_pay_this_redemption_is_not_taken_as_its_payment() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_history(&server, "tx-gf-payout", REDEEMER, 9_999_999).await;
+    let id = permit_out(&pool, 10_000_000, Some(PAYOUT_TRACE), 4, now() + 180).await;
+
+    let paid = payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: Some("tx-gf-payout") },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(paid, 0);
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)));
+}
+
+/// After the deadline, a refused permit that did not run never can: the redemption is paid again.
+#[tokio::test]
+async fn a_refused_permit_goes_back_to_be_paid_once_its_deadline_passed_and_it_never_ran() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_nonce(&server, 4).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 400).await;
+
+    payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: None },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state_of(&pool, id).await, ("payout_pending".into(), None, None));
+}
+
+/// Past its deadline but inside the grace after it, a refused permit may still show up on chain: it is
+/// left alone, even though the float's nonce says it has not run.
+#[tokio::test]
+async fn a_refused_permit_inside_the_grace_after_its_deadline_is_left_alone() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_nonce(&server, 4).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 120).await;
+
+    payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: None },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)));
+}
+
+/// The nonce moved and no transfer paying this redemption was found: it may be paid, so it goes to a
+/// human and no longer holds the float.
+#[tokio::test]
+async fn a_permit_whose_nonce_moved_without_a_transfer_is_left_for_a_human() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_nonce(&server, 5).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 400).await;
+
+    payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: None },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, None));
+    assert_eq!(payout_alerts(&pool, "p1", "may have been paid").await, 1);
+}
+
+#[tokio::test]
+async fn a_relay_refusal_is_not_retried_before_its_deadline() {
+    let pool = pool().await;
+    let id = pending_redemption(&pool, 10_000_000).await;
+    let signer = counting(PayoutReply::RelayRefused {
+        reason: "the relay refused the payout permit: NonceNotMatchException".into(),
+        nonce: 4,
+        deadline: (now() + 180) as u64,
+    });
+    let cfg = gasfree_config("http://unused".into());
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1, "the refused permit is valid until its deadline");
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)));
+}
+
+/// A signer on GasFree behind a treasury with GasFree off: the permit is recorded, and it pages once.
+#[tokio::test]
+async fn a_gasfree_payout_to_a_treasury_with_gasfree_off_pages_once() {
+    let pool = pool().await;
+    let id = pending_redemption(&pool, 10_000_000).await;
+    let signer = counting(PayoutReply::Submitted { trace_id: "trace-1".into(), nonce: 4, deadline: (now() + 180) as u64 });
+    let cfg = config();
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(payout_alerts(&pool, "p1", "GasFree off").await, 1, "paged once, not every pass");
+    assert_eq!(state_of(&pool, id).await.0, "payout_submitted", "the permit is recorded, never dropped");
+}
+
+/// Spec §4: until the float's one-time activation, redemptions are "not available yet".
+#[tokio::test]
+async fn redemptions_wait_for_the_gasfree_floats_activation_and_it_is_said_once() {
+    let pool = pool().await;
+    let first = pending_redemption(&pool, 10_000_000).await;
+    let second = pending_redemption(&pool, 5_000_000).await;
+    let signer = counting(PayoutReply::FloatNotActive { float_address: FLOAT.into() });
+    let cfg = gasfree_config("http://unused".into());
+
+    for _ in 0..3 {
+        payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    }
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 3, "one call per pass: every redemption would get the same answer");
+    assert_eq!(state_of(&pool, first).await.0, "payout_pending");
+    assert_eq!(state_of(&pool, second).await.0, "payout_pending");
+    assert_eq!(payout_alerts(&pool, "warn", "not available yet").await, 1);
+}
+
+/// An answer that may have sent a permit, with its nonce unknown: nothing else is signed until that
+/// permit could no longer run.
+#[tokio::test]
+async fn an_ambiguous_gasfree_payout_holds_the_float_for_the_longest_deadline() {
+    let pool = pool().await;
+    let first = pending_redemption(&pool, 10_000_000).await;
+    pending_redemption(&pool, 5_000_000).await;
+    let signer = counting(PayoutReply::Ambiguous("the relay gave no clear answer".into()));
+    let cfg = gasfree_config("http://unused".into());
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let deadline: Option<i64> =
+        sqlx::query_scalar("SELECT payout_permit_deadline FROM redemption_intents WHERE id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let held = deadline.expect("a deadline holds the float") - now();
+    assert!((890..=910).contains(&held), "held for the longest deadline plus the grace, about 900 s, got {held}");
+    assert_eq!(payout_alerts(&pool, "p1", "do not return this intent").await, 1, "the page says when the intent may be returned");
+}
+
+/// Spec §4: a redemption is refused before anything exists to burn against while the float's next
+/// transfer would also pay its activation.
+#[tokio::test]
+async fn a_redemption_is_refused_until_the_gasfree_float_is_activated() {
+    let pool = pool().await;
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/internal/redemption-intents")
+            .header("authorization", "Bearer i")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "redeemer_address": "0xaaaa000000000000000000000000000000000009",
+                    "payout_address": REDEEMER,
+                    "amount_clt": 10_000_000,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let never_moved = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/getcontract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&never_moved)
+        .await;
+    let app = treasury_service::api::router(pool.clone(), gasfree_config(never_moved.uri()));
+    assert_eq!(app.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM redemption_intents").fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, 0, "nothing exists to burn against");
+
+    let activated = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/getcontract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"contract_address": "41ab", "bytecode": ""})))
+        .mount(&activated)
+        .await;
+    let app = treasury_service::api::router(pool.clone(), gasfree_config(activated.uri()));
+    assert_eq!(app.oneshot(request()).await.unwrap().status(), StatusCode::CREATED);
+}
+
+/// Two redemptions of the same amount to one address: the first one's transaction must not be taken
+/// as the second one's payment, even when the relay names it — the chain says it paid the first.
+#[tokio::test]
+async fn a_transaction_that_already_paid_another_redemption_is_not_taken_as_this_ones() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_history(&server, "tx-gf-payout", REDEEMER, 10_000_000).await;
+    let first = pending_redemption(&pool, 10_000_000).await;
+    sqlx::query("UPDATE redemption_intents SET status = 'paid', payout_ref = 'tx-gf-payout' WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let second = permit_out(&pool, 10_000_000, Some(PAYOUT_TRACE), 4, now() + 180).await;
+
+    let paid = payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: Some("tx-gf-payout") },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(paid, 0);
+    assert_eq!(state_of(&pool, second).await, ("payout_submitted".into(), None, Some(4)));
+    assert_eq!(payout_alerts(&pool, "p1", "already paid").await, 1);
 }

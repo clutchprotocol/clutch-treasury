@@ -160,6 +160,11 @@ pub struct AppConfig {
     pub redemption_fee_usdt: i64,
     pub signer_url: String,
     pub signer_token: String,
+    /// GasFree (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md), read by `load`
+    /// from the environment with `gasfree::load_settings`, never from TOML. `None`, the default, is
+    /// the TRX rail exactly as before.
+    #[serde(skip)]
+    pub gasfree: Option<gasfree::Settings>,
 }
 
 impl AppConfig {
@@ -180,7 +185,7 @@ impl AppConfig {
 
     pub fn load(env: &str) -> Result<Self, ConfigError> {
         dotenv().ok();
-        let cfg: Self = Config::builder()
+        let mut cfg: Self = Config::builder()
             .add_source(File::with_name(&format!("config/{}.toml", env)))
             .add_source(Environment::with_prefix("APP"))
             .build()?
@@ -249,6 +254,9 @@ impl AppConfig {
             );
         }
         assert!(cfg.backing_halt_bps <= cfg.backing_target_bps, "halt bps above target bps");
+        // From the environment only, like the secrets above: the three services read the same
+        // variables from one env file (spec §6), and a half-set rail stops the service here.
+        cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         Ok(cfg)
     }
 }
