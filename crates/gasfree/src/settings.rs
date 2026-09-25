@@ -33,7 +33,55 @@ pub struct Settings {
 /// missing one stops the service at boot, not at the first deposit. A blank value counts as unset,
 /// because the deploy repo passes an unset optional value as an empty string (`${X:-}`).
 pub fn load_settings(var: impl Fn(&str) -> Option<String>) -> Result<Option<Settings>, String> {
-    todo!("Task 1 Step 5")
+    let optional = |name: &str| var(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let rail = match optional("APP_TRANSFER_RAIL").as_deref() {
+        None | Some("trx") => false,
+        Some("gasfree") => true,
+        Some(other) => return Err(format!("APP_TRANSFER_RAIL must be trx or gasfree, got {other:?}")),
+    };
+    let Some(network) = optional("APP_GASFREE_NETWORK") else {
+        return if rail {
+            Err("APP_TRANSFER_RAIL=gasfree needs APP_GASFREE_NETWORK and the other GasFree settings".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let chain: &'static Chain = match network.as_str() {
+        "nile" => &NILE,
+        "mainnet" => &MAINNET,
+        other => return Err(format!("APP_GASFREE_NETWORK must be nile or mainnet, got {other:?}")),
+    };
+    let required =
+        |name: &str| optional(name).ok_or_else(|| format!("{name} must be set when APP_GASFREE_NETWORK is"));
+    let micro_usdt = |name: &str| required(name).and_then(|raw| positive_micro_usdt(name, &raw));
+    let implementation = |name: &str| required(name).and_then(|raw| implementation_hex(name, &raw));
+    Ok(Some(Settings {
+        chain,
+        rail,
+        activate_fee_max_usdt: micro_usdt("APP_GASFREE_ACTIVATE_FEE_MAX_USDT")?,
+        transfer_fee_max_usdt: micro_usdt("APP_GASFREE_TRANSFER_FEE_MAX_USDT")?,
+        min_deposit_usdt: micro_usdt("APP_MIN_DEPOSIT_USDT")?,
+        expected_beacon_implementation: implementation("APP_GASFREE_EXPECTED_IMPLEMENTATION")?,
+        expected_controller_implementation: implementation("APP_GASFREE_EXPECTED_CONTROLLER_IMPLEMENTATION")?,
+    }))
+}
+
+/// A zero maximum sizes every hold and every permit at nothing: the relay refuses such permits, and
+/// every sweep stops while the service looks set up.
+fn positive_micro_usdt(name: &str, raw: &str) -> Result<i64, String> {
+    match raw.parse::<i64>() {
+        Ok(v) if v > 0 => Ok(v),
+        _ => Err(format!("{name} must be a positive whole number of micro-USDT, got {raw:?}")),
+    }
+}
+
+/// `0xA3B0…` or `a3b0…` in, 40 lowercase hex characters out.
+fn implementation_hex(name: &str, raw: &str) -> Result<String, String> {
+    let hex = raw.trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase();
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{name} must be a 20-byte hex address like 0xa3b0edff…, got {raw:?}"));
+    }
+    Ok(hex)
 }
 
 #[cfg(test)]

@@ -65,7 +65,12 @@ impl Chain {
 
 impl std::fmt::Debug for Chain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("Task 1 Step 5")
+        // Not the creation code: it is 997 bytes of hex, and it is tested byte for byte elsewhere.
+        f.debug_struct("Chain")
+            .field("chain_id", &self.chain_id)
+            .field("controller", &self.controller)
+            .field("beacon", &self.beacon)
+            .finish_non_exhaustive()
     }
 }
 
