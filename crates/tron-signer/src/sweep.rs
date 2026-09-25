@@ -18,6 +18,17 @@
 //! Do not add a `to`, a `contract`, or an `amount` parameter. Each one individually converts this
 //! from "can only do the right thing" into "does whatever it is told by whoever got in".
 //!
+//! # On the GasFree rail, the fee is sized when the permit is signed
+//!
+//! A GasFree sweep's `maxFee` is fixed when the permit is signed, from the chain's record of
+//! whether the account is activated at that moment. The treasury sizes what it holds back when it
+//! mints. The two agree only when every deposit a sweep moves was credited first, and the treasury
+//! treats an account as activated only after it has seen that account's first transfer itself.
+//! The treasury's own sweeper keeps to the first rule — it sweeps credited deposits only — but a
+//! sweep requested any other way can move a deposit before it is credited. So on this rail the
+//! claim above, that a request's safety does not depend on who sends it, holds only together with
+//! the treasury's hold rule (spec §2; Plan 3).
+//!
 //! # Sweeping the whole balance, not the deposited amount
 //!
 //! A derived address exists for exactly one deposit, so anything sitting there is that deposit —
@@ -42,6 +53,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::keys::Signer;
+
+mod gasfree_rail;
+
+pub use gasfree_rail::{
+    activate_float_response, load_gasfree_config, trace_response, ActivateFloatOutcome, GasFreeConfig, SelfTest,
+};
 
 /// Enough TRX at a deposit address to pay for the one TRC-20 transfer that sweeps it.
 ///
@@ -133,6 +150,34 @@ pub enum SweepOutcome {
     /// The fee account has run out of TRX. The only outcome here that no automation can resolve —
     /// an operator has to top the account up, and until they do every sweep stalls.
     FeeAccountDry { fee_address: String, have_sun: i64, need_sun: i64 },
+    /// A GasFree permit is with the relay. NOT yet swept: once it runs, `receiver` gets
+    /// `value_usdt` and the relay takes at most `max_fee_usdt` on top. The GasFree account keeps
+    /// whatever of `max_fee_usdt` the relay did not take — it never falls to 0, and after an
+    /// activation it can keep more than one transfer fee — so decide "swept" from the chain: the
+    /// controller's `nonces(owner)` moving past `nonce`. After `deadline` the permit can no longer
+    /// run.
+    Pending {
+        trace_id: String,
+        gasfree_address: String,
+        receiver: String,
+        value_usdt: i64,
+        max_fee_usdt: i64,
+        nonce: u64,
+        deadline: u64,
+    },
+    /// A transfer from this GasFree account is already in flight. Nothing was signed; try next pass.
+    Busy { gasfree_address: String },
+    /// The relay refused the permit. `reason` is its exception name. `MaxFeeExceededException`
+    /// means the live fee rose above the configured maximum: the deposit stays put, still counted,
+    /// and a human must decide — never a higher `maxFee` than the treasury held back.
+    Rejected { reason: String, message: String },
+    /// Nothing was signed, and nothing will be until a human acts: GasFree's code changed, or the
+    /// relay and this signer disagree about an address.
+    Halted { reason: String },
+    /// The GasFree account holds at most `max_fee_usdt` — `fee_to_hold` for its activation state,
+    /// so the activation fee is included until the first transfer — and the plain address holds
+    /// nothing. Not an error on its own; a later deposit to the same account lifts it over the fee.
+    BelowFee { gasfree_address: String, balance_usdt: i64, max_fee_usdt: i64 },
 }
 
 /// What one payout attempt did. Mirrors `SweepOutcome`: the caller must be able to tell "refused,
@@ -143,7 +188,8 @@ pub enum PayoutOutcome {
     /// Broadcast accepted; `tx_id` is the on-chain transfer.
     Paid { tx_id: String },
     /// The float does not hold enough USDT. Proof that nothing was broadcast. Only an operator
-    /// topping the float up resolves it.
+    /// topping the float up resolves it on the TRX rail; on the GasFree rail, sweeps refill the
+    /// GasFree float until it holds its target (spec §4).
     FloatDry { float_address: String, have_usdt: i64, need_usdt: i64 },
     /// Above `per_tx_payout_cap_usdt`. Proof that nothing was broadcast.
     CapExceeded { limit_usdt: i64 },
@@ -160,7 +206,27 @@ pub enum PayoutOutcome {
     /// the treasury) even though some of ITS internal failures (a txID mismatch, a node rejecting
     /// the broadcast) are, in principle, also provable non-broadcasts. Drawing the line at the
     /// call rather than inside it keeps that guarantee simple enough to trust.
+    ///
+    /// The GasFree rail (`sweep/gasfree_rail.rs`) keeps the same rule with one exception. After a
+    /// signed payout permit was handed to the relay, a reply is a refusal only when the relay
+    /// refused it with one of `PRE_EXECUTION_REFUSALS` — the refusals the GasFree docs list as its
+    /// checks before execution — and that refusal is `RelayRefused`, not `Refused`. At that point
+    /// the relay holds a signed permit, and only its word says the permit will not run; that is the
+    /// trust the design already places in the pinned relay. Any other answer after the permit was
+    /// sent is `Err`, and so ambiguous.
     Refused(String),
+    /// A GasFree permit paying `to` is with the relay. Not yet paid: the treasury follows
+    /// `trace_id` to the on-chain transaction and confirms it there, as it confirms a TRX payout.
+    /// `nonce` and `deadline` are the signed permit's.
+    Submitted { trace_id: String, nonce: u64, deadline: u64 },
+    /// `Refused`, plus the identity of the refused permit: the relay refused a signed payout permit
+    /// with one of `PRE_EXECUTION_REFUSALS`. Its wire status is `refused`, so the treasury reads it
+    /// as a refusal; `nonce` and `deadline` let it later tell from the chain whether that permit ran.
+    RelayRefused { reason: String, nonce: u64, deadline: u64 },
+    /// The GasFree float has never made a transfer, so its next one would also pay the activation
+    /// fee, which a redemption's fee does not cover. Provably nothing was signed. Only the one-time
+    /// activation (`/internal/activate-float`) resolves it.
+    FloatNotActive { float_address: String },
 }
 
 /// What one fund-float attempt did. Same reason the other two exist: whoever reads the reply must
@@ -186,6 +252,45 @@ pub enum FundFloatOutcome {
     Refused(String),
 }
 
+/// The wire form of a sweep outcome.
+///
+/// A contract with treasury-service's `HttpSigner`, which treats any status it does not know as a
+/// failure — so a typo here stalls sweeps rather than moving money. The first four are the same
+/// literals the handler sent before GasFree existed.
+pub fn sweep_response(outcome: &SweepOutcome) -> serde_json::Value {
+    use serde_json::json;
+    match outcome {
+        SweepOutcome::Swept { tx_id, amount_usdt } => json!({"status": "swept", "tx_id": tx_id, "amount_usdt": amount_usdt}),
+        SweepOutcome::NothingToSweep => json!({"status": "nothing_to_sweep"}),
+        SweepOutcome::Funded { tx_id, amount_sun } => json!({"status": "funded", "tx_id": tx_id, "amount_sun": amount_sun}),
+        SweepOutcome::FeeAccountDry { fee_address, have_sun, need_sun } => json!({
+            "status": "fee_account_dry",
+            "fee_address": fee_address,
+            "have_sun": have_sun,
+            "need_sun": need_sun,
+        }),
+        SweepOutcome::Pending { trace_id, gasfree_address, receiver, value_usdt, max_fee_usdt, nonce, deadline } => json!({
+            "status": "pending",
+            "trace_id": trace_id,
+            "gasfree_address": gasfree_address,
+            "receiver": receiver,
+            "value_usdt": value_usdt,
+            "max_fee_usdt": max_fee_usdt,
+            "nonce": nonce,
+            "deadline": deadline,
+        }),
+        SweepOutcome::Busy { gasfree_address } => json!({"status": "busy", "gasfree_address": gasfree_address}),
+        SweepOutcome::Rejected { reason, message } => json!({"status": "rejected", "reason": reason, "message": message}),
+        SweepOutcome::Halted { reason } => json!({"status": "halted", "reason": reason}),
+        SweepOutcome::BelowFee { gasfree_address, balance_usdt, max_fee_usdt } => json!({
+            "status": "below_fee",
+            "gasfree_address": gasfree_address,
+            "balance_usdt": balance_usdt,
+            "max_fee_usdt": max_fee_usdt,
+        }),
+    }
+}
+
 /// The wire form of a payout outcome.
 ///
 /// Separate from the handler so the status strings are testable without an HTTP rig. These
@@ -206,6 +311,16 @@ pub fn payout_response(outcome: &PayoutOutcome) -> serde_json::Value {
         }),
         PayoutOutcome::NeedsTrx { tx_id, amount_sun } => {
             serde_json::json!({"status": "needs_trx", "tx_id": tx_id, "amount_sun": amount_sun})
+        }
+        PayoutOutcome::Submitted { trace_id, nonce, deadline } => {
+            serde_json::json!({"status": "submitted", "trace_id": trace_id, "nonce": nonce, "deadline": deadline})
+        }
+        // `refused`, so the treasury reads it as it reads any other refusal.
+        PayoutOutcome::RelayRefused { reason, nonce, deadline } => {
+            serde_json::json!({"status": "refused", "reason": reason, "nonce": nonce, "deadline": deadline})
+        }
+        PayoutOutcome::FloatNotActive { float_address } => {
+            serde_json::json!({"status": "float_not_active", "float_address": float_address})
         }
         PayoutOutcome::Refused(reason) => serde_json::json!({"status": "refused", "reason": reason}),
     }
@@ -362,11 +477,26 @@ struct AccountRow {
 pub struct SweepClient {
     http: reqwest::Client,
     cfg: SweepConfig,
+    /// `None` unless GasFree is configured. While it is `None` nothing in this service derives,
+    /// reads or signs for a GasFree address — the state every signer is in until someone sets
+    /// `APP_GASFREE_API_KEY`.
+    gasfree: Option<gasfree_rail::GasFree>,
 }
 
 impl SweepClient {
     pub fn new(cfg: SweepConfig) -> Self {
-        Self { http: reqwest::Client::new(), cfg }
+        Self { http: reqwest::Client::new(), cfg, gasfree: None }
+    }
+
+    /// Turn the GasFree rail on.
+    pub fn with_gasfree(mut self, cfg: GasFreeConfig) -> Self {
+        self.gasfree = Some(gasfree_rail::GasFree::new(cfg));
+        self
+    }
+
+    /// The GasFree address of the wallet `plain`, when GasFree is on.
+    pub fn gasfree_address_for(&self, plain: &str) -> Result<Option<String>, String> {
+        self.gasfree.as_ref().map(|gf| gasfree::gasfree_address(gf.cfg.chain, plain)).transpose()
     }
 
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -485,16 +615,31 @@ impl SweepClient {
         Ok(resp.data.first().map(|a| a.balance).unwrap_or(0))
     }
 
-    /// Move everything at `index` to the configured treasury address.
+    /// Sweep what `index` holds: its GasFree account first, by permit to the payout float or
+    /// custody, then its plain address, to custody.
     ///
     /// The destination and the token are this service's config; only the index comes from the
     /// caller. See the module docs for why that is the whole point.
     pub async fn sweep(&self, signer: &Signer, index: u32) -> Result<SweepOutcome, String> {
         let from = signer.address_at(index)?;
 
+        // The GasFree account first, and only when GasFree is on. Its dust — a balance that cannot
+        // pay its own fee — must not stop the plain address below from being swept.
+        let mut gasfree_dust = None;
+        if let Some(gf) = &self.gasfree {
+            let g = gasfree::gasfree_address(gf.cfg.chain, &from)?;
+            let balance = self.usdt_balance(&g).await?;
+            if balance > 0 {
+                match self.sweep_gasfree(gf, signer, index, &from, &g, balance).await? {
+                    dust @ SweepOutcome::BelowFee { .. } => gasfree_dust = Some(dust),
+                    other => return Ok(other),
+                }
+            }
+        }
+
         let amount = self.usdt_balance(&from).await?;
         if amount == 0 {
-            return Ok(SweepOutcome::NothingToSweep);
+            return Ok(gasfree_dust.unwrap_or(SweepOutcome::NothingToSweep));
         }
 
         // Deliberately AFTER the balance check above: an address holding no USDT returns
@@ -553,6 +698,12 @@ impl SweepClient {
         // reads and can trigger a real TRX funding broadcast before failing at transfer_parameter.
         if amount_usdt <= 0 {
             return Ok(PayoutOutcome::Refused(format!("payout amount must be positive, got {amount_usdt}")));
+        }
+
+        // The GasFree float pays when redemptions are on that rail. Same two checks above, first,
+        // for both rails.
+        if let Some(gf) = self.gasfree.as_ref().filter(|gf| gf.cfg.payouts) {
+            return self.payout_gasfree(gf, signer, to, amount_usdt).await;
         }
 
         // Everything from here down to the call to `sign_and_broadcast` is provably pre-broadcast:

@@ -15,7 +15,7 @@ mismatch treated as a P1 that halts minting rather than as a dashboard metric.
 |-------|------|-------|
 | `treasury-service` | The ledger, four-eyes minting, reconciliation, sweeping, redemption payouts | the mint authority key |
 | `payment-orchestrator` | The browser-facing deposit and redemption API; derives and polls deposit addresses | the account **xpub** only — it cannot spend |
-| `tron-signer` | Signs TRON transactions: sweeps and payouts | the deposit wallet **mnemonic** |
+| `tron-signer` | Signs TRON transactions and GasFree permits: sweeps and payouts | the deposit wallet **mnemonic**, and the GasFree API key |
 | `clutch-chain` | Shared chain client: builds, signs and submits CLT transactions | — |
 | `gasfree` | GasFree address derivation and permit hashing, one copy shared by the orchestrator and the signer | — |
 

@@ -26,3 +26,9 @@ tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+# The GasFree rail (sweep/gasfree_rail.rs, relay.rs). The pure crate derives GasFree addresses and
+# permit hashes; hmac and base64 sign the relay's API requests. Both versions are already in the
+# lockfile, pulled in by other crates.
+gasfree = { path = "../gasfree" }
+hmac = "0.12"
+base64 = "0.22"
