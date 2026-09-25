@@ -757,11 +757,29 @@ async fn gasfree_verdict(
     if deposit_address == addresses.plain {
         return Verdict::Approve { cap: None };
     }
-    if addresses.gasfree.as_deref() != Some(deposit_address) {
+    // The signer's GasFree account must be the one this service's own settings give for the same
+    // plain address. A signer with GasFree off answers `null`, and one on another network answers a
+    // different address. Either way the two services disagree, and nothing here can say what this
+    // deposit may mint. It waits: rejecting it would hand a human a deposit to re-mint by hand, with
+    // no fee held back.
+    let ours = match gasfree::gasfree_address(settings.chain, &addresses.plain) {
+        Ok(g) => g,
+        Err(e) => return Verdict::Wait(format!("deriving the GasFree account of index {index}: {e}")),
+    };
+    if addresses.gasfree.as_deref() != Some(ours.as_str()) {
+        let message = format!(
+            "the signer puts the GasFree account of index {index} at {:?}, but this service's GasFree settings put it \
+             at {ours}: the two services' GasFree settings disagree. Deposits there wait until they agree.",
+            addresses.gasfree
+        );
+        alert_once(pool, "p1", "tron_verifier", &message, chrono::Duration::hours(1)).await;
+        return Verdict::Wait(message);
+    }
+    if deposit_address != ours {
         return Verdict::Reject(format!(
-            "deposit address {deposit_address} is neither the plain address {} nor the GasFree account {:?} of index \
+            "deposit address {deposit_address} is neither the plain address {} nor the GasFree account {ours} of index \
              {index}: no sweep of that index could move it",
-            addresses.plain, addresses.gasfree
+            addresses.plain
         ));
     }
     let seen_first_transfer = match record_account(pool, index, deposit_address, &addresses.plain).await {

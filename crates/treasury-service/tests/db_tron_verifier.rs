@@ -1274,3 +1274,32 @@ async fn with_gasfree_on_a_deposit_without_an_index_waits() {
         "without an index there is nothing to ask the signer"
     );
 }
+
+/// A signer with GasFree off answers `null` for the GasFree account, while this service's settings
+/// say the deposit sits at one. The two services disagree, so the deposit waits and a human is
+/// paged once, rather than being rejected into a hand-made mint with no fee held back.
+#[tokio::test]
+async fn a_gasfree_deposit_waits_while_the_signer_disagrees_about_its_account() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/addresses/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"index": 7, "plain": PLAIN_7, "gasfree": null})))
+        .mount(&server)
+        .await;
+    mount_confirmed_deposit(&server, &gasfree_7(), "tx-gf-off", 10_000_000).await;
+    let id = seed_indexed_intent(&pool, 10_000_000, 10_000_000, "tx-gf-off", &gasfree_7(), Some(7)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+    treasury_service::tron_verifier::verify_once(&pool, &gasfree_config(&server)).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "created", "never rejected, never approved");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+    let pages: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alerts WHERE severity = 'p1' AND source = 'tron_verifier' AND message LIKE '%disagree%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pages, 1, "paged once, not every pass");
+}
