@@ -388,7 +388,30 @@ impl HttpSigner {
     /// orchestrator reported, because whether a deposit pays a relay fee must not be the
     /// orchestrator's choice.
     pub async fn addresses(&self, index: i64) -> Result<IndexAddresses, String> {
-        todo!("Task 2 Step 7")
+        let resp = self
+            .http
+            .get(format!("{}/internal/addresses/{index}", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("signer unreachable: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("signer returned {}", resp.status()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| format!("unreadable signer response: {e}"))?;
+        if body["index"].as_i64() != Some(index) {
+            return Err(format!("asked for index {index}, the signer answered for {}", body["index"]));
+        }
+        let plain = body["plain"]
+            .as_str()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| format!("the signer named no plain address: {body}"))?;
+        let gasfree = match &body["gasfree"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(a) if !a.is_empty() => Some(a.clone()),
+            other => return Err(format!("the signer gave an unreadable GasFree address: {other}")),
+        };
+        Ok(IndexAddresses { plain: plain.to_string(), gasfree })
     }
 }
 

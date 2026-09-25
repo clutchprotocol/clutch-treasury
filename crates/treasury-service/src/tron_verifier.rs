@@ -37,6 +37,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::configuration::AppConfig;
+use crate::gasfree_rail::{deposit_mint, DepositMint};
 use crate::ledger::{alert, alert_once};
 
 /// A single TRC-20 transfer as TronGrid's trc20 endpoint reports it. Field names VERIFIED
@@ -741,7 +742,82 @@ async fn gasfree_verdict(
     intent: &DepositBackedIntent,
     observed_amount_usdt: i64,
 ) -> Verdict {
-    todo!("Task 2 Step 7")
+    let Some(index) = intent.derivation_index else {
+        return Verdict::Wait(format!(
+            "intent {} has no derivation_index, so its address cannot be classified; with GasFree on it is never approved without one",
+            intent.id
+        ));
+    };
+    // `evaluate` already refused an intent with no address, so a Pass always has one.
+    let deposit_address = intent.deposit_address.as_deref().unwrap_or_default();
+    let addresses = match signer.addresses(index).await {
+        Ok(a) => a,
+        Err(e) => return Verdict::Wait(format!("asking the signer for the addresses of index {index}: {e}")),
+    };
+    if deposit_address == addresses.plain {
+        return Verdict::Approve { cap: None };
+    }
+    if addresses.gasfree.as_deref() != Some(deposit_address) {
+        return Verdict::Reject(format!(
+            "deposit address {deposit_address} is neither the plain address {} nor the GasFree account {:?} of index \
+             {index}: no sweep of that index could move it",
+            addresses.plain, addresses.gasfree
+        ));
+    }
+    let seen_first_transfer = match record_account(pool, index, deposit_address, &addresses.plain).await {
+        Ok(seen) => seen,
+        Err(e) => return Verdict::Wait(e),
+    };
+    let fee = gasfree::fee_to_hold(seen_first_transfer, settings.activate_fee_max_usdt, settings.transfer_fee_max_usdt);
+    match deposit_mint(observed_amount_usdt, fee, settings.min_deposit_usdt) {
+        DepositMint::Mint { cap } => Verdict::Approve { cap: Some(cap) },
+        DepositMint::BelowMinimum { cap } => Verdict::Hold {
+            cap,
+            reason: format!(
+                "{observed_amount_usdt} micro-USDT arrived at GasFree account {deposit_address}. After the {fee} held \
+                 for the relay's fee, {cap} is below the minimum deposit of {}, so nothing was minted. The USDT stays \
+                 at the account, counted in the reserve, and is swept with the user's next deposit. Approving this \
+                 intent (mint-intent-approve) mints at most {cap}.",
+                settings.min_deposit_usdt
+            ),
+        },
+        DepositMint::NothingToMint => Verdict::Reject(format!(
+            "{observed_amount_usdt} micro-USDT arrived at GasFree account {deposit_address}, no more than the {fee} a \
+             sweep may pay the relay, so nothing can ever be minted for it. The USDT stays at the account, counted in \
+             the reserve, and is swept with the user's next deposit."
+        )),
+    }
+}
+
+/// Record the GasFree account of `index`, and say whether the treasury has seen its own first sweep
+/// of it run.
+///
+/// That record, not the chain's contract record, decides the hold (spec §2; Plan 2's final review,
+/// I2). A sweep asked for some other way can activate the account before a deposit it moved was
+/// credited. That permit paid activation, and a hold sized from the chain would have kept back only
+/// one transfer fee. The record implies contract code, so a hold sized from it is never below the
+/// `maxFee` the signer sizes from the chain.
+async fn record_account(pool: &PgPool, index: i64, gasfree_address: &str, owner: &str) -> Result<bool, String> {
+    sqlx::query(
+        "INSERT INTO gasfree_accounts (derivation_index, gasfree_address, owner_address)
+         VALUES ($1, $2, $3) ON CONFLICT (derivation_index) DO NOTHING",
+    )
+    .bind(index)
+    .bind(gasfree_address)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("recording GasFree account {gasfree_address}: {e}"))?;
+    let seen: Option<bool> = sqlx::query_scalar(
+        "SELECT first_transfer_at IS NOT NULL FROM gasfree_accounts
+         WHERE derivation_index = $1 AND gasfree_address = $2",
+    )
+    .bind(index)
+    .bind(gasfree_address)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("reading GasFree account {gasfree_address}: {e}"))?;
+    seen.ok_or_else(|| format!("index {index} is recorded with a different GasFree account than {gasfree_address}"))
 }
 
 /// Hard mismatch: `rejected` + alert. `WHERE status = 'created'` for the same rerun-safety

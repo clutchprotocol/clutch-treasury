@@ -23,7 +23,14 @@ pub enum DepositMint {
 /// relay's `active` field, and never the chain's contract record alone (`record_account` in
 /// tron_verifier.rs says why).
 pub fn deposit_mint(observed_usdt: i64, fee_usdt: i64, min_deposit_usdt: i64) -> DepositMint {
-    todo!("Task 2 Step 7")
+    let cap = observed_usdt.saturating_sub(fee_usdt);
+    if cap < 1 {
+        DepositMint::NothingToMint
+    } else if cap < min_deposit_usdt {
+        DepositMint::BelowMinimum { cap }
+    } else {
+        DepositMint::Mint { cap }
+    }
 }
 
 #[cfg(test)]
