@@ -89,7 +89,8 @@ pub enum SignerReply {
     Busy,
     /// The relay refused the permit. The deposit stays where it is, still counted, and a human
     /// decides — never with a higher maxFee than was held back.
-    Rejected { reason: String },
+    /// `reason` is the relay's exception name; `message` is its free text.
+    Rejected { reason: String, message: String },
     /// The signer signs nothing for GasFree until a human acts: GasFree's code changed, or the relay
     /// and the signer disagree about an address.
     Halted { reason: String },
@@ -193,7 +194,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         tracing::warn!("{message}");
         // Beside the log line: a plain warn! is invisible to whatever watches the alerts table, and
         // this condition is exactly as actionable as every other sweeper alert below.
-        alert(pool, "warn", "sweeper", &message).await;
+        alert_once(pool, "warn", "sweeper", &message, chrono::Duration::hours(1)).await;
     }
 
     let mut dry_alerted = false;
@@ -309,7 +310,23 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
             // The signer answered for this index's GasFree account: it found USDT there and asked
             // for a permit. No deposit on the books is at that account, so nothing is recorded; the
             // plain address is looked at again on the next pass.
-            other => tracing::warn!("sweeper: index {index} (plain address {address}) was answered for its GasFree account: {other:?}"),
+            other => {
+                tracing::warn!("sweeper: index {index} (plain address {address}) was answered for its GasFree account: {other:?}");
+                // With GasFree off here, nothing will follow what the signer did. One page an hour,
+                // whatever the index; the index and the reply are in the log.
+                if config.gasfree.is_none() {
+                    alert_once(
+                        pool,
+                        "p1",
+                        "sweeper",
+                        "the signer answers sweeps with GasFree statuses, but this treasury has GasFree off \
+                         (APP_GASFREE_NETWORK is not set). The two services disagree about the rail, and the plain \
+                         deposits it answered for are not swept: give both services the same GasFree settings.",
+                        chrono::Duration::hours(1),
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -509,13 +526,8 @@ impl SweepSigner for HttpSigner {
             },
             Some("busy") => SignerReply::Busy,
             Some("rejected") => SignerReply::Rejected {
-                reason: format!(
-                    "{} {}",
-                    body["reason"].as_str().unwrap_or("no reason given"),
-                    body["message"].as_str().unwrap_or("")
-                )
-                .trim_end()
-                .to_string(),
+                reason: body["reason"].as_str().unwrap_or("no reason given").to_string(),
+                message: body["message"].as_str().unwrap_or("").to_string(),
             },
             Some("halted") => SignerReply::Halted {
                 reason: body["reason"].as_str().unwrap_or("no reason given").to_string(),

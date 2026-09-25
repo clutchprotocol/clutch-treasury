@@ -321,6 +321,9 @@ impl TronClient {
     ///
     /// Custody + every unswept deposit address + the payout float.
     ///
+    /// Custody and the float are read before and after the addresses; if either changed, the walk is
+    /// refused, because a transfer between two reads would be counted twice.
+    ///
     /// Reading only the main address would report a reserve near zero while deposits sit on derived
     /// addresses awaiting a sweep. That is not a halt risk — `judge` keys on the LEDGER's
     /// `custody_reported`, and `trongrid_balance` is a cross-check column that plays no part in any
@@ -344,20 +347,35 @@ impl TronClient {
         float_address: &str,
         usdt_contract: &str,
     ) -> Result<i64, String> {
-        let mut total = self.get_custody_balance(main_address, usdt_contract).await?;
+        // Custody and the float first, and again after the walk. USDT moving between them and an
+        // address read in between (a fund-float into the float, a sweep into custody) would be
+        // counted twice, so a walk that saw either of them change is not a sum of one moment.
+        let main = self.get_custody_balance(main_address, usdt_contract).await?;
+        let float = self
+            .get_custody_balance(float_address, usdt_contract)
+            .await
+            .map_err(|e| format!("payout float {float_address}: {e}"))?;
+        // Saturating: a corrupt balance must not wrap the reserve into something small.
+        let mut total = main.saturating_add(float);
         for addr in unswept_addresses {
             let bal = self
                 .get_custody_balance(addr, usdt_contract)
                 .await
                 .map_err(|e| format!("unswept deposit address {addr}: {e}"))?;
-            // Saturating: a corrupt balance must not wrap the reserve into something small.
             total = total.saturating_add(bal);
         }
-        let float = self
+        let main_after = self.get_custody_balance(main_address, usdt_contract).await?;
+        let float_after = self
             .get_custody_balance(float_address, usdt_contract)
             .await
             .map_err(|e| format!("payout float {float_address}: {e}"))?;
-        Ok(total.saturating_add(float))
+        if main_after != main || float_after != float {
+            return Err(format!(
+                "custody or the payout float moved while the reserve was read (custody {main} then {main_after}, \
+                 float {float} then {float_after}); not a sum of one moment"
+            ));
+        }
+        Ok(total)
     }
 
     pub async fn get_custody_balance(&self, custody_address: &str, usdt_contract: &str) -> Result<i64, String> {

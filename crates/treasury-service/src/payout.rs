@@ -217,6 +217,21 @@ const LONGEST_PERMIT_SECS: i64 = 600;
 /// paid again within minutes.
 const DEADLINE_GRACE_SECS: i64 = 300;
 
+/// A signer paying by GasFree permit behind a treasury with GasFree off: nothing here settles those
+/// payouts, and the float may have paid them.
+async fn gasfree_off(pool: &PgPool) {
+    alert_once(
+        pool,
+        "p1",
+        "payout",
+        "the signer pays redemptions by GasFree permit, but this treasury has GasFree off (APP_GASFREE_NETWORK is \
+         not set), so it never settles them: each stays payout_submitted. Do not return them to payout_pending; \
+         the float may have paid them. Give both services the same GasFree settings.",
+        chrono::Duration::hours(1),
+    )
+    .await;
+}
+
 /// Pays each due `payout_pending` intent against its ALREADY-CONFIRMED burn.
 ///
 /// Burn first, payout second, always — `watcher::confirm_burn` is the sole path into
@@ -372,6 +387,9 @@ pub async fn drain_once(
                 processed += 1;
             }
             PayoutReply::Submitted { trace_id, nonce, deadline } => {
+                if config.gasfree.is_none() {
+                    gasfree_off(pool).await;
+                }
                 // Counted against today's budget from the next pass on: `daily_payout_total` counts
                 // every `payout_submitted` row, and this pass ends here.
                 if let Err(e) = sqlx::query(
@@ -397,6 +415,9 @@ pub async fn drain_once(
                 break; // one permit at a time
             }
             PayoutReply::RelayRefused { reason, nonce, deadline } => {
+                if config.gasfree.is_none() {
+                    gasfree_off(pool).await;
+                }
                 // Refused on the relay's word. The signed permit stays valid until its deadline, so it
                 // may still pay: the row stays payout_submitted, which `daily_payout_total` counts from
                 // the next pass on.

@@ -973,6 +973,28 @@ async fn a_refused_permit_goes_back_to_be_paid_once_its_deadline_passed_and_it_n
     assert_eq!(state_of(&pool, id).await, ("payout_pending".into(), None, None));
 }
 
+/// Past its deadline but inside the grace after it, a refused permit may still show up on chain: it is
+/// left alone, even though the float's nonce says it has not run.
+#[tokio::test]
+async fn a_refused_permit_inside_the_grace_after_its_deadline_is_left_alone() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_float_nonce(&server, 4).await;
+    let id = permit_out(&pool, 10_000_000, None, 4, now() - 120).await;
+
+    payout::confirm_gasfree_payouts_once(
+        &pool,
+        &gasfree_config(server.uri()),
+        &nile(),
+        &TronClient::new(server.uri(), "k".into()),
+        &GasFreeReads { txn_hash: None },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)));
+}
+
 /// The nonce moved and no transfer paying this redemption was found: it may be paid, so it goes to a
 /// human and no longer holds the float.
 #[tokio::test]
@@ -1012,6 +1034,21 @@ async fn a_relay_refusal_is_not_retried_before_its_deadline() {
 
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1, "the refused permit is valid until its deadline");
     assert_eq!(state_of(&pool, id).await, ("payout_submitted".into(), None, Some(4)));
+}
+
+/// A signer on GasFree behind a treasury with GasFree off: the permit is recorded, and it pages once.
+#[tokio::test]
+async fn a_gasfree_payout_to_a_treasury_with_gasfree_off_pages_once() {
+    let pool = pool().await;
+    let id = pending_redemption(&pool, 10_000_000).await;
+    let signer = counting(PayoutReply::Submitted { trace_id: "trace-1".into(), nonce: 4, deadline: (now() + 180) as u64 });
+    let cfg = config();
+
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+    payout::drain_once(&pool, &cfg, &signer).await.unwrap();
+
+    assert_eq!(payout_alerts(&pool, "p1", "GasFree off").await, 1, "paged once, not every pass");
+    assert_eq!(state_of(&pool, id).await.0, "payout_submitted", "the permit is recorded, never dropped");
 }
 
 /// Spec §4: until the float's one-time activation, redemptions are "not available yet".

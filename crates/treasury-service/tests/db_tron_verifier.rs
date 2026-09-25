@@ -1001,6 +1001,30 @@ async fn the_reserve_includes_the_payout_float() {
     assert_eq!(total, 1000, "float USDT is reserve backing CLT, not spare money");
 }
 
+/// A transfer between two reads of the walk would be counted twice: a walk that saw custody move is refused.
+#[tokio::test]
+async fn a_reserve_walk_that_saw_custody_move_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/wallet/triggerconstantcontract"))
+        .and(body_string_contains(REAL_MAIN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"constant_result": [format!("{:064x}", 700)]})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_balance(&server, REAL_MAIN, 900).await;
+    mount_balance(&server, FLOAT, 300).await;
+
+    let client = treasury_service::tron_verifier::TronClient::new(server.uri(), String::new());
+    let err = client
+        .get_reserve_balance(REAL_MAIN, &[], FLOAT, USDT)
+        .await
+        .expect_err("a walk that saw custody move is not a sum");
+
+    assert!(err.contains("moved while the reserve was read"), "{err}");
+}
+
 // --- GasFree (docs/superpowers/specs/2026-09-24-gasfree-transfer-rail-design.md §2) ---
 //
 // With GasFree on, a deposit at a user's GasFree account mints what arrived less the most a sweep

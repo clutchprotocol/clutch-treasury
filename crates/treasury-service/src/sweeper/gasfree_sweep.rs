@@ -138,8 +138,10 @@ pub(super) async fn settle(pool: &PgPool, settings: &gasfree::Settings, client: 
                             "sweeper",
                             &format!(
                                 "the relay says {got} micro-USDT of the sweep of {account} reached the receiver; the \
-                                 permit said {value_usdt}. If the fee came out of the value, every GasFree mint is too \
-                                 large by the fee: stop GasFree deposits and read open question 1 of the GasFree design."
+                                 permit said {value_usdt}. If the fee came out of the value, mints are still covered \
+                                 (what the relay did not take stays at the account, and the reserve counts it), but a \
+                                 GasFree payout would pay the redeemer less than asked and never be confirmed: turn \
+                                 redemptions off (APP_REDEMPTIONS_ENABLED) and read open question 1 of the GasFree design."
                             ),
                         )
                         .await;
@@ -225,6 +227,53 @@ pub(super) async fn sweep_account(
     }
 
     let requested_at = chrono::Utc::now();
+    // Never sign a higher maxFee than was held back (spec §2). The treasury's own maxima are what it
+    // can check before signing. After a maximum is raised, deposits minted before the change held
+    // less than a permit may now take: they wait here, still counted, until it is lowered again.
+    // These are the rows this permit would settle (the same `verified_at` bound as `settle`).
+    let held: Option<i64> = match sqlx::query_scalar(
+        "SELECT MAX(fee_held_usdt) FROM mint_intents
+         WHERE derivation_index = $1 AND deposit_address = $2 AND swept_at IS NULL AND verified_at <= $3",
+    )
+    .bind(index)
+    .bind(address)
+    .bind(requested_at)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("sweeper: could not read what the deposits at {address} held back: {e}");
+            alert_once(
+                pool,
+                "p1",
+                "sweeper",
+                &format!("could not read what the deposits at GasFree account {address} held back, so nothing was signed for it"),
+                hourly(),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(held) = held else {
+        tracing::info!("sweeper: no credited deposit at {address} (index {index}) is left to sweep");
+        return;
+    };
+    if fee > held {
+        alert_once(
+            pool,
+            "p1",
+            "sweeper",
+            &format!(
+                "a sweep of GasFree account {address} (index {index}) may now cost up to {fee} micro-USDT, but its \
+                 deposits held back {held}, so nothing was signed. A maximum was raised after they were minted: \
+                 they stay there, still counted, until the maximum is lowered to what they held."
+            ),
+            hourly(),
+        )
+        .await;
+        return;
+    }
     match signer.sweep(index).await {
         SignerReply::Pending { trace_id, gasfree_address, value_usdt, max_fee_usdt, nonce, deadline } => {
             if gasfree_address != address {
@@ -239,25 +288,15 @@ pub(super) async fn sweep_account(
                 )
                 .await;
             }
-            // Never a higher maxFee than was held back (spec §2): the most any deposit here held is
-            // the most the relay may take.
-            let held: Option<i64> = sqlx::query_scalar(
-                "SELECT MAX(fee_held_usdt) FROM mint_intents
-                 WHERE derivation_index = $1 AND deposit_address = $2 AND swept_at IS NULL AND verified_at <= $3",
-            )
-            .bind(index)
-            .bind(address)
-            .bind(requested_at)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(None);
-            if let Some(h) = held.filter(|h| max_fee_usdt > *h) {
+            // The signer sizes maxFee from its own settings. Above what was held, the two services'
+            // maxima differ; the permit is signed by then, so paging is what is left.
+            if max_fee_usdt > held {
                 alert(
                     pool,
                     "p1",
                     "sweeper",
                     &format!(
-                        "the signer set maxFee {max_fee_usdt} on the permit for {address}, above the {h} held back for \
+                        "the signer set maxFee {max_fee_usdt} on the permit for {address}, above the {held} held back for \
                          any deposit it moves. The permit is signed; if it runs, the reserve may fall below supply by \
                          the difference. Check the GasFree maxima in both services."
                     ),
@@ -292,15 +331,18 @@ pub(super) async fn sweep_account(
         }
         SignerReply::Busy => tracing::info!("sweeper: a transfer from {address} is already in flight; next pass"),
         SignerReply::BelowFee => tracing::info!("sweeper: {address} holds no more than the relay's fee; left for a later deposit"),
-        SignerReply::Rejected { reason } => {
+        SignerReply::Rejected { reason, message } => {
+            // Keyed on the exception's name alone; the relay's free text is in the log.
+            tracing::warn!("sweeper: the relay refused the sweep of {address} (index {index}): {reason} {message}");
             alert_once(
                 pool,
                 "p1",
                 "sweeper",
                 &format!(
                     "the relay refused the sweep of GasFree account {address}: {reason}. The deposit stays there, still \
-                     counted. If the live fee is above the configured maximum, raise the maximum in the signer and the \
-                     treasury together, never in the signer alone."
+                     counted. If the live fee is above the configured maximum: raising the maximum (in the signer and \
+                     the treasury together, never in the signer alone) covers only deposits minted after the change, \
+                     and the treasury signs nothing for deposits that held less than a permit may take."
                 ),
                 hourly(),
             )

@@ -650,7 +650,7 @@ async fn a_relay_refusal_pages_and_leaves_the_deposit_where_it_is() {
     mount_gasfree_chain(&server, &account, 10_000_000, 0, BEACON_OK).await;
     seed_account(&pool, 7, OWNER_7, false).await;
     let id = seed_gasfree_deposit(&pool, 7, &account, 2_000_000).await;
-    let signer = FakeSigner::new(SignerReply::Rejected { reason: "MaxFeeExceededException max fee exceeded".into() });
+    let signer = FakeSigner::new(SignerReply::Rejected { reason: "MaxFeeExceededException".into(), message: "max fee exceeded".into() });
 
     sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
 
@@ -675,6 +675,42 @@ async fn a_permit_whose_max_fee_is_above_what_was_held_pages() {
 
     assert_eq!(sweeper_alerts(&pool, "p1", "held back").await, 1);
     assert_eq!(account_state(&pool, 7).await, (Some(TRACE.into()), Some(4), true), "the permit exists, so it is followed");
+}
+
+/// Spec §2: "Never sign a higher `maxFee` than was held back". Deposits that held less than the fee a
+/// permit may now take are not signed for, and it pages once.
+#[tokio::test]
+async fn no_permit_is_signed_for_deposits_that_held_less_than_the_fee() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let account = account_of(OWNER_7);
+    mount_gasfree_chain(&server, &account, 10_000_000, 0, BEACON_OK).await;
+    seed_account(&pool, 7, OWNER_7, false).await;
+    let id = seed_gasfree_deposit(&pool, 7, &account, 500_000).await;
+    let signer = FakeSigner::new(pending(8_000_000, 2_000_000, 0));
+
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+    sweeper::sweep_once(&pool, &gasfree_config(&server), &tron(&server), &signer).await;
+
+    assert!(signer.asked().is_empty(), "nothing is signed for deposits that held less than the fee");
+    assert!(swept_at(&pool, id).await.is_none());
+    assert_eq!(sweeper_alerts(&pool, "p1", "nothing was signed").await, 1, "paged once, not every pass");
+}
+
+/// A signer on GasFree behind a treasury with GasFree off: nothing here follows what it did, so it pages once.
+#[tokio::test]
+async fn a_gasfree_answer_to_a_treasury_with_gasfree_off_pages_once() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_balance(&server, 500_000_000).await;
+    let id = seed(&pool, "credited", 7, 1).await;
+    let signer = FakeSigner::new(pending(9_500_000, 500_000, 0));
+
+    sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+    sweeper::sweep_once(&pool, &config(server.uri(), 100_000_000), &tron(&server), &signer).await;
+
+    assert!(swept_at(&pool, id).await.is_none());
+    assert_eq!(sweeper_alerts(&pool, "p1", "GasFree off").await, 1, "paged once, not every pass");
 }
 
 /// A balance no larger than what the relay may take would move nothing (spec §3). The fee is sized on
@@ -761,7 +797,7 @@ async fn the_gasfree_sweep_answers_are_read_field_by_field() {
         (serde_json::json!({"status": "busy", "gasfree_address": "TGasFree"}), SignerReply::Busy),
         (
             serde_json::json!({"status": "rejected", "reason": "MaxFeeExceededException", "message": "max fee exceeded"}),
-            SignerReply::Rejected { reason: "MaxFeeExceededException max fee exceeded".into() },
+            SignerReply::Rejected { reason: "MaxFeeExceededException".into(), message: "max fee exceeded".into() },
         ),
         (
             serde_json::json!({"status": "halted", "reason": "GasFree's code changed"}),
