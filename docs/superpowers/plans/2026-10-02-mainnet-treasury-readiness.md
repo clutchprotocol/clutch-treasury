@@ -1782,8 +1782,9 @@ for c in "$CH_TREASURY_PG" "$CH_ORCH_PG" "$CH_ORCH" "$CH_TREASURY" "$CH_SIGNER";
   if [ "$status" = healthy ]; then
     echo "  $c healthy"
   else
-    echo "  $c is not healthy ($status). Its last log lines:"
-    docker logs --tail 30 "$c" 2>&1 | sed 's/^/      /' || true
+    # No service log here: the log of this workflow is public, and a service log can hold a user's
+    # address or an identifier. The operator reads it on the host.
+    echo "  $c is not healthy ($status). Read its log on the host: docker logs --tail 50 $c"
     unhealthy=1
   fi
 done
@@ -1794,7 +1795,7 @@ docker ps --filter "label=com.docker.compose.project=$CH_PROJECT" --format '  {{
 
 if [ "$unhealthy" -ne 0 ]; then
   echo ""
-  echo "ABORT: not every service is healthy. Nothing was stopped; read the logs above, or run PROBE=mainnet-treasury."
+  echo "ABORT: not every service is healthy. Nothing was stopped; read the logs on the host (the commands are above), or run PROBE=mainnet-treasury."
   exit 1
 fi
 
@@ -2819,7 +2820,7 @@ with the message file saying: `docs: the mainnet treasury in the on-call, backup
 
 No code. **Every step that changes the host's env files, deploys, starts something or moves money is the maintainer's, or needs the maintainer's yes in chat for that step.** After each step the gate is `PROBE=mainnet-treasury`: the latest reconciliation run is `ok`, the breaker clear, and no new P1 alert. A failed gate stops the rollout. Record each step's result in the ledger.
 
-1. **Prerequisites (maintainer, on the host, never in chat).** In `.env.mainnet` add `BACKUP_PASSPHRASE` (new: `openssl rand -base64 48`, kept somewhere that is not the host) and `BACKUP_REMOTE` (an rclone destination for mainnet dumps, for example the same R2 bucket under `mainnet/`). Both must differ from the values in `.env` (the preflight refuses an equal one: with one remote, both chains would write `treasury-<stamp>.dump.enc` into the same folder, and a restore could take the other chain's dump). Confirm `JWT_SECRET` equals `.env`'s `MAINNET_JWT_SECRET` (the preflight checks it).
+1. **Prerequisites (maintainer, on the host, never in chat).** In `.env.mainnet` add `BACKUP_PASSPHRASE` (new: `openssl rand -base64 48`, kept somewhere that is not the host) and `BACKUP_REMOTE` (an rclone destination for mainnet dumps, for example the same R2 bucket under `mainnet/`). Both must differ from the values in `.env` (the preflight refuses an equal one: with one remote, both chains would write `treasury-<stamp>.dump.enc` into the same folder, and a restore could take the other chain's dump). Confirm `JWT_SECRET` equals `.env`'s `MAINNET_JWT_SECRET` (the preflight checks it). Also run "Provision treasury secrets" for `.env.mainnet` once more, AFTER this pull request is merged: the file was last provisioned on 2026-09-20, before the payout float existed, and the start refuses without `PAYOUT_FLOAT_ADDRESS`. Provisioning appends the missing float and never overwrites anything that is set. (If the maintainer decides to rotate the mainnet mnemonic first, remove `DEPOSIT_MNEMONIC`, `DEPOSIT_ACCOUNT_XPUB` and `PAYOUT_FLOAT_ADDRESS` from `.env.mainnet` before this run.)
 2. **Merge the pull request (maintainer).** It runs a normal stage deploy. Controller: the stage gate (`PROBE=sweeper`) is unchanged; `PROBE=metrics` shows Prometheus loaded the new jobs; **no alert fires** (`TreasuryServiceDown` must stay quiet for the mainnet jobs, which are `up == 0` and have never been up).
 3. **Write the mainnet settings (maintainer dispatches "Set GasFree settings (stage)", network `mainnet`, confirm `gasfree mainnet`).** Expected in the log: `=== after (.env.mainnet) ===` with the 17 settings, then `All invariants hold`, then `the redemption fee covers a GasFree payout's relay fee` and `the payout float fills far enough for the largest payout`.
 4. **Check the pins and the fees (controller).** The mainnet file pins `sha-df5243a`; `PROBE=gasfree`'s mainnet section shows `activateFee 1500000` and `transferFee 1500000`, `the live fees against the maxima in .env.mainnet` both `OK`, and both implementations equal to the reviewed values.
