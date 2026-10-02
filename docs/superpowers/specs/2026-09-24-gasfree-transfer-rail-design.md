@@ -356,16 +356,44 @@ throughout.
 
 Mainnet follows only after that, with its own API key and its own fee reading.
 
+**Result, Nile, 2026-10-02: done.** The rail was switched on at 03:33 UTC on 2026-09-26 and run on
+2026-10-02, with these amounts in USDT:
+
+- A new account was sent 3.00 and then 40.00. The 3.00 minted 1.00 CLT (2.00 held back: the
+  activation and transfer maxima). The 40.00 minted 39.50 (0.50 held back, because the treasury had
+  already recorded the account's first transfer). Each sweep moved the account's whole balance less
+  `maxFee`; the relay took 1.30, then 0.30, and the account kept the difference (0.20 after both).
+- The float was activated from the surplus. The relay accepted a transfer of 0.000001 USDT to
+  custody, and charged 1.30. A redemption of 6 CLT paid exactly 5.00 USDT from the float (relay fee
+  0.30), and was marked `paid` after the treasury read the transfer from the float on chain, so
+  TronGrid does report `from` on the float's transfers.
+- A second new account was sent 10.00 and minted 8.00 CLT. The float was above its 30.00 target, so
+  the sweep went to custody, which rose by exactly 8.00 (5621.124931 to 5629.124931).
+- The fee account held 727.9 TRX before and after all of it: no TRX was spent.
+- Reconciliation read `ok` with the predicted figures each time it was read: after the first two
+  deposits (surplus 3001.224930, exactly the predicted amount), and in the hourly run after the
+  activation, the redemption and the third deposit together (`custody_reported` 6588.824930,
+  `ledger_liability` 3587.500000). Stage reconciles every hour, so those three steps shared one
+  reading rather than one each.
+- A never-used account got a relay reply, and the 130-hex permit signature was accepted. Not seen:
+  the relay's nonce after an expired permit, and a documented refusal arriving as body code 400.
+
 ## Open questions, resolved on Nile before code depends on them
 
 1. **What `value` means.** Whether it is what the receiver gets with the fee charged on top, or the
    total with the fee taken out of it. The reserve rule holds either way; the number written into
    the permit differs. Section 3 assumes the first and must be corrected if the measurement says the
-   second.
-2. **The Nile beacon's `implementation()`**, which has not been read yet.
-3. **Mainnet fees**, which need a mainnet API key.
+   second. **Resolved on Nile, 2026-10-02: the fee is charged on top.** A permit with `value` 1.00
+   put 1.00 USDT into the float and sent 1.30 USDT (1.00 activation + 0.30 transfer) to the relay.
+   Section 3 is right as written.
+2. **The Nile beacon's `implementation()`.** **Resolved:** `b8eda40b467b45af107f198e94cc2fa1378adf50`
+   (the controller's is `2ec1c0ada96ac9c3d6aab8e0c6e18194ed72c441`, read through its proxy).
+   `PROBE=gasfree` compares both with `.env` before a deploy.
+3. **Mainnet fees**, which need a mainnet API key. **Open:** the relay answers the Nile key on
+   mainnet with "Apikey not found.".
 4. **Who controls the beacon upgrade.** `owner()` reverts; the authority may be readable through
    another interface. Worth knowing; not a blocker, since the tripwire does not depend on it.
+   **Open.**
 
 ## Out of scope
 
