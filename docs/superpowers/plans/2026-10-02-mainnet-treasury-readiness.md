@@ -1456,6 +1456,7 @@ TREASURY_READONLY_TOKEN=main-r
 TREASURY_POSTGRES_PASSWORD=main-pg1
 ORCHESTRATOR_POSTGRES_PASSWORD=main-pg2
 JWT_SECRET=jwt-mainnet-x
+BACKUP_PASSPHRASE=main-backup-pass
 PER_TX_MINT_CAP_CLT=1000000000
 DAILY_MINT_CAP_CLT=2000000000
 MAX_REDEMPTION_CLT=200000000
@@ -1490,6 +1491,7 @@ check "a complete, separate mainnet file passes" 0 "every required setting is se
 check "a missing required setting fails" 1 "AZURE_KEY_VERSION is empty or missing" '/^AZURE_KEY_VERSION=/d'
 check "an empty required setting fails" 1 "SIGNER_TOKEN is empty or missing" 's/^SIGNER_TOKEN=.*/SIGNER_TOKEN=/'
 check "a missing limit fails" 1 "REDEMPTION_FEE_USDT is empty or missing" '/^REDEMPTION_FEE_USDT=/d'
+check "a missing backup passphrase fails" 1 "BACKUP_PASSPHRASE is empty or missing" '/^BACKUP_PASSPHRASE=/d'
 check "the Nile TronGrid fails" 1 "TRONGRID_URL is not https://api.trongrid.io" 's#^TRONGRID_URL=.*#TRONGRID_URL=https://nile.trongrid.io#'
 check "the Nile USDT contract fails" 1 "USDT_CONTRACT is not the mainnet USDT contract" 's/^USDT_CONTRACT=.*/USDT_CONTRACT=TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf/'
 check "the stage mnemonic fails" 1 "DEPOSIT_MNEMONIC is the same in both files" 's/^DEPOSIT_MNEMONIC=.*/DEPOSIT_MNEMONIC=stage mnemonic words/'
@@ -1534,7 +1536,7 @@ sed -i -e 's/^DEPOSIT_MNEMONIC=.*/DEPOSIT_MNEMONIC=stage mnemonic words/' -e 's/
 chmod 600 "$T/mainnet.env" "$T/stage.env"
 code=0; out=$(preflight "$T/mainnet.env" "$T/stage.env" 2>&1) || code=$?
 leak=""
-for secret in "stage mnemonic words" "stage-signer" "main-i" "main-pg1" "jwt-mainnet-x" "client-secret-value" "mainnet mnemonic"; do
+for secret in "stage mnemonic words" "stage-signer" "main-i" "main-pg1" "jwt-mainnet-x" "client-secret-value" "mainnet mnemonic" "main-backup-pass"; do
   printf '%s' "$out" | grep -qF -- "$secret" && leak="$leak [$secret]"
 done
 if [ "$code" -eq 1 ] && [ -z "$leak" ]; then
@@ -1588,7 +1590,7 @@ git add scripts/lib/mainnet-preflight.sh scripts/test-mainnet-preflight.sh scrip
 git commit -F commit-msg.txt
 ```
 
-Controller: run CI. Expected: "Test treasury scripts" fails, and the self-check shows `FAIL` by name for all 19 of its cases (`0 passed, 19 failed`): the stub prints nothing and returns 0, so the clean case and `the non-hex placeholder is fine` fail on their text, and every case that expects a refusal fails on its exit code; the other suites stay green.
+Controller: run CI. Expected: "Test treasury scripts" fails, and the self-check shows `FAIL` by name for all 20 of its cases (`0 passed, 20 failed`): the stub prints nothing and returns 0, so the clean case and `the non-hex placeholder is fine` fail on their text, and every case that expects a refusal fails on its exit code; the other suites stay green.
 
 - [ ] **Step 3: The preflight**
 
@@ -1605,7 +1607,9 @@ Replace `scripts/lib/mainnet-preflight.sh`:
 #
 # What it refuses, and why:
 #   - a mainnet file that is missing, readable by other users, or lacks a setting the compose file
-#     requires (compose would also refuse most of these, but one setting at a time, after pulling);
+#     requires (compose would also refuse most of these, but one setting at a time, after pulling), or
+#     lacks BACKUP_PASSPHRASE (the nightly backup aborts without it, and a treasury with no backup
+#     must not start);
 #   - TronGrid or the USDT contract of the testnet: watching the wrong token on the wrong network
 #     credits nothing, and nothing says so;
 #   - any secret equal to the stage one. One DEPOSIT_MNEMONIC derives the SAME TRON addresses on Nile
@@ -1619,8 +1623,10 @@ Replace `scripts/lib/mainnet-preflight.sh`:
 
 MAINNET_USDT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 
-# Every setting the mainnet compose file requires with `:?` or that the money path cannot run without.
-PF_REQUIRED="CUSTODY_TRON_ADDRESS TRONGRID_URL USDT_CONTRACT AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_VAULT_URL AZURE_KEY_NAME AZURE_KEY_VERSION DEPOSIT_MNEMONIC DEPOSIT_ACCOUNT_XPUB PAYOUT_FLOAT_ADDRESS SIGNER_TOKEN TREASURY_INITIATOR_TOKEN TREASURY_APPROVER_TOKEN TREASURY_READONLY_TOKEN TREASURY_POSTGRES_PASSWORD ORCHESTRATOR_POSTGRES_PASSWORD JWT_SECRET PER_TX_MINT_CAP_CLT DAILY_MINT_CAP_CLT MAX_REDEMPTION_CLT MIN_REDEMPTION_CLT PER_TX_PAYOUT_CAP_USDT REDEMPTION_FEE_USDT DAILY_PAYOUT_CAP_CLT"
+# Every setting the mainnet compose file requires with `:?` or that the money path cannot run without,
+# and BACKUP_PASSPHRASE: backup-treasury-db.sh aborts without it, so a treasury that started would have
+# no backup the first night.
+PF_REQUIRED="CUSTODY_TRON_ADDRESS TRONGRID_URL USDT_CONTRACT AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_VAULT_URL AZURE_KEY_NAME AZURE_KEY_VERSION DEPOSIT_MNEMONIC DEPOSIT_ACCOUNT_XPUB PAYOUT_FLOAT_ADDRESS SIGNER_TOKEN TREASURY_INITIATOR_TOKEN TREASURY_APPROVER_TOKEN TREASURY_READONLY_TOKEN TREASURY_POSTGRES_PASSWORD ORCHESTRATOR_POSTGRES_PASSWORD JWT_SECRET PER_TX_MINT_CAP_CLT DAILY_MINT_CAP_CLT MAX_REDEMPTION_CLT MIN_REDEMPTION_CLT PER_TX_PAYOUT_CAP_USDT REDEMPTION_FEE_USDT DAILY_PAYOUT_CAP_CLT BACKUP_PASSPHRASE"
 
 # Settings that must differ between the two files.
 PF_DIFFER="DEPOSIT_MNEMONIC DEPOSIT_ACCOUNT_XPUB CUSTODY_TRON_ADDRESS SIGNER_TOKEN TREASURY_INITIATOR_TOKEN TREASURY_APPROVER_TOKEN TREASURY_READONLY_TOKEN TREASURY_POSTGRES_PASSWORD ORCHESTRATOR_POSTGRES_PASSWORD JWT_SECRET BACKUP_PASSPHRASE BACKUP_REMOTE"
@@ -1877,7 +1883,7 @@ git add scripts/lib/mainnet-preflight.sh scripts/mainnet-treasury-up.sh .github/
 git commit -F commit-msg.txt
 ```
 
-Controller: run CI. Expected: "Test treasury scripts" succeeds; the preflight self-check says `ok` by name for all 19 cases (`19 passed, 0 failed`), and `bash -n` passes on the three new scripts; the other suites stay green. The task reviewer reads `mainnet-treasury-up.sh` against the live path: the order of the gates, that nothing before `up -d` changes the host, and that no line prints a value.
+Controller: run CI. Expected: "Test treasury scripts" succeeds; the preflight self-check says `ok` by name for all 20 cases (`20 passed, 0 failed`), and `bash -n` passes on the three new scripts; the other suites stay green. The task reviewer reads `mainnet-treasury-up.sh` against the live path: the order of the gates, that nothing before `up -d` changes the host, and that no line prints a value.
 
 ---
 
