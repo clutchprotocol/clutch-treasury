@@ -2853,10 +2853,27 @@ Gate for the whole task: steps 1-9 done, each gate read, and nothing in the logs
 
 ---
 
+## Execution notes (written after the work)
+
+The code is in `clutch-deploy` pull request #107, branch `feat/mainnet-treasury-readiness`: Tasks 1 to 7, a fix wave of three commits that followed a whole-branch review, and the Task 8 docs. Every task was built tests first (a red commit, then a green commit), and the CI log was read by test name. Reviews found things the plan did not say. These are the places where the finished code differs from the plan text above, and why.
+
+1. **`ENV_FILE` must name a file that exists and can be read.** `check-cap-invariants.sh` refuses a missing file. Without that, a typing mistake in the file name printed "All invariants hold" on the stage defaults.
+2. **The start preflight is stricter than Task 4 says.** It also requires `BACKUP_PASSPHRASE` (the nightly backup aborts without it, and it now covers mainnet). It lints `.env.mainnet` line by line (only blank lines, `#` comments and plain upper-case `NAME=value` lines, each name once, mode 600), because docker compose and `tron-signer` read an env file more loosely than its text says, and a stray line makes `docker compose config` print the line into a public log. The stage `.env` is read the way compose reads it (the last of a duplicate, quotes and comments removed). It also compares the payout float address and the backup values, and refuses a `GASFREE_NETWORK` other than `mainnet`.
+3. **No service log and no compose error in a public log.** The start script prints `docker logs --tail 50 <container>` for the operator to run on the host. `Set mint caps` on mainnet lints the file first, refuses unless the treasury runs, and discards compose's output.
+4. **The one-address sweep is stage only.** Its workflow printed the typed address into the public log before anything could refuse it.
+5. **The account xpub is never printed.** Not by provisioning, `fund-float` or `activate-float`. The mainnet xpub was printed on 2026-09-20 by three provisioning runs; the decision to rotate the mainnet mnemonic is asked at step 1 of the rollout.
+6. **The nightly backup.** A failed dump leaves no partial file, a mainnet treasury that exists but is stopped fails the run, and an empty `BACKUP_REMOTE` means "no upload" (the restore rehearsal depends on it).
+7. **One concurrency group, `env-file-writers`,** for the four workflows that write or read the env files.
+8. **More CI than planned.** Every workflow file is parsed with Ruby; the guard has 23 self-check cases and also checks aliases, `container_name`, each service's own image, the peer list, TronGrid exactly, and that the GasFree settings reach the mainnet services; the chain labels of the four treasury jobs in `prometheus.yml` are checked; there are nine `promtool` tests instead of five.
+
+Known limits, left on purpose (each is small, and none opens anything to users): the Alertmanager template has no CI check (the first proof is the first live Telegram message); the Grafana Treasury row mixes both treasuries after the first mainnet start; the stage probe still prints whole URLs and secret lengths (a separate follow-up); `tron-signer` logs its account xpub at start-up (a follow-up in `clutch-treasury`); a stage deploy that pulls a newer `postgres:16-alpine` makes the next mainnet start restart both databases; some workflow display names still say "(stage)" although they take a chain.
+
+---
+
 ## After this plan
 
 Not in this plan, each its own plan, in this order:
 
 1. **The KMS payout key (A2).** `tron-signer` has no KMS signing: the float's key is derived from `DEPOSIT_MNEMONIC`, which sits in an env variable on the host. Design and build a KMS-backed signer for the float (the address `payout_gasfree_address` derives from), as the mint authority already is. Readiness marks it a Blocker.
-2. **The pilot and go-live.** Open mainnet to the maintainer first: attach the orchestrator to the stage network under a name no stage service has (or a gateway), flip `/payment/` from 503 and its deploy gate, turn redemptions on with a reviewed commit, set pilot caps, seed custody with about 5 real USDT, activate the float (`activate mainnet`, surplus of at least 4.00), one real deposit and one real redemption (readiness B1 and B2), a mainnet restore rehearsal, and the remaining tools made chain-aware (`mint-intent`, `redrive-mint`, `reverse-mint`, `close-repaid-deposit`).
+2. **The pilot and go-live.** Open mainnet to the maintainer first: attach the orchestrator to the stage network under a name no stage service has (or a gateway), flip `/payment/` from 503 and its deploy gate, turn redemptions on with a reviewed commit, set pilot caps, put real USDT where activation needs it (the GasFree float must hold at least 4.00 USDT plus the smallest transfer, or the signer answers `float_dry`: USDT sent to the custody address does not fill the float, which fills from the sweep of a real deposit or from USDT sent to the float's GasFree address; and the reserve must exceed the liabilities by at least 4.00 USDT), activate the float (`activate mainnet`), one real deposit and one real redemption (readiness B1 and B2), a mainnet restore rehearsal, and the remaining tools made chain-aware (`mint-intent`, `redrive-mint`, `reverse-mint`, `close-repaid-deposit`).
 3. **Operators.** A second person who can halt (G3) and the validator set (C2) stay the maintainer's decisions.
