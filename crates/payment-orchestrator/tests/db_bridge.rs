@@ -77,6 +77,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
         rate_limit_per_minute: 1_000,
         gasfree: None,
+        pilot_allowed_addresses: None,
     }
 }
 

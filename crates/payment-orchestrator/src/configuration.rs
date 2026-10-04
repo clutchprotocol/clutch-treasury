@@ -102,6 +102,36 @@ pub struct OrchConfig {
     /// the TRX rail exactly as before.
     #[serde(skip)]
     pub gasfree: Option<gasfree::Settings>,
+    /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
+    /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
+    /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see
+    /// `parse_pilot_allowed` for the values. Checked in `auth::authenticated_pk`, which every route
+    /// that needs a caller goes through, so one place covers deposits and redemptions alike.
+    #[serde(skip)]
+    pub pilot_allowed_addresses: Option<Vec<String>>,
+}
+
+/// `APP_PILOT_ALLOWED_ADDRESSES`. Unset, or `*`, is everyone (`None`). Anything else is a
+/// comma-separated list of addresses (`Some`), compared without regard to case. A blank value is an
+/// empty list, which is nobody: a gate that opens when its setting is empty is not a gate.
+pub fn parse_pilot_allowed(raw: Option<&str>) -> Option<Vec<String>> {
+    match raw.map(str::trim) {
+        None | Some("*") => None,
+        Some(list) => Some(
+            list.split(',')
+                .map(|a| a.trim().to_ascii_lowercase())
+                .filter(|a| !a.is_empty())
+                .collect(),
+        ),
+    }
+}
+
+/// Whether `pk` may use the service under `allowed` (see `OrchConfig::pilot_allowed_addresses`).
+pub fn pilot_permits(allowed: &Option<Vec<String>>, pk: &str) -> bool {
+    match allowed {
+        None => true,
+        Some(list) => list.iter().any(|a| a.eq_ignore_ascii_case(pk.trim())),
+    }
 }
 
 impl OrchConfig {
@@ -127,6 +157,56 @@ impl OrchConfig {
         // From the environment only, like the secrets above: the three services read the same
         // variables from one env file (spec §6), and a half-set rail stops the service here.
         cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+        cfg.pilot_allowed_addresses = parse_pilot_allowed(std::env::var("APP_PILOT_ALLOWED_ADDRESSES").ok().as_deref());
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(items: &[&str]) -> Option<Vec<String>> {
+        Some(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn an_unset_pilot_list_is_everyone() {
+        assert_eq!(parse_pilot_allowed(None), None);
+    }
+
+    #[test]
+    fn a_star_is_everyone() {
+        assert_eq!(parse_pilot_allowed(Some("*")), None);
+        assert_eq!(parse_pilot_allowed(Some(" * ")), None);
+    }
+
+    #[test]
+    fn addresses_are_split_trimmed_and_lowercased() {
+        assert_eq!(parse_pilot_allowed(Some(" 0xAB , 0xcd,")), list(&["0xab", "0xcd"]));
+    }
+
+    #[test]
+    fn a_blank_pilot_list_is_nobody() {
+        assert_eq!(parse_pilot_allowed(Some("")), list(&[]));
+        assert_eq!(parse_pilot_allowed(Some(" , ")), list(&[]));
+    }
+
+    #[test]
+    fn no_pilot_list_permits_anyone() {
+        assert!(pilot_permits(&None, "0xanything"));
+    }
+
+    #[test]
+    fn a_pilot_list_permits_only_its_addresses_in_any_case() {
+        let allowed = list(&["0xab"]);
+        assert!(pilot_permits(&allowed, "0xAB"));
+        assert!(pilot_permits(&allowed, " 0xab "));
+        assert!(!pilot_permits(&allowed, "0xac"));
+    }
+
+    #[test]
+    fn an_empty_pilot_list_permits_nobody() {
+        assert!(!pilot_permits(&list(&[]), "0xab"));
     }
 }
