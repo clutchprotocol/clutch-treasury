@@ -54,6 +54,9 @@ Five things must all be true before any mainnet address is handed to a user:
    **Met 2026-09-15** — see D1. The remaining four are unchanged.
 5. Someone other than the maintainer can halt minting and knows how.
 
+**Exception, 2026-10-04:** the payout-key half of item 1 is waived for a capped pilot (A2). The mint
+key half stands: it is behind Azure Key Vault (A1).
+
 Everything below expands these, plus the product and legal work that sits outside them.
 
 ## What to do next, in order
@@ -285,7 +288,7 @@ answer to that constraint regardless of provider — it is the part that *can* b
 real cloud account, and it is tested; `azure_kms_signer.rs`'s own tests are wiremock-only for the
 same reason, and were checked against the real vault by hand, once, tonight, rather than in CI.
 
-### A2. KMS-backed payout signer — **Blocker** (same plumbing applies)
+### A2. KMS-backed payout signer — **Blocker; open by choice for a capped pilot, 2026-10-04** (same plumbing applies)
 
 `PayoutSigner` (`crates/treasury-service/src/payout.rs`) is the matching seam for the payout key.
 Today the payout float is derived from the deposit mnemonic at `m/44'/195'/0'/2/0` and held by
@@ -302,6 +305,35 @@ this stack's Keccak-over-hex-string convention, so `digest_for_hash_hex` is the 
 **Verification:** payouts signed through KMS, and the float's key material never on disk. The
 per-transaction cap and the float balance stay in place; the KMS boundary is in addition to them,
 not a replacement for them.
+
+**Open by choice for a capped pilot, 2026-10-04.** The maintainer decided to run a small pilot before
+this item is built ("pilot first", not "A2 first"). That is an exception to the rule at the top of
+this file that a Blocker has none. It is written down here so that nobody has to find it. It has the
+same shape as C2 and G3: chosen, with the cost stated.
+
+**What is exposed.** The payout key is derived from `DEPOSIT_MNEMONIC`. That is a plain line in
+`.env.mainnet` on the VPS, and `tron-signer` holds it in its environment. Anyone who reads that file
+or gets a shell on the host can sign with it. The same mnemonic gives:
+
+- the plain payout float at `2/0`, and the GasFree float that is derived from it;
+- every deposit address at `0/i`, and each user's GasFree account, until the USDT in them is swept.
+
+It does not reach custody. The custody key is not on the host (A4).
+
+**What bounds it in the pilot.** The payout float target is **$100**, so the float holds about $100.
+The largest redemption and the signer's per-transaction cap are **$50** (B4, "Pilot limits").
+Redemptions are off and `/payment/` is closed until the pilot starts. Two limits of that bound:
+
+- The per-transaction cap bounds a compromised *caller* of the signer's API, that is the treasury or
+  the orchestrator. It does **not** bound a leaked key or a shell on the host. That attacker signs
+  directly and meets no cap. For a leaked key, the bounds are the float balance and the USDT that
+  waits at deposit and GasFree addresses.
+- The USDT that waits at those addresses is not limited by the float. It is what users have
+  deposited and not yet had swept.
+
+**When it ends.** The exception is for the pilot only. Raise the float target and the two payout
+limits together, and widen the pilot, only after A2 ships: the payout key behind the same KMS
+boundary as the mint key. This item stays a **Blocker** for anything beyond the pilot.
 
 ### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 blocked on the mainnet cutover**
 
@@ -490,6 +522,9 @@ worth deciding together rather than separately:
 
 #### The decided set — accepted by the maintainer, 2026-09-17
 
+**The pilot lowers three of these numbers (the float, the payout cap and the redemption maximum).**
+See "Pilot limits" below.
+
 Each line names the assumption it rests on. Where an assumption turns out to be wrong, the number
 moves with it rather than the table being rewritten.
 
@@ -540,6 +575,38 @@ than it is.
 **A $25 minimum redemption is high for ride fares**, and that is inherent rather than a choice: the
 on-chain payout cost is fixed regardless of size, so small redemptions are uneconomic. The honest
 options are a higher minimum, a subsidised fee, or batching — not a smaller number.
+
+#### Pilot limits — accepted by the maintainer, 2026-10-04
+
+The pilot runs before A2 (the KMS payout key) exists. So the payout key is a plain secret on the
+host, and the float is the ceiling on what a leaked key can pay out. Three numbers of the decided
+set are lower for the pilot. Nothing else changes.
+
+| Cap | Decided | Pilot | Why this number |
+|---|---|---|---|
+| `PAYOUT_FLOAT_TARGET_USDT` | about $1,000 | **$100** | The float is the ceiling on what a leaked payout key can pay out (A2). $100 is the number the maintainer chose. |
+| `PER_TX_PAYOUT_CAP_USDT` (signer) | $200 | **$50** | `check-cap-invariants.sh` needs the float target to cover the largest payout plus the relay's fee. $100 covers $50 + $2.00. It does not cover $200 + $2.00. |
+| `MAX_REDEMPTION_CLT` (orchestrator) | $200 | **$50** | Equal to the signer's cap, as before. |
+
+The window of a redemption is $25 to $50. The $2.00 fee is still 8% of the smallest one.
+
+**Unchanged on purpose:** the mint caps ($1,000 per transaction, $2,000 per day), the $25 minimum,
+the $2.00 fee and the rolling 24-hour payout ceiling ($1,000). The mint caps bound the unbacked CLT
+that a compromised mint authority can create, and that key is behind KMS (A1), so the pilot does not
+change that risk.
+
+**One open question for the maintainer.** The table above calls the 24-hour ceiling "the float, from
+the other side". With a $100 float it is ten times the float. That does no harm, because the float
+only refills from swept deposits. But it no longer has the reason it was given. Lower it to about
+$200, or keep $1,000 and write down why.
+
+**Where it lives.** The mainnet block of `clutch-deploy/scripts/set-gasfree-settings.sh` and
+`.env.mainnet.example` (clutch-deploy #110). The host runs these values once "Set GasFree settings"
+(network mainnet) and then "Mainnet — start the treasury" have run. The `mainnet-treasury` probe
+shows the values the services run with.
+
+**How it ends.** Raise all three together, only after A2 ships, and run `check-cap-invariants.sh`
+on the new set first.
 
 **Verification:** half met. Each cap is recorded above with the worst case it bounds, and the
 relationships are checked mechanically. What remains is mechanical too and cannot be done yet —
