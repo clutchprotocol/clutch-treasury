@@ -522,7 +522,8 @@ worth deciding together rather than separately:
 
 #### The decided set — accepted by the maintainer, 2026-09-17
 
-**The pilot lowers three of these numbers (the float, the payout cap and the redemption maximum).**
+**The pilot lowers four of these numbers (the float, the payout cap, the redemption maximum and the
+24-hour payout ceiling).**
 See "Pilot limits" below.
 
 Each line names the assumption it rests on. Where an assumption turns out to be wrong, the number
@@ -579,7 +580,7 @@ options are a higher minimum, a subsidised fee, or batching — not a smaller nu
 #### Pilot limits — accepted by the maintainer, 2026-10-04
 
 The pilot runs before A2 (the KMS payout key) exists. So the payout key is a plain secret on the
-host, and the float is the ceiling on what a leaked key can pay out. Three numbers of the decided
+host, and the float is the ceiling on what a leaked key can pay out. Four numbers of the decided
 set are lower for the pilot. Nothing else changes.
 
 | Cap | Decided | Pilot | Why this number |
@@ -587,25 +588,30 @@ set are lower for the pilot. Nothing else changes.
 | `PAYOUT_FLOAT_TARGET_USDT` | about $1,000 | **$100** | The float is the ceiling on what a leaked payout key can pay out (A2). $100 is the number the maintainer chose. |
 | `PER_TX_PAYOUT_CAP_USDT` (signer) | $200 | **$50** | `check-cap-invariants.sh` needs the float target to cover the largest payout plus the relay's fee. $100 covers $50 + $2.00. It does not cover $200 + $2.00. |
 | `MAX_REDEMPTION_CLT` (orchestrator) | $200 | **$50** | Equal to the signer's cap, as before. |
+| `DAILY_PAYOUT_CAP_CLT` (rolling 24 hours) | $1,000 | **$200** | The float, from the other side (see the decided set). $1,000 was ten times the pilot's float. $200 is four largest payouts, the same ratio as stage ($100 against $25). Chosen by the maintainer, 2026-10-04. |
 
 The window of a redemption is $25 to $50. The $2.00 fee is still 8% of the smallest one.
 
-**Unchanged on purpose:** the mint caps ($1,000 per transaction, $2,000 per day), the $25 minimum,
-the $2.00 fee and the rolling 24-hour payout ceiling ($1,000). The mint caps bound the unbacked CLT
-that a compromised mint authority can create, and that key is behind KMS (A1), so the pilot does not
-change that risk.
+**Unchanged on purpose:** the mint caps ($1,000 per transaction, $2,000 per day), the $25 minimum
+and the $2.00 fee. The mint caps bound the unbacked CLT that a compromised mint authority can
+create, and that key is behind KMS (A1), so the pilot does not change that risk.
 
-**One open question for the maintainer.** The table above calls the 24-hour ceiling "the float, from
-the other side". With a $100 float it is ten times the float. That does no harm, because the float
-only refills from swept deposits. But it no longer has the reason it was given. Lower it to about
-$200, or keep $1,000 and write down why.
+**What the 24-hour ceiling does at its limit** (`treasury-service`, `payout.rs`). It sums the
+payouts submitted or paid in the last 24 hours.
+
+- When the next redemption would pass the ceiling, it and every later one wait. Their CLT is already
+  burned. They are paid as older payouts leave the window. `TreasuryRedemptionUnpaid` fires after
+  two hours.
+- A redemption that alone exceeds the ceiling is never paid. A p1 alert is raised and it is skipped.
+  So the ceiling must stay at or above the redemption maximum. `check-cap-invariants.sh` does not
+  compare the two. At $200 against $50 it holds.
 
 **Where it lives.** The mainnet block of `clutch-deploy/scripts/set-gasfree-settings.sh` and
-`.env.mainnet.example` (clutch-deploy #110). The host runs these values once "Set GasFree settings"
-(network mainnet) and then "Mainnet — start the treasury" have run. The `mainnet-treasury` probe
-shows the values the services run with.
+`.env.mainnet.example` (clutch-deploy #110 and #111). The host runs these values once "Set GasFree
+settings" (network mainnet) and then "Mainnet — start the treasury" have run. The `mainnet-treasury`
+probe shows the values the services run with.
 
-**How it ends.** Raise all three together, only after A2 ships, and run `check-cap-invariants.sh`
+**How it ends.** Raise all four together, only after A2 ships, and run `check-cap-invariants.sh`
 on the new set first.
 
 **Verification:** half met. Each cap is recorded above with the worst case it bounds, and the
