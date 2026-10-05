@@ -923,6 +923,23 @@ an alert; and a watcher cursor above the chain head needs to alert rather than h
 Today a stuck mint needs a human to notice, which does not scale.
 :::
 
+**Mainnet, rehearsed 2026-10-05.** `rehearse-restore.yml` takes a chain since clutch-deploy #117. Two
+runs on the mainnet treasury, both clean:
+
+- Source `synthetic` (run 37278951963). The mainnet databases were dumped with a passphrase made for
+  the run, restored into throwaway databases, counted, and dropped.
+- Source `remote` (run 37279016073). The newest dump in the mainnet off-host remote (taken
+  2026-10-04 17:17 UTC) was fetched and opened with the real passphrase in `.env.mainnet`. It was
+  restored into a throwaway database, and `treasury-service --reconcile-once` ran against the copy:
+  `reconciliation status: ok`, "RECONCILED CLEAN". Both copies were dropped.
+
+**What this proves, and what it does not.** The ledger held nothing yet: no mint intents, no
+redemptions, no deposit intents (two deposit addresses had been issued). A ledger with nothing in it
+reconciles trivially. So this proves the path: the remote answers, the passphrase opens the dump, the
+restore loads and the reconciliation runs. It does not prove that data survives. Run source `remote`
+again after the first real deposits and record that date here too. Mainnet D1 is not fully closed
+until then. The logs of these runs name no remote and no user.
+
 ### D2. Plaintext mnemonic copies on the host — **Blocker** (mitigated 2026-09-10)
 
 `provision-treasury-secrets.sh` and `set-mint-caps.sh` each copied `.env` to a timestamped
