@@ -320,22 +320,42 @@ or gets a shell on the host can sign with it. The same mnemonic gives:
 
 It does not reach custody. The custody key is not on the host (A4).
 
-**What bounds it in the pilot.** The payout float target is **$100**, so the float holds about $100.
-The largest redemption and the signer's per-transaction cap are **$50** (B4, "Pilot limits").
+**What bounds it in the pilot.** Since 2026-10-05 the pilot runs ONE WALLET (see "One wallet" below), so
+the float holds the whole reserve and its balance is no longer a bound. The largest redemption and the
+signer's per-transaction cap are **$50** (B4, "Pilot limits").
 Redemptions are on since 2026-10-05, but the treasury refuses to create one until the GasFree float is
 activated, so nobody can withdraw yet. `/payment/` has been open to every account since 2026-10-05
 (B4, "Opened to every account"). Two limits of that bound:
 
 - The per-transaction cap bounds a compromised *caller* of the signer's API, that is the treasury or
   the orchestrator. It does **not** bound a leaked key or a shell on the host. That attacker signs
-  directly and meets no cap. For a leaked key, the bounds are the float balance and the USDT that
-  waits at deposit and GasFree addresses.
-- The USDT that waits at those addresses is not limited by the float. It is what users have
-  deposited and not yet had swept.
+  directly and meets no cap. For a leaked key, the bound is the whole reserve: the float, and the USDT
+  that waits at deposit and GasFree addresses.
+- The USDT that waits at those addresses is what users have deposited and not yet had swept.
 
-**When it ends.** The exception is for the pilot only. Raise the float target and the two payout
-limits together, and widen the pilot, only after A2 ships: the payout key behind the same KMS
-boundary as the mint key. This item stays a **Blocker** for anything beyond the pilot.
+**One wallet, accepted 2026-10-05.** The maintainer asked to remove the separate payout float and to pay
+straight from custody, because of the budget and the early stage of the network. Paying from custody is
+not possible: the custody key is not on the host (A4) and its wallet holds no TRX, so nothing there can
+sign a payout. The maintainer accepted the alternative: the float is the only wallet.
+`PAYOUT_FLOAT_TARGET_USDT` is **$1,000,000** (clutch-deploy `scripts/set-gasfree-settings.sh`). A sweep
+goes to the float while it holds less than the target and to custody after that, and no deposit can reach
+$1,000,000 (the daily mint cap is $200), so every sweep goes to the GasFree float and custody stays
+empty. Three things follow:
+
+- **The float is not a ceiling on theft any more.** The key on the host holds the whole reserve, which
+  is every deposit that has not yet been redeemed, and not about $100. A leaked key or a shell on the
+  host can take all of it. This is the cost the maintainer accepted.
+- **What limits the loss is how fast the reserve can grow:** the mint caps ($100 per deposit, $200 per
+  day). The reserve is never more than what users have put in and not taken out.
+- **Reconciliation does not change.** It already counts custody, every float and the unswept deposit
+  addresses (`get_reserve_balance`).
+
+To go back, set `PAYOUT_FLOAT_TARGET_USDT` to $100 again. Sweeps then go to custody once the float holds
+$100. What is in the float stays there and pays redemptions.
+
+**When it ends.** The exception is for the pilot only. Raise the two payout limits together and put the
+float target back, and widen the pilot, only after A2 ships: the payout key behind the same KMS boundary
+as the mint key. This item stays a **Blocker** for anything beyond the pilot.
 
 ### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 blocked on the mainnet cutover**
 
@@ -494,7 +514,8 @@ above them, so they are the last line of defence and have to be chosen on purpos
 
 The float balance is a cap nobody set: **a compromised `treasury-service` cannot move more than the
 float holds**, because it cannot reach custody at all (A4, A5). Keeping the float small is
-therefore a safety control and not just an operational convenience.
+therefore a safety control and not just an operational convenience. **The mainnet pilot gives this
+control up on purpose (one wallet, 2026-10-05, A2): the float holds the whole reserve.**
 
 **The relationships are now checked mechanically** rather than remembered:
 `clutch-deploy/scripts/check-cap-invariants.sh`, which `set-mint-caps.sh` runs after every change.
@@ -524,9 +545,9 @@ worth deciding together rather than separately:
 
 #### The decided set — accepted by the maintainer, 2026-09-17
 
-**The pilot lowers six of these numbers (the float, the payout cap, the redemption maximum, the
-24-hour payout ceiling and the two mint caps).**
-See "Pilot limits" below.
+**The pilot changes six of these numbers (the float target, the payout cap, the redemption maximum, the
+24-hour payout ceiling and the two mint caps).** The float target is not lowered but turned into a
+switch: one wallet. See "Pilot limits" below.
 
 Each line names the assumption it rests on. Where an assumption turns out to be wrong, the number
 moves with it rather than the table being rewritten.
@@ -582,13 +603,14 @@ options are a higher minimum, a subsidised fee, or batching — not a smaller nu
 #### Pilot limits — accepted by the maintainer, 2026-10-04
 
 The pilot runs before A2 (the KMS payout key) exists. So the payout key is a plain secret on the
-host, and the float is the ceiling on what a leaked key can pay out. Six numbers of the decided
-set are lower for the pilot. Nothing else changes.
+host. Since 2026-10-05 the pilot also runs one wallet, so the float is no longer a ceiling on what a
+leaked key can take: it holds the whole reserve (A2, "One wallet"). Six numbers of the decided set
+are different for the pilot. Nothing else changes.
 
 | Cap | Decided | Pilot | Why this number |
 |---|---|---|---|
-| `PAYOUT_FLOAT_TARGET_USDT` | about $1,000 | **$100** | The float is the ceiling on what a leaked payout key can pay out (A2). $100 is the number the maintainer chose. |
-| `PER_TX_PAYOUT_CAP_USDT` (signer) | $200 | **$50** | `check-cap-invariants.sh` needs the float target to cover the largest payout plus the relay's fee. $100 covers $50 + $2.00. It does not cover $200 + $2.00. |
+| `PAYOUT_FLOAT_TARGET_USDT` | about $1,000 | **$1,000,000** | One wallet, accepted by the maintainer on 2026-10-05 (A2, "One wallet"). It is a switch and not a limit: a sweep goes to the float while the float holds less than this, so every sweep goes to the float and custody stays empty. The first pilot value was $100 (2026-10-04), when the float was the ceiling on what a leaked payout key could take. |
+| `PER_TX_PAYOUT_CAP_USDT` (signer) | $200 | **$50** | `check-cap-invariants.sh` needs the float target to cover the largest payout plus the relay's fee. $1,000,000 covers $50 + $2.00 and $200 + $2.00. |
 | `MAX_REDEMPTION_CLT` (orchestrator) | $200 | **$50** | Equal to the signer's cap, as before. |
 | `DAILY_PAYOUT_CAP_CLT` (rolling 24 hours) | $1,000 | **$200** | The float, from the other side (see the decided set). $1,000 was ten times the pilot's float. $200 is four largest payouts, the same ratio as stage ($100 against $25). Chosen by the maintainer, 2026-10-04. |
 | `PER_TX_MINT_CAP_CLT` | $1,000 | **$100** | Set when mainnet was opened to every account (below). What is credited in one deposit must not outgrow what can be paid out. A deposit above it is parked for a human. Chosen by the maintainer, 2026-10-05. |
