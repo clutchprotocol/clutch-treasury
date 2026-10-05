@@ -170,7 +170,12 @@ nothing and is held for a human (`needs_manual`). The deposit panel shows the mi
 **The cost of this safety, stated plainly:** users pay the configured maximum, not the live fee. At
 1.50 + 0.50 against a live 1.00 + 0.30, a first deposit pays 0.70 more than strictly needed. The
 difference stays behind as extra backing, and it is what later pays for the float's activation
-(section 4). It must be presented to users as "fee up to", never as a fixed fee.
+(section 4). This section first said it must be presented to users as "fee up to". **Decision of
+2026-10-05 (the maintainer): say it plainly.** "Up to" reads as "I pay the real fee, at most this",
+and the treasury does not charge that: it takes the maximum, always. The deposit panel now shows the
+amount taken as the network fee, with a note that the relay may charge less and that the difference is
+not refunded and stays in the reserve as extra backing; the docs and the website say the same. The
+API field `fee_up_to_usdt` keeps its name, which is the most the relay can charge.
 
 ## 3. Sweeping
 

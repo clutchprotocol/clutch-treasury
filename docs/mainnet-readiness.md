@@ -677,11 +677,15 @@ the maintainer was told before deciding. They are kept here because they are the
   The float is not activated. Activating it needs the float to hold at least 4.00 USDT plus the smallest
   transfer, and the reserve to exceed what users are owed by at least 4.00 USDT (`ON-CALL.md`,
   "Activate the GasFree float"). Without USDT from the maintainer, both come from users' deposits. A
-  first deposit holds back up to 4.00 USDT and the relay charges about 3.00 at today's fees, so each
+  first deposit holds back 4.00 USDT and the relay charges about 3.00 at today's fees, so each
   first deposit leaves about 1.00, and it takes about four. Until then nobody can withdraw, and the
-  first depositors wait for the people after them.
-- **A deposit costs the user up to 4.00 USDT the first time**, and up to 2.00 after that. The minimum
-  after the fee is 5.00.
+  first depositors wait for the people after them. That is the "users pay" way, and the maintainer
+  chose it on 2026-10-05, on the condition that it is said plainly (next point).
+- **A deposit costs the user 4.00 USDT the first time**, and 2.00 after that. That is the most the
+  relay may charge, and the treasury takes all of it. The relay charges less today (about 3.00 and
+  1.50), and the difference is not refunded: it stays in the reserve as extra backing. The app, the
+  docs and the website say so since 2026-10-05; they used to say "up to". The minimum after the fee is
+  5.00.
 - **What is credited is bounded by the mint caps** ($100 per deposit, $200 per day). A deposit above
   $100 is not credited until a human raises the cap and approves it again (`treasury_bridge.rs` and
   `outbox.rs`). A deposit that would take the day over $200 waits and is retried by itself. In both
