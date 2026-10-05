@@ -1,5 +1,10 @@
 # Key ceremony
 
+> **Not in use since 2026-10-05.** The mainnet mint key is a plain secret on the host (readiness A1,
+> "Mint key on the host"), made without a ceremony, and the Azure key described here is no longer the
+> authority of any chain. This page is kept as the procedure for the day the mint key goes behind a KMS
+> or a hardware boundary again. That needs a new chain, because `mint_authority` is a genesis value.
+
 Readiness item **A3**. `keys.md` names a key ceremony and tested recovery as mainnet blockers
 without saying what either involves. You cannot hold a ceremony you have not written down, so this
 is that procedure. It is a prerequisite for A3, not A3 itself: the item closes when the ceremony has

@@ -55,7 +55,11 @@ Five things must all be true before any mainnet address is handed to a user:
 5. Someone other than the maintainer can halt minting and knows how.
 
 **Exception, 2026-10-04:** the payout-key half of item 1 is waived for a capped pilot (A2). The mint
-key half stands: it is behind Azure Key Vault (A1).
+key half stood: it was behind Azure Key Vault (A1).
+
+**Exception, 2026-10-05:** the mint-key half is waived for the same pilot. Both keys are now plain
+secrets on the stage host (A1, "Mint key on the host"; A2). Item 1 is open until both are behind a
+boundary again.
 
 Everything below expands these, plus the product and legal work that sits outside them.
 
@@ -154,7 +158,40 @@ API call, a dispute mechanism — that is named in its own section along with wh
 
 The named blocker, already tracked in [`keys.md`](keys.md).
 
-### A1. Mint authority custody — **Closed 2026-09-18, single-key** (M-of-N shipped 2026-09-11)
+### A1. Mint authority custody — **Open by choice for the pilot, 2026-10-05: the mint key is on the host.** Was closed 2026-09-18 behind Azure Key Vault, single-key (M-of-N shipped 2026-09-11)
+
+**Mint key on the host, 2026-10-05.** The maintainer asked, because of the budget and the early
+stage of the network, to keep the keys in the app and not in Azure. The mint key is now a plain
+secret in `.env.mainnet` on the stage host (`MINT_AUTHORITY_SECRET`, with its public address in
+`MINT_AUTHORITY_ADDRESS`). It was made on the host the same day by `mainnet-mint-key.yml`, inside the
+treasury image's `ceremony-check`, and never printed. Its address is
+`0x87b7ec606b943b99273097644f3a9e22581ceda6`. `mainnet-treasury-service` signs with it
+(`APP_SIGNER_KIND=env`), and at start it logged "mint authority confirmed by the chain".
+
+`mint_authority` is a genesis value, so the key could not be swapped on the running chain. The
+mainnet chain was **replaced the same day** (C1). The first chain had never minted anything: the
+reset script (`clutch-deploy` `scripts/reset-mainnet-chain.sh`) refuses unless the ledger has no mint
+event and no mint intent in flight and the last reconciliation shows zero supply, and all three were
+zero. So nothing was lost. The chain id, validators and every other parameter are unchanged. A copy of
+the first chain's three data volumes is kept on the host.
+
+**What this costs.** A leaked key, or a shell on the host, can mint CLT directly on the chain, without
+limit. The four-eyes rule, the mint caps and the breaker are in `treasury-service`, off-chain, so they
+stop a mistake in the treasury and not a holder of the key. A host compromise now gives the attacker
+both keys: the whole reserve (A2, "One wallet") and, on top of that, any amount of unbacked CLT, which
+breaks the peg for everyone who holds CLT. Redeeming unbacked CLT through the normal path is bounded
+by the reserve and the payout limits (B4). If the mint key is lost, no CLT can ever be minted on this
+chain again. The maintainer must keep a copy of the secret somewhere that is not the host; nothing
+here checks that this was done.
+
+**When it ends.** The same as A2: before anything beyond the pilot. Putting the mint key behind a KMS
+or a hardware boundary again needs another new chain, for the same reason. The Azure signer
+(`AzureKmsSigner`, `APP_SIGNER_KIND=azure_kms`) is still in the code and unused, and the ceremony in
+A3 and `KEY-CEREMONY.md` still describes how to do it. The earlier the move, the cheaper the new
+chain: it is free while no CLT exists.
+
+**Everything below in A1 is the history of the Azure design**, which was in force from 2026-09-18 to
+2026-10-05.
 
 The mint authority was an environment variable (`ChainSigner` / `EnvKeySigner`,
 `crates/clutch-chain/src/signer.rs`). It was the only key that could create CLT, so a host
@@ -357,7 +394,14 @@ $100. What is in the float stays there and pays redemptions.
 float target back, and widen the pilot, only after A2 ships: the payout key behind the same KMS boundary
 as the mint key. This item stays a **Blocker** for anything beyond the pilot.
 
-### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19; step 6 blocked on the mainnet cutover**
+### A3. Key ceremony and tested recovery — **Steps 1-5 done 2026-09-19 for the Azure key; that key stopped being the mint authority on 2026-10-05**
+
+**Superseded 2026-10-05.** The mainnet mint authority is now the key on the host (A1, "Mint key on
+the host"), made without a ceremony and without a tested recovery: the maintainer's copy of the
+secret is the only recovery. The Azure key `clutch-mint-key-1` is no longer the authority of any
+chain, so step 6 below is moot, and the maintainer can delete the vault and both app registrations.
+The register is kept as the record of what was done, and as the procedure for the day the mint key
+goes behind a boundary again.
 
 The ceremony has been performed against the real key. What is recorded here is the register entry
 this item asks for.
@@ -427,7 +471,7 @@ is started:
 
 | Piece | State |
 |---|---|
-| `docker-compose.mainnet.treasury.yml` | An overlay on the testnet treasury file, holding only the differences: TRON mainnet, the KMS signer, `clutch-network` re-pointed at the mainnet chain, an alias so nginx can tell the two orchestrators apart. |
+| `docker-compose.mainnet.treasury.yml` | An overlay on the testnet treasury file, holding only the differences: TRON mainnet, the mint key on the host (the KMS signer until 2026-10-05), `clutch-network` re-pointed at the mainnet chain, an alias so nginx can tell the two orchestrators apart. |
 | `.env.mainnet.example` | Every value, with the four that are yours marked. |
 | `provision-treasury-secrets.sh` | Takes `ENV_FILE`; the workflow offers `.env` or `.env.mainnet`. Generates a **separate** mnemonic and never overwrites. |
 | `/payment/` on the mainnet vhost | Returns **503**, asserted by a deploy gate. It stays that way until a mainnet orchestrator exists. |
@@ -673,7 +717,17 @@ exist. This item now waits on C1 rather than on a decision.
 
 ## C. Chain and genesis
 
-### C1. Fresh mainnet genesis — **Closed 2026-09-19: the chain is running**
+### C1. Fresh mainnet genesis — **Closed 2026-09-19: the chain is running. Replaced 2026-10-05, same parameters, new `mint_authority`**
+
+**Replaced 2026-10-05.** The first chain was replaced by a second one with the same parameters except
+`mint_authority`, which is now `0x87b7ec606b943b99273097644f3a9e22581ceda6`, the mint key on the host
+(A1). The first chain had never minted (0 mint events, 0 supply). `mainnet-reset-chain.yml` (run
+37311101546) removed it, after the gates passed, and kept a copy of its data on the host. `mainnet-start.yml`
+(run 37311399175) started the new one at 12:42 UTC: all three validators reported the same block at
+height 3 — `6388b477967c8932dd58a4d718a259a99248aba17619f3eb496ea3daa735f5c7` — and none logged a
+rejection. The treasury's watcher raised one p1 ("chain cursor above head") and reset its own cursor,
+as designed. Everything below describes the first chain and is kept for the record; where it names
+the old authority, read the new one.
 
 **Started 2026-09-19** by `clutch-deploy`'s `mainnet-start.yml` (run 35445134248), from commit
 `9e418eb`. The run log is the permanent record of the committed values. `MAINNET=1 check-genesis.sh`
