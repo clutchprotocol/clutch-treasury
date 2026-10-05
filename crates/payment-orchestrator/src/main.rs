@@ -13,6 +13,13 @@ async fn main() {
         .init();
     let env = std::env::args().nth(2).unwrap_or_else(|| "default".to_string()); // `-- --env X` later; default fine
     let config = OrchConfig::load(&env).expect("load config");
+    // One fixed line that the deploy looks for. An image from before the allowlist ignores
+    // APP_PILOT_ALLOWED_ADDRESSES without a word, so a missing line is how a start finds out that the
+    // gate it asked for is not there. It names a count, never an address: the logs are not private.
+    match &config.pilot_allowed_addresses {
+        None => tracing::info!("pilot allowlist: off, every account may use this service"),
+        Some(list) => tracing::info!("pilot allowlist: on, {} address(es)", list.len()),
+    }
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)

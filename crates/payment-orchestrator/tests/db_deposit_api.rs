@@ -101,6 +101,8 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
         rate_limit_per_minute: 1_000,
         gasfree: None,
+        // Everyone, as on stage: the pilot allowlist has its own tests below.
+        pilot_allowed_addresses: None,
     }
 }
 
@@ -179,6 +181,59 @@ async fn seed_deposit(
     .await
     .unwrap();
     id
+}
+
+/// POST /api/v1/deposits as `user`, through the real router, with the response left unread. A
+/// refusal (403) has no body, which `post_deposit` below would try to parse as JSON.
+async fn post_deposit_response(app: axum::Router, user: &str) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/deposits")
+        .header("authorization", bearer_for(user))
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+/// The pilot allowlist is checked after the signature and before anything is created: an account
+/// that is not on it gets 403 and is handed no address, and one that is on it gets an address, in
+/// whatever case its token carries.
+#[tokio::test]
+async fn a_pilot_allowlist_refuses_unlisted_accounts_before_they_get_an_address() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    // Lower-case, as `parse_pilot_allowed` stores it. USER_A in its token is mixed-case.
+    config.pilot_allowed_addresses = Some(vec![USER_A.to_ascii_lowercase()]);
+    let app = router_with(pool.clone(), config);
+
+    let refused = post_deposit_response(app.clone(), USER_B).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let listed = post_deposit_response(app, USER_A).await;
+    assert_ne!(listed.status(), StatusCode::FORBIDDEN);
+    let body = body_json(listed).await;
+    assert!(body["address"].as_str().unwrap().starts_with('T'));
+
+    let given: i64 = sqlx::query_scalar("SELECT count(*) FROM deposit_addresses WHERE lower(user_pk) = lower($1)")
+        .bind(USER_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(given, 0, "an account that is not on the list is handed no address");
+}
+
+/// A pilot list with nobody on it refuses everybody. It is what a blank setting means, so an empty
+/// value can never open the service.
+#[tokio::test]
+async fn an_empty_pilot_allowlist_refuses_everyone() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    config.pilot_allowed_addresses = Some(vec![]);
+    let app = router_with(pool, config);
+
+    assert_eq!(post_deposit_response(app, USER_A).await.status(), StatusCode::FORBIDDEN);
 }
 
 /// The user asks where to send, not how much they promise to send. Two calls must give the same
