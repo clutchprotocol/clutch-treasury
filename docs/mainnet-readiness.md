@@ -322,8 +322,9 @@ It does not reach custody. The custody key is not on the host (A4).
 
 **What bounds it in the pilot.** The payout float target is **$100**, so the float holds about $100.
 The largest redemption and the signer's per-transaction cap are **$50** (B4, "Pilot limits").
-Redemptions are off. `/payment/` has been open to every account since 2026-10-05 (B4, "Opened to
-every account"). Two limits of that bound:
+Redemptions are on since 2026-10-05, but the treasury refuses to create one until the GasFree float is
+activated, so nobody can withdraw yet. `/payment/` has been open to every account since 2026-10-05
+(B4, "Opened to every account"). Two limits of that bound:
 
 - The per-transaction cap bounds a compromised *caller* of the signer's API, that is the treasury or
   the orchestrator. It does **not** bound a leaked key or a shell on the host. That attacker signs
@@ -603,8 +604,11 @@ was to leave the caps as decided). `PILOT_ALLOWED_ADDRESSES` is `*`. The orchest
 a list again at any time (`clutch-deploy/docs/ON-CALL.md`, "Who may use mainnet"). These are the facts
 the maintainer was told before deciding. They are kept here because they are the risk:
 
-- **Nobody can withdraw yet.** Redemptions are off (`APP_REDEMPTIONS_ENABLED=false`) and the GasFree
-  float is not activated. Activating it needs the float to hold at least 4.00 USDT plus the smallest
+- **Nobody can withdraw yet.** Redemptions were turned on the same day (`APP_REDEMPTIONS_ENABLED=true`,
+  clutch-deploy #115), but with the GasFree rail the treasury refuses to create a redemption (503,
+  "not yet") until the GasFree float has made its first transfer. That refusal comes before anything
+  exists to burn against, so nobody loses CLT while they wait (`create_redemption_intent_handler`).
+  The float is not activated. Activating it needs the float to hold at least 4.00 USDT plus the smallest
   transfer, and the reserve to exceed what users are owed by at least 4.00 USDT (`ON-CALL.md`,
   "Activate the GasFree float"). Without USDT from the maintainer, both come from users' deposits. A
   first deposit holds back up to 4.00 USDT and the relay charges about 3.00 at today's fees, so each
