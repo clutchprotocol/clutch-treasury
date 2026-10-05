@@ -322,7 +322,8 @@ It does not reach custody. The custody key is not on the host (A4).
 
 **What bounds it in the pilot.** The payout float target is **$100**, so the float holds about $100.
 The largest redemption and the signer's per-transaction cap are **$50** (B4, "Pilot limits").
-Redemptions are off and `/payment/` is closed until the pilot starts. Two limits of that bound:
+Redemptions are off. `/payment/` has been open to every account since 2026-10-05 (B4, "Opened to
+every account"). Two limits of that bound:
 
 - The per-transaction cap bounds a compromised *caller* of the signer's API, that is the treasury or
   the orchestrator. It does **not** bound a leaked key or a shell on the host. That attacker signs
@@ -522,8 +523,8 @@ worth deciding together rather than separately:
 
 #### The decided set — accepted by the maintainer, 2026-09-17
 
-**The pilot lowers four of these numbers (the float, the payout cap, the redemption maximum and the
-24-hour payout ceiling).**
+**The pilot lowers six of these numbers (the float, the payout cap, the redemption maximum, the
+24-hour payout ceiling and the two mint caps).**
 See "Pilot limits" below.
 
 Each line names the assumption it rests on. Where an assumption turns out to be wrong, the number
@@ -580,7 +581,7 @@ options are a higher minimum, a subsidised fee, or batching — not a smaller nu
 #### Pilot limits — accepted by the maintainer, 2026-10-04
 
 The pilot runs before A2 (the KMS payout key) exists. So the payout key is a plain secret on the
-host, and the float is the ceiling on what a leaked key can pay out. Four numbers of the decided
+host, and the float is the ceiling on what a leaked key can pay out. Six numbers of the decided
 set are lower for the pilot. Nothing else changes.
 
 | Cap | Decided | Pilot | Why this number |
@@ -589,12 +590,34 @@ set are lower for the pilot. Nothing else changes.
 | `PER_TX_PAYOUT_CAP_USDT` (signer) | $200 | **$50** | `check-cap-invariants.sh` needs the float target to cover the largest payout plus the relay's fee. $100 covers $50 + $2.00. It does not cover $200 + $2.00. |
 | `MAX_REDEMPTION_CLT` (orchestrator) | $200 | **$50** | Equal to the signer's cap, as before. |
 | `DAILY_PAYOUT_CAP_CLT` (rolling 24 hours) | $1,000 | **$200** | The float, from the other side (see the decided set). $1,000 was ten times the pilot's float. $200 is four largest payouts, the same ratio as stage ($100 against $25). Chosen by the maintainer, 2026-10-04. |
+| `PER_TX_MINT_CAP_CLT` | $1,000 | **$100** | Set when mainnet was opened to every account (below). What is credited in one deposit must not outgrow what can be paid out. A deposit above it is parked for a human. Chosen by the maintainer, 2026-10-05. |
+| `DAILY_MINT_CAP_CLT` | $2,000 | **$200** | The same as the daily payout ceiling, so that what is credited in a day cannot outgrow what can be paid out in one. A deposit that would pass it waits, and is retried as older mints leave the 24-hour window. Chosen by the maintainer, 2026-10-05. |
 
 The window of a redemption is $25 to $50. The $2.00 fee is still 8% of the smallest one.
 
-**Unchanged on purpose:** the mint caps ($1,000 per transaction, $2,000 per day), the $25 minimum
-and the $2.00 fee. The mint caps bound the unbacked CLT that a compromised mint authority can
-create, and that key is behind KMS (A1), so the pilot does not change that risk.
+**Unchanged on purpose:** the $25 minimum and the $2.00 fee.
+
+**Opened to every account, 2026-10-05.** The maintainer asked for top-ups on mainnet to be open to
+every account. Offered the choice, they opened it with the lower mint caps above (the other choice
+was to leave the caps as decided). `PILOT_ALLOWED_ADDRESSES` is `*`. The orchestrator can be limited to
+a list again at any time (`clutch-deploy/docs/ON-CALL.md`, "Who may use mainnet"). These are the facts
+the maintainer was told before deciding. They are kept here because they are the risk:
+
+- **Nobody can withdraw yet.** Redemptions are off (`APP_REDEMPTIONS_ENABLED=false`) and the GasFree
+  float is not activated. Activating it needs the float to hold at least 4.00 USDT plus the smallest
+  transfer, and the reserve to exceed what users are owed by at least 4.00 USDT (`ON-CALL.md`,
+  "Activate the GasFree float"). Without USDT from the maintainer, both come from users' deposits. A
+  first deposit holds back up to 4.00 USDT and the relay charges about 3.00 at today's fees, so each
+  first deposit leaves about 1.00, and it takes about four. Until then nobody can withdraw, and the
+  first depositors wait for the people after them.
+- **A deposit costs the user up to 4.00 USDT the first time**, and up to 2.00 after that. The minimum
+  after the fee is 5.00.
+- **What is credited is bounded by the mint caps** ($100 per deposit, $200 per day). A deposit above
+  $100 is not credited until a human raises the cap and approves it again (`treasury_bridge.rs` and
+  `outbox.rs`). A deposit that would take the day over $200 waits and is retried by itself. In both
+  cases the user's USDT stays at their deposit address, counted in the reserve, and no CLT exists for
+  it until it is credited.
+- **What is not bounded:** the number of users, and the payout key on the host (A2).
 
 **What the 24-hour ceiling does at its limit** (`treasury-service`, `payout.rs`). It sums the
 payouts submitted or paid in the last 24 hours.
@@ -607,11 +630,12 @@ payouts submitted or paid in the last 24 hours.
   compare the two. At $200 against $50 it holds.
 
 **Where it lives.** The mainnet block of `clutch-deploy/scripts/set-gasfree-settings.sh` and
-`.env.mainnet.example` (clutch-deploy #110 and #111). The host runs these values once "Set GasFree
-settings" (network mainnet) and then "Mainnet — start the treasury" have run. The `mainnet-treasury`
-probe shows the values the services run with.
+`.env.mainnet.example` (clutch-deploy #110, #111 and #114). The host runs them. The mint caps were set
+there with "Set mint caps" before the repo said so, and #114 makes the writer say the same, so that a
+later "Set GasFree settings" does not put the decided caps back. The `mainnet-treasury` probe shows
+the values the services run with, and how many addresses the allowlist names.
 
-**How it ends.** Raise all four together, only after A2 ships, and run `check-cap-invariants.sh`
+**How it ends.** Raise all six together, only after A2 ships, and run `check-cap-invariants.sh`
 on the new set first.
 
 **Verification:** half met. Each cap is recorded above with the worst case it bounds, and the
