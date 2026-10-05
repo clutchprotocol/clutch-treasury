@@ -630,8 +630,9 @@ payouts submitted or paid in the last 24 hours.
   burned. They are paid as older payouts leave the window. `TreasuryRedemptionUnpaid` fires after
   two hours.
 - A redemption that alone exceeds the ceiling is never paid. A p1 alert is raised and it is skipped.
-  So the ceiling must stay at or above the redemption maximum. `check-cap-invariants.sh` does not
-  compare the two. At $200 against $50 it holds.
+  So the ceiling must stay at or above the redemption maximum. `check-cap-invariants.sh` compares the
+  two since 2026-10-05 (check 5b, clutch-deploy #118) and refuses a set where the maximum is above
+  the ceiling. It runs on every stage deploy and on the mainnet start. At $200 against $50 it holds.
 
 **Where it lives.** The mainnet block of `clutch-deploy/scripts/set-gasfree-settings.sh` and
 `.env.mainnet.example` (clutch-deploy #110, #111 and #114). The host runs them. The mint caps were set
