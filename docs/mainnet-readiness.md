@@ -1310,9 +1310,11 @@ threshold together. Record whichever here.
 
 **What changed.** The reference app no longer generates, imports, stores or backs up a private key,
 on any network. The user's own wallet (MetaMask, Trust Wallet) keeps the key and signs a short
-readable text with `personal_sign`; the node (`Transaction::verify_signature`, `clutch-node` #23) and
-the Hub API (`verify_auth_challenge`, `clutch-hub` #29) accept that next to the old signature, and
-the SDK takes a `Signer` where it took a key (`clutch-hub` #30). The key notice, the encrypted backup,
+readable text with `personal_sign`, and TronLink signs the same text with `signMessageV2` (TIP-191,
+the same key with another prefix; `clutch-node` #24, `clutch-hub` #31 and #32); the node
+(`Transaction::verify_signature`, `clutch-node` #23) and the Hub API (`verify_auth_challenge`,
+`clutch-hub` #29) accept that next to the old signature, and the SDK takes a `Signer` where it took
+a key (`clutch-hub` #30). The key notice, the encrypted backup,
 the private-key modal and `utils/wallet.js` / `utils/keystore.js` are deleted, and the new version
 deletes the `clutch_{passenger|driver}_{publicKey|privateKey}` entries that older versions left in
 `localStorage`. What the app keeps about a wallet is its id, so the next visit connects without a
