@@ -240,8 +240,7 @@ pub async fn reset_attempts(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
 
 /// Rows due for the bridge's create step: `confirmed` deposits whose backoff window has
 /// elapsed. The `confirmed` row itself IS the pending-operation row (spec §6 outbox semantics —
-/// it was written atomically with the state change by `webhook.rs`'s `confirm_and_credit`), so
-/// there is no separate queue to scan.
+/// the poller writes it when it confirms a transfer), so there is no separate queue to scan.
 pub async fn due_for_mint_request(pool: &PgPool) -> Result<Vec<DepositIntent>, sqlx::Error> {
     sqlx::query_as::<_, DepositIntent>(&format!(
         "SELECT {INTENT_COLS} FROM deposit_intents WHERE status = 'confirmed' AND next_attempt_at <= now() ORDER BY created_at"

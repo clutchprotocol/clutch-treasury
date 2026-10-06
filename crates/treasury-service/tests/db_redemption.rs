@@ -767,7 +767,7 @@ impl PayoutSigner for GasFreeReads {
         Ok(Trace { state: "SUCCEED".into(), txn_hash: self.txn_hash.map(str::to_string), txn_amount: None })
     }
     async fn float_owner(&self) -> Result<(String, Option<String>), String> {
-        Ok((FLOAT_OWNER.into(), Some(float().into())))
+        Ok((FLOAT_OWNER.into(), Some(float())))
     }
 }
 
@@ -1064,7 +1064,7 @@ async fn redemptions_wait_for_the_gasfree_floats_activation_and_it_is_said_once(
     let pool = pool().await;
     let first = pending_redemption(&pool, 10_000_000).await;
     let second = pending_redemption(&pool, 5_000_000).await;
-    let signer = counting(PayoutReply::FloatNotActive { float_address: float().into() });
+    let signer = counting(PayoutReply::FloatNotActive { float_address: float() });
     let cfg = gasfree_config("http://unused".into());
 
     for _ in 0..3 {

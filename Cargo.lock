@@ -302,8 +302,10 @@ dependencies = [
 name = "clutch-chain"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "hex",
+ "reqwest",
  "rlp",
  "secp256k1 0.29.1",
  "serde",
@@ -313,6 +315,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -3044,7 +3047,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha3",
  "sqlx",
  "tokio",
  "tower",
@@ -3063,7 +3065,6 @@ dependencies = [
  "bip32",
  "bip39",
  "bs58",
- "config",
  "dotenv",
  "gasfree",
  "hex",

@@ -1,5 +1,5 @@
 //! Plan C 5b: the deposit->mint bridge, against a real database and wiremock standing in for
-//! the treasury (same convention as `bitcart_adapter.rs`'s wiremock coverage of Bitcart).
+//! the treasury.
 //!
 //! The central property this file exists to prove, per the brief: the POST to
 //! `/internal/mint-intents` sends `expected_amount_usdt` = the amount the user was told to pay (the

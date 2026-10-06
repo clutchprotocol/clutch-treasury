@@ -24,16 +24,14 @@ chrono = { version = "0.4.38", features = ["serde"] }
 jsonwebtoken = "9"
 reqwest = { version = "0.12.7", features = ["json"] }
 async-trait = "0.1"
-# Discriminator shuffle only (uq_active_pay_amount) — already resolves to 0.8.7 in
-# Cargo.lock via secp256k1's "rand" feature in clutch-chain, so this direct dep adds
-# no new version to pin.
+# Retry jitter for the treasury bridge (deposits.rs).
 rand = "0.8"
-# Tron address validation (Plan C T6): base58check decode with the built-in double-SHA256
+# Tron address validation: base58check decode with the built-in double-SHA256
 # checksum verification ("check" feature) — a shape regex ("T…, 34 chars") passes a single
 # mistyped character; only the checksum catches it. Small, focused dep beats hand-rolling
 # base58 + double-SHA256 to avoid adding it.
 bs58 = { version = "0.5", features = ["check"] }
-# BIP32 for per-intent address derivation (derive.rs). Deliberately a crate, not hand-rolled:
+# BIP32 for deposit address derivation (derive.rs). Deliberately a crate, not hand-rolled:
 # a subtly wrong derivation sends real USDT to addresses whose keys cannot be reconstructed.
 bip32 = "0.5"
 # GasFree addresses (addresses.rs, gasfree_chain.rs): G = gasfree(D), computed from public constants,

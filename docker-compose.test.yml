@@ -34,10 +34,9 @@ services:
       # tests, but AppConfig::load still panics on an empty key regardless.
       APP_TRONGRID_API_KEY: test-trongrid-key
       # payment-orchestrator's own secrets, same test rig, same rule: OrchConfig::load
-      # panics on an empty one, so all four must be present for `cargo test --workspace`
+      # panics on an empty one, so all three must be present for `cargo test --workspace`
       # to even construct a config in orchestrator tests.
       APP_JWT_SECRET: test-jwt-secret
-      APP_BITCART_TOKEN: test-bitcart-token
       APP_TREASURY_INITIATOR_TOKEN: test-initiator
       APP_TREASURY_READONLY_TOKEN: test-readonly
     depends_on:
