@@ -31,10 +31,15 @@ cannot move a coin. The mnemonic exists only in `tron-signer`, which publishes n
    address set grows.
 3. `treasury-service` verifies the transfer on chain, records it against its `tron_tx_id`, and mints
    the matching CLT through the four-eyes ledger.
-4. Its sweeper later moves the USDT from the derived address into custody. A freshly derived address
-   holds no TRX and cannot pay for its own sweep, so `tron-signer` funds it first from the fee
-   account at `<account>/1/0` — a different change level from deposit addresses, so nothing there
-   can collide with an address a depositor was told to pay into.
+4. Its sweeper later moves the USDT out of the user's address. On the GasFree rail, which mainnet
+   and stage both run, a relay permit does the sweep and its fee is held back from the USDT, so no
+   TRX is needed. The sweep goes to the payout float while the float holds less than
+   `PAYOUT_FLOAT_TARGET_USDT`, and to custody after that. On the mainnet pilot that target is
+   $1,000,000, so every sweep goes to the float and custody stays empty (one wallet, see
+   [readiness A2](docs/mainnet-readiness.md)). On the older TRX rail a freshly derived address holds
+   no TRX and cannot pay for its own sweep, so `tron-signer` funds it first from the fee account at
+   `<account>/1/0` — a different change level from deposit addresses, so nothing there can collide
+   with an address a depositor was told to pay into.
 
 Any amount is credited in full, and each on-chain transfer is its own row, so repeated top-ups to
 the same address all count rather than just the first.
@@ -44,7 +49,9 @@ identity. There is deliberately no `clt_address` field; it was removed as a foot
 
 ## Redemption
 
-Live since 2026-09-04. A redemption burns CLT and pays USDT back, and **the burn is irreversible and
+Live on the testnet since 2026-09-04. On mainnet redemptions are switched on since 2026-10-05, but
+the treasury refuses to create one until the GasFree float has made its first transfer, so nobody
+can withdraw there yet. A redemption burns CLT and pays USDT back, and **the burn is irreversible and
 happens before the payout**, which drives every decision in that path: the ordering is fixed, a burn
 carrying no reference is CLT destroyed with nothing pointing at it, and a second burn against one
 reference is just as bad — so the attempt is written to storage before the broadcast, never only to
@@ -52,8 +59,8 @@ memory.
 
 A single redemption is bounded **twice, in services that do not share the value**:
 `APP_MAX_REDEMPTION_CLT` refuses the request before any burn, and `tron-signer`'s own per-transaction
-cap refuses the payout. Both are \$25 today and were deliberately aligned, so a request the signer
-would reject can never become a burn nobody can pay.
+cap refuses the payout. Both are \$25 on the testnet and \$50 on the mainnet pilot, always equal
+to each other, so a request the signer would reject can never become a burn nobody can pay.
 
 ## The two API rules that matter
 
@@ -64,7 +71,8 @@ that endpoint exists, which is that owning the orchestrator must never move a de
 **`/internal/payout` is the deliberate exception** and does take `to` and `amount`, because a
 redemption has no other way to express them. Its bound is different, not absent: it can only spend
 from the payout float at `2/0` — never a deposit address, never custody — so the float balance caps
-the loss and a per-transaction cap bounds one request. `contract` is still never a parameter.
+the loss and a per-transaction cap bounds one request. On the mainnet pilot the float holds the whole
+reserve (one wallet), so there the float balance is not a small bound. `contract` is still never a parameter.
 
 ## Endpoints worth knowing
 
@@ -99,8 +107,17 @@ suffixes its own name.
 
 ## Status
 
-**Not ready for real funds**, and the readiness document says exactly why rather than implying
-otherwise. The gate is five conditions — keys behind a hardware or KMS boundary with tested
-recovery, a real mainnet payout receipt, a fresh mainnet genesis with a validator set that is not
-three containers on one host, an off-host ledger backup with a restore that has actually been
-performed, and a second person who can halt minting. None of them is met today.
+**A capped pilot is live on mainnet since 2026-10-05; nothing beyond it is ready.** Mainnet takes
+real USDT from every account, with mint caps of \$100 per deposit and \$200 per day and a \$50
+redemption maximum. Withdrawals open when the GasFree float is activated. The readiness document
+says exactly what the pilot runs without, rather than implying otherwise.
+
+The gate for anything beyond the pilot is five conditions, and the pilot runs with only one met:
+
+| Condition | Today |
+|---|---|
+| Mint and payout keys behind a hardware or KMS boundary, with tested recovery | Waived for the pilot: both keys are on the host |
+| A real mainnet payout receipt | Open: the float is not activated yet |
+| A fresh mainnet genesis, with validators that are not three containers on one host | Fresh genesis yes; validators on one host, by choice |
+| An off-host ledger backup with a restore actually performed | Met 2026-09-15, rehearsed on mainnet 2026-10-05 |
+| A second person who can halt minting | Open, by choice |

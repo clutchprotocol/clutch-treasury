@@ -1,8 +1,14 @@
 # Mainnet readiness
 
-Status as of 2026-09-10: **not ready for real funds.** This document lists every gap between
-the stack as deployed on stage and a deployment that could hold money, with a verification step
-for each one, so readiness is a checklist rather than a judgement call.
+Status as of 2026-10-06: **a capped pilot is live on mainnet; anything beyond the pilot is not
+ready.** The mainnet (chain `1000`) has taken real USDT since 2026-10-05, open to every account, with
+mint caps of $100 per deposit and $200 per day and a $50 redemption maximum (B4, "Pilot limits").
+Withdrawals are not open yet: the treasury refuses a redemption until the GasFree float is activated
+(B1). The pilot runs without parts of the gate below, each one an exception recorded in its own item.
+
+This document lists every gap between the stack as deployed and a deployment that could hold money
+beyond the pilot's limits, with a verification step for each one, so readiness is a checklist rather
+than a judgement call.
 
 Scope is the whole Clutch stack, not only the treasury, because the treasury cannot be safe on
 its own. It lives here because this is the repo that holds funds.
@@ -44,7 +50,9 @@ close anything.
 
 ## The gate
 
-Five things must all be true before any mainnet address is handed to a user:
+Five things must all be true before any mainnet address is handed to a user. Since 2026-10-05 the
+capped pilot hands out mainnet addresses with only item 4 met, by the maintainer's choice; each
+exception is recorded below and in its item. The gate is the rule for anything beyond the pilot.
 
 1. The mint key and the payout key are behind a hardware or KMS boundary, with a tested recovery.
 2. A real mainnet payout receipt has been read, and the energy and fee model matches it.
@@ -53,6 +61,16 @@ Five things must all be true before any mainnet address is handed to a user:
 4. ~~The treasury ledger has an off-host backup and a restore that has actually been performed.~~
    **Met 2026-09-15** — see D1. The remaining four are unchanged.
 5. Someone other than the maintainer can halt minting and knows how.
+
+**Where each item stands, 2026-10-06:**
+
+| Item | State |
+|---|---|
+| 1. Keys behind a boundary | **Waived for the pilot.** Both keys are plain secrets on the host (A1, A2). See the two exceptions below. |
+| 2. A real payout receipt | **Open.** The mainnet treasury runs, but the GasFree float has not been activated, so no payout has been made (B1, B2). |
+| 3. Fresh genesis, independent validators | **Half met.** The mainnet genesis is fresh (C1, replaced on 2026-10-05 and twice on 2026-10-06 for wallet signatures, each time before any CLT existed). The three validators are on one host, open by choice (C2). |
+| 4. Off-host backup and a performed restore | **Met 2026-09-15** (D1). The mainnet restore was rehearsed on 2026-10-05. |
+| 5. A second person who can halt | **Open by choice, 2026-09-18** (G3). |
 
 **Exception, 2026-10-04:** the payout-key half of item 1 is waived for a capped pilot (A2). The mint
 key half stood: it was behind Azure Key Vault (A1).
@@ -65,92 +83,58 @@ Everything below expands these, plus the product and legal work that sits outsid
 
 ## What to do next, in order
 
-Several of these block each other, so the order is not a preference. Everything below needs a
-person, an account, a host, a firm or a lawyer — the engineering side of each item is done and
-recorded in its own section.
+Rewritten 2026-10-06, after the pilot started. The list before it predated the pilot; what it said
+and how each step ended is at the bottom of this section.
 
-~~**Start here, because nothing depends on it and its failure mode is the worst.**~~
+**Now, to finish the pilot.**
 
-1. ~~**Perform the D1 restore rehearsal.**~~ **Done 2026-09-15.** Off-host backups run to
-   Cloudflare R2 nightly, and a dump fetched back out of the remote restores and reconciles `ok`.
-   Re-run `rehearse-restore.yml` with `source: remote` after anything that touches that path.
+1. **Activate the GasFree float and read the first payout receipt (B1, B2).** Withdrawals stay
+   closed until this runs: the treasury answers 503 to a redemption until the float has made its
+   first transfer. `activate-float.yml` for mainnet needs the float to hold at least 4.00 USDT plus
+   the smallest transfer, and the reserve to exceed what users are owed by at least 4.00 USDT
+   (`clutch-deploy/docs/ON-CALL.md`, "Activate the GasFree float"). Then the first real redemption
+   is B1's receipt, and its fee is B2's measurement. Read both on tronscan, not from a service log.
+2. **Decide the deposit-address ceiling (E2).** Accept about 6,000 with the D3 alert as the
+   tripwire, or raise `MAX_ADDRESSES_PER_PASS`, `poll_interval_secs` and that alert threshold
+   together. Not urgent at pilot volumes, but it is a decision nobody has recorded.
 
-   It also found a real 10,000,000 CLT discrepancy that had been raising a p1 since 2026-09-14 —
-   a mint stuck in `submitted` that nothing re-drives — which is the argument for the item rather
-   than an aside. See D1.
-2. ~~**Force a failure (D3).**~~ **Done 2026-09-17.** Alertmanager delivers to Telegram, and
-   `TreasuryServiceDown` was watched firing, routing and arriving during a real four-minute outage.
-   D3 and D4 are both closed.
+**Before raising any pilot limit.** Each of these is a recorded exception, and the pilot's limits
+are what make it acceptable. Raise the six pilot numbers in B4 together, only after:
 
-   This unblocks the caps decision below: the daily mint cap's exposure is that cap multiplied by
-   how long a compromise runs unnoticed, and that is now minutes rather than however long until
-   someone next looked.
-3. **Name a second operator and rehearse a halt (G3).** One person knowing the breaker exists is
-   not a control. Everything they need now exists — a halt workflow and `docs/ON-CALL.md` — so what
-   is left is a conversation and one rehearsal, not a task.
+3. **The payout key behind a boundary (A2).** `AzureKmsSigner` and `external_signature.rs` cover
+   the curve; TRON's digest is different (see A2). Put `PAYOUT_FLOAT_TARGET_USDT` back to a real
+   ceiling at the same time ("One wallet").
+4. **The mint key behind a boundary again (A1, A3).** `mint_authority` is a genesis value, so this
+   is a new chain. That is free only while no CLT exists: the reset refuses the day any CLT has
+   been minted, and after that the move needs a planned migration.
+5. **A second operator who has rehearsed a halt (G3).** Open by choice since 2026-09-18. The halt
+   workflow and `clutch-deploy/docs/ON-CALL.md` exist, so what is left is a person.
 
-**Then the chain of things that unblock each other.**
+**Before anything beyond the pilot.**
 
-4. ~~Provision key custody for the three mint keys.~~ **Done 2026-09-18 for the mint authority,
-   as one key rather than three.** AWS was declined as a provider (maintainer, 2026-09-11); Azure
-   Key Vault was chosen instead of waiting for a second account, per A1 above. Curve `P-256K`,
-   `exportable: false`, confirmed two ways, not one.
+6. **Validators on independent hosts (C2, G2).** Rehearse the move once on a throwaway network
+   first (C3, `clutch-deploy/docs/AUTHORITY-ROTATION.md`). The set size picks the block cadence at
+   `60 / len`, so decide the number deliberately.
+7. **Decide on reputation (H2).** A proposal exists
+   (`docs/superpowers/specs/2026-09-11-reputation-design.md`), recommending it be derived off chain
+   from public history rather than put into consensus.
 
-   **Still open: the payout signer (A2).** Same plumbing (`AzureKmsSigner`, already written) would
-   cover it, but it has not been provisioned — `tron-signer` still holds the payout key derived
-   from the deposit mnemonic as a plain environment variable. A second vault, or a second key in
-   the same vault, and the same ceremony, close it whenever it is prioritised.
+**How the previous list ended**, for anyone following an old link to a step number:
 
-   This closing A1 is also most of what closes D2: the mint secret is what has left `.env` so far.
-   The deposit mnemonic, which D2 also names, stays until A2 is done.
-
-   `external_signature.rs` is deliberately vendor-neutral: it turns a DER `(r, s)` from any
-   external signer into the `(r, s, v)` the node needs, so only the API call itself changes with
-   the provider.
-5. **Decide the mainnet validator set (C2).** Hosts that share no operator, provider or power
-   supply. Its *size* picks the block cadence at `60 / len`, so decide the number deliberately, and
-   it is the other value C1 is waiting on.
-
-**Then the decisions that only need someone to make them.**
-
-8. ~~**Set the mainnet caps (B4).**~~ **Decided 2026-09-17**, in the same sitting as the alert route
-   from step 2, which is what the daily mint cap depended on. The relationships are checked
-   mechanically; applying them needs a mainnet host, so B4 now waits on C1 rather than on anyone.
-9. **Pick the deposit-address ceiling (E2).** Accept ~6,000 with the D3 alert as the tripwire, or
-   raise `MAX_ADDRESSES_PER_PASS`, `poll_interval_secs` and that alert threshold together.
-10. **Choose how the edge config gets an owner (G1).** An include of a directory `clutch-deploy`
-    owns, or Clutch taking port 80. Host reorganisation either way.
-
-**Then the two that are genuinely unfinished design work, not configuration.**
-
-11. **Decide on the dispute mechanism (H1).** A proposal now exists
-    (`docs/superpowers/specs/2026-09-11-dispute-resolution-design.md`) with a recommendation, so
-    this is a review rather than a design exercise. **One decision inside it has to happen before
-    step 13**, not after: if the release window is a consensus parameter it belongs in `ChainInit`,
-    and genesis-committed values cannot be added later without a new chain. Settle that before the
-    mainnet genesis is fixed even if the rest of the mechanism ships later.
-12. **Decide on reputation (H2).** A proposal exists
-    (`docs/superpowers/specs/2026-09-11-reputation-design.md`) recommending it be derived off chain
-    from public history rather than put into consensus. Read it *after* step 11: H1's auto-release
-    removes most of the incentive reputation guards against, which may make the light version
-    sufficient.
-
-**And one decision that has to be made before the genesis, not after.**
-
-12b. **~~Choose N and the mint threshold (A1).~~ Decided 2026-09-12: a 2-of-3.** What remains is
-    generating the three keys in the ceremony (A3), in the three separate locations named in
-    `docs/KEY-CEREMONY.md`. Their addresses are genesis-committed, so all three must exist and be
-    tested before step 13.
-
-**Last, and only after all of the above.**
-
-13. **Boot the mainnet genesis and read the first payout receipt (C1, B1, B2).** Check step 11's
-    consensus-parameter question is answered before this, since the genesis cannot be amended. The first mainnet
-    payout is the first real test of the energy model, because Nile cannot show it. Re-measure the
-    redemption fee from that receipt rather than scaling the testnet number.
-
-Nothing in this list is blocked on further engineering. Where an item still needs code — the KMS
-API call, a dispute mechanism — that is named in its own section along with what has to exist first.
+| Old step | Outcome |
+|---|---|
+| 1. D1 restore rehearsal | Done 2026-09-15; mainnet rehearsed 2026-10-05 (D1). |
+| 2. Force a failure (D3) | Done 2026-09-17. |
+| 3. Second operator (G3) | Still open, by choice. Step 5 above. |
+| 4. Key custody | Done 2026-09-18 for the mint key in Azure; reversed for the pilot 2026-10-05, both keys on the host (A1, A2). Steps 3 and 4 above. |
+| 5. Validator set (C2) | Decided 2026-09-18: one VPS for now. Step 6 above. |
+| 8. Mainnet caps (B4) | Decided 2026-09-17; the pilot runs a lower set since 2026-10-04/05 (B4, "Pilot limits"). |
+| 9. Deposit-address ceiling (E2) | Still open. Step 2 above. |
+| 10. Edge config owner (G1) | Closed 2026-09-13: `clutch-deploy` injects its own blocks into the host's nginx config. |
+| 11. Dispute mechanism (H1) | Built 2026-09-12, live on the testnet 2026-09-14. The mainnet genesis commits `ride_auto_release_secs` 7200, which was the decision that had to come before the genesis. |
+| 12. Reputation (H2) | Still open. Step 7 above. |
+| 12b. 2-of-3 mint authority | Superseded 2026-09-18 by a single key, then by the key on the host (A1). The M-of-N design stays as the reference for a later chain. |
+| 13. Mainnet genesis and payout receipt | Genesis done 2026-09-19 (C1). The payout receipt is step 1 above. |
 
 ---
 
@@ -464,17 +448,24 @@ not a check, so it is broken by an addition rather than by a change.
 
 ## B. The payout rail on mainnet
 
-### B1. First real payout receipt — **Blocker** (wiring built 2026-09-19; unfunded)
+### B1. First real payout receipt — **Blocker** (the mainnet treasury runs since 2026-10-05; the float is not activated, so no payout yet)
 
-`clutch-deploy` now has everything needed to run a treasury against TRON mainnet, and none of it
-is started:
+**Where it stands, 2026-10-06.** The mainnet treasury runs (`docker-compose.mainnet.treasury.yml`,
+compose project `clutch-main-treasury`, started by "Mainnet — start the treasury"). Deposits are
+credited and swept on the GasFree rail into the GasFree float (A2, "One wallet"). Redemptions are on
+(`APP_REDEMPTIONS_ENABLED=true`), but the treasury refuses to create one until the float has made its
+first transfer, and `activate-float.yml` has not been run for mainnet. So no payout has been made and
+this item is still open. The rest of this section is the wiring as it was first built on 2026-09-19;
+two rows of the table changed since, and are marked.
+
+`clutch-deploy` now has everything needed to run a treasury against TRON mainnet:
 
 | Piece | State |
 |---|---|
-| `docker-compose.mainnet.treasury.yml` | An overlay on the testnet treasury file, holding only the differences: TRON mainnet, the mint key on the host (the KMS signer until 2026-10-05), `clutch-network` re-pointed at the mainnet chain, an alias so nginx can tell the two orchestrators apart. |
+| `docker-compose.mainnet.treasury.yml` | **A complete file since, not an overlay**, with `mainnet-` service names so no name answers on a shared network next to the stage one. First built as an overlay on the testnet treasury file, holding only the differences: TRON mainnet, the mint key on the host (the KMS signer until 2026-10-05), `clutch-network` re-pointed at the mainnet chain, an alias so nginx can tell the two orchestrators apart. |
 | `.env.mainnet.example` | Every value, with the four that are yours marked. |
 | `provision-treasury-secrets.sh` | Takes `ENV_FILE`; the workflow offers `.env` or `.env.mainnet`. Generates a **separate** mnemonic and never overwrites. |
-| `/payment/` on the mainnet vhost | Returns **503**, asserted by a deploy gate. It stays that way until a mainnet orchestrator exists. |
+| `/payment/` on the mainnet vhost | **Proxies to `mainnet-payment-orchestrator` since 2026-10-05**; the deploy gate now expects 401 from `/payment/api/v1/deposits`. It returned 503 until the mainnet orchestrator existed. |
 
 **The mnemonics must differ, and this is a money-loss hazard rather than hygiene.** TRON addresses
 are network-agnostic: one mnemonic derives the *same* deposit addresses on Nile and on mainnet. Two
@@ -539,7 +530,7 @@ whichever document is wrong is corrected. The two independent redemption
 bounds must remain numerically aligned, for the reason given in the workspace notes: a request the
 signer would reject must never become a burn nobody can pay.
 
-### B4. Mainnet caps set deliberately — **Blocker** (decided 2026-09-17; applies when a mainnet host exists)
+### B4. Mainnet caps set deliberately — **Blocker** (decided 2026-09-17; the pilot's lower set runs on mainnet since 2026-10-05)
 
 The stage caps were sized for test money. Mainnet caps are the loss ceiling for every failure mode
 above them, so they are the last line of defence and have to be chosen on purpose.
@@ -713,15 +704,30 @@ the values the services run with, and how many addresses the allowlist names.
 **How it ends.** Raise all six together, only after A2 ships, and run `check-cap-invariants.sh`
 on the new set first.
 
-**Verification:** half met. Each cap is recorded above with the worst case it bounds, and the
-relationships are checked mechanically. What remains is mechanical too and cannot be done yet —
-`check-cap-invariants.sh` passing against the mainnet `.env`, which requires a mainnet host to
-exist. This item now waits on C1 rather than on a decision.
+**Verification:** met for the pilot set. Each cap is recorded above with the worst case it bounds,
+and the relationships are checked mechanically. `check-cap-invariants.sh` runs against
+`.env.mainnet` at every mainnet treasury start, and the start refuses if it fails
+(`clutch-deploy/scripts/mainnet-treasury-up.sh`); each mainnet treasury start recorded here since 2026-10-05 got past it. The
+decided set has not run on mainnet yet: it waits on A2, as above.
 ---
 
 ## C. Chain and genesis
 
-### C1. Fresh mainnet genesis — **Closed 2026-09-19: the chain is running. Replaced 2026-10-05, same parameters, new `mint_authority`**
+### C1. Fresh mainnet genesis — **Closed 2026-09-19: the chain is running. Replaced 2026-10-05 (new `mint_authority`) and twice on 2026-10-06 (wallet signatures)**
+
+**Replaced twice more on 2026-10-06, for wallet signatures.** Accepting a signature from the user's
+wallet is a consensus change in clutch-node, so every validator must run it from the same block, and
+both times no CLT existed, so a new chain was cheaper than a rolling upgrade. Same parameters and the
+same `mint_authority` both times; the reset's gates showed 0 mint events, 0 intents and supply 0.
+
+- 10:11 UTC: `personal_sign` (MetaMask, Trust Wallet), validators on `sha-95ea975`
+  (`mainnet-reset-chain.yml` run 37448085408, `mainnet-start.yml` run 37448459799).
+- 14:54 UTC: TronLink's `signMessageV2` too, validators on `sha-d0c3d0a`
+  (run 37482792711, then run 37483108106: three validators at height 3 with the same block hash, 0
+  rejections). Minting resumed at 14:59 UTC.
+
+The reset refuses the day any CLT has been minted, so a later consensus change needs a rolling
+upgrade of the validators instead. The record is in `clutch-deploy/CLAUDE.md`, "The mainnet treasury".
 
 **Replaced 2026-10-05.** The first chain was replaced by a second one with the same parameters except
 `mint_authority`, which is now `0x87b7ec606b943b99273097644f3a9e22581ceda6`, the mint key on the host
@@ -1916,13 +1922,16 @@ that were designed for this and appear sound:
 - **The sweep endpoint takes an index and nothing else.** No destination, amount, or contract
   parameter, so it cannot be turned into a payout path.
 - **Custody is unreachable from code.** The payout float is a separate derivation path, so the worst
-  case for a compromised treasury service is the float balance, not the reserve.
+  case for a compromised treasury service is the float balance, not the reserve. **The mainnet pilot
+  gives this up on purpose** (A2, "One wallet", 2026-10-05): every sweep goes to the float and custody
+  stays empty, so there the worst case is the whole reserve, bounded by the mint caps.
 - **Redemptions are bounded twice, in services that do not share the value**, so a request the
   signer would refuse cannot become a burn nobody can pay.
 - **Ambiguous payouts stop rather than retry.** Only a reply that proves nothing was broadcast
   returns a redemption to the queue; anything else pages a human. That trade accepts a stuck
   redemption to avoid a double payment, which is the right way round.
-- **Mint has four-eyes approval, a per-transaction cap, a daily cap, and a manual halt.**
+- **Mint has four-eyes approval, a per-transaction cap, a daily cap, and a manual halt.** These stop
+  a mistake in the treasury, not a holder of the mint key, which on the pilot is on the host (A1).
 - **Genesis pre-mints nothing.** Every CLT that exists was minted against a verified deposit.
 - **Keys never leave the client for ride transactions.** The Hub forwards signed RLP and cannot
   alter a transaction without the signature failing, and `verifyUnsignedTransaction` closes the
@@ -1930,8 +1939,10 @@ that were designed for this and appear sound:
 
 ## Open questions for the maintainer
 
-1. **What does mainnet mean here** — a persistent public testnet that stops being reset, a bounded
-   pilot in one city with low caps, or a public launch? The blockers differ enormously.
+1. ~~**What does mainnet mean here** — a persistent public testnet that stops being reset, a bounded
+   pilot in one city with low caps, or a public launch? The blockers differ enormously.~~
+   **Answered 2026-10-04: a capped pilot first** ("pilot first", not "A2 first"), opened to every
+   account on 2026-10-05 with the lower mint caps (B4, "Pilot limits").
 2. ~~Who is the second operator?~~ **Answered 2026-09-18: there is none, by choice.** G3 stays
    open — see the note under it and under A1's single-key decision, both dated the same day.
 3. ~~**Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
