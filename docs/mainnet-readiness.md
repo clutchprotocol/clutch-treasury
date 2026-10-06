@@ -1306,14 +1306,36 @@ threshold together. Record whichever here.
 
 ## F. Client-side key handling
 
-### F1. Demo app key storage — **Second branch satisfied 2026-09-11**
+### F1. Demo app key storage — **Closed 2026-10-06: the first branch is done, the app holds no key**
 
-The reference app generates or imports keys in the browser and stores them in plaintext
-`localStorage` under `clutch_{passenger|driver}_privateKey`. Any XSS, any malicious extension, or a
-shared machine is total loss of that user's funds. This does not block a mainnet chain, but it
-blocks shipping this app to real users, and it is the app people copy.
+**What changed.** The reference app no longer generates, imports, stores or backs up a private key,
+on any network. The user's own wallet (MetaMask, Trust Wallet) keeps the key and signs a short
+readable text with `personal_sign`; the node (`Transaction::verify_signature`, `clutch-node` #23) and
+the Hub API (`verify_auth_challenge`, `clutch-hub` #29) accept that next to the old signature, and
+the SDK takes a `Signer` where it took a key (`clutch-hub` #30). The key notice, the encrypted backup,
+the private-key modal and `utils/wallet.js` / `utils/keystore.js` are deleted, and the new version
+deletes the `clutch_{passenger|driver}_{publicKey|privateKey}` entries that older versions left in
+`localStorage`. What the app keeps about a wallet is its id, so the next visit connects without a
+prompt. The mainnet chain was reset onto the validator build that accepts the wallet signature (no
+CLT had ever been minted there, which is what the reset script proves before it deletes anything).
 
-This item offered two branches. The second is now done (`clutch-hub-demo-app` `feat/key-storage-notice`,
+**What is still open, and not hidden.** A wallet shows the text it signs (`clutch-tx:{chain}:{hash}`),
+not the ride: blind signing. The app names what each prompt is for before it opens, and the SDK
+checks the unsigned transaction against what was asked, but a page that is not the app could ask a
+user to sign a text of that shape for a transaction of its own choosing. Readable typed data
+(EIP-712) would fix it. WalletConnect (a phone wallet signing for a page on a computer) is not built;
+on a phone the page opens inside the wallet's own browser.
+
+**Verification:** met. The live app bundle contains no key generation, `localStorage` holds no
+`clutch_*_privateKey`, a transaction signed through a wallet-style provider is accepted by the node
+and a bad one is refused, and a login signed over the plain message returns a token.
+
+*History, kept because it explains the decision.* The reference app generated or imported keys in the
+browser and stored them in plaintext `localStorage` under `clutch_{passenger|driver}_privateKey`. Any
+XSS, any malicious extension, or a shared machine is total loss of that user's funds. This did not
+block a mainnet chain, but it blocked shipping this app to real users, and it is the app people copy.
+
+This item offered two branches. The second was done first (`clutch-hub-demo-app` `feat/key-storage-notice`,
 live on stage): a non-dismissible notice at wallet setup, before the key exists, which is the only
 moment a warning can change what someone does. It says the key is plaintext in this browser and
 readable by any script, extension or other user of the machine; that clearing site data destroys it
@@ -1325,12 +1347,9 @@ stale key names and a "remember keys" option that does not exist; both are fixed
 There is no dismiss button on purpose. A remembered dismissal hides the warning from exactly the
 person who arrives on a shared machine later.
 
-**The first branch — an actual key boundary — remains the better answer** and is required before any
-app built on this pattern holds real funds. Nothing about the disclosure makes plaintext storage
-safe; it makes it *known*, which is the most that documentation can do.
-
-**Verification:** met as written. Re-open as a blocker against any deployment that intends real
-funds through this app, where only the first branch counts.
+**The first branch — an actual key boundary — was the better answer** and is what shipped on
+2026-10-06. Nothing about the disclosure made plaintext storage safe; it made it *known*, which is the
+most that documentation can do.
 
 ### F2. SDK pin in the demo app's production build — **Closed 2026-09-10**
 
@@ -1913,8 +1932,9 @@ that were designed for this and appear sound:
    pilot in one city with low caps, or a public launch? The blockers differ enormously.
 2. ~~Who is the second operator?~~ **Answered 2026-09-18: there is none, by choice.** G3 stays
    open — see the note under it and under A1's single-key decision, both dated the same day.
-3. **Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
-   points at something else? F1 depends entirely on the answer.
+3. ~~**Is the reference app in scope** as a wallet real users hold funds in, or is it a demo that
+   points at something else? F1 depends entirely on the answer.~~ **Answered 2026-10-06: the app
+   holds no key.** The user's own wallet signs, so the question no longer applies (F1).
 
 ---
 
