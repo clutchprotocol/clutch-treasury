@@ -1,8 +1,7 @@
 //! The deposit→mint bridge (Plan C 5b): the only thing in this crate that crosses from the
 //! public zone into the private one. Two steps, both driven off the `confirmed` deposit row
-//! itself — spec §6 outbox semantics: that row IS the pending-operation row, written atomically
-//! with the state change by `webhook.rs`'s `confirm_and_credit`, so there is no separate queue
-//! to keep in sync.
+//! itself — spec §6 outbox semantics: that row IS the pending-operation row, written by the
+//! poller when it confirms a transfer, so there is no separate queue to keep in sync.
 //!
 //! 1. `create_step`: POST `{treasury_url}/internal/mint-intents` with the **initiator** token.
 //!    THE line that matters most in this file: `expected_amount_usdt` is the amount the user was
@@ -302,7 +301,7 @@ async fn record_failure_and_maybe_alert(pool: &PgPool, id: Uuid, step: &str, cau
 }
 
 /// Spawned once from `main.rs`, same shape as `poller::run`. `poll_interval_secs` is shared with
-/// the Bitcart poller — no dedicated interval justified for a second outbound dependency at
+/// the deposit poller — no dedicated interval justified for a second outbound dependency at
 /// pilot volume.
 pub async fn run(pool: PgPool, config: OrchConfig, poll_interval_secs: u64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs));

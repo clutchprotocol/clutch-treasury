@@ -269,7 +269,7 @@ async fn the_deposit_endpoint_returns_a_stable_address_and_needs_no_amount() {
             .await
             .unwrap();
     assert!(
-        hot_until.map_or(false, |t| t > chrono::Utc::now()),
+        hot_until.is_some_and(|t| t > chrono::Utc::now()),
         "the route must mark the address hot"
     );
 

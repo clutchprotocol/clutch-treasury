@@ -147,7 +147,7 @@ async fn backing_below_halt_denies_and_trips() {
     // Liability 100, custody 99 → 9900 bps < 10000.
     treasury_service::ledger::append_event(&pool, "mint_executed", 100, 0, None, None, "seed").await.unwrap();
     treasury_service::ledger::append_event(&pool, "custody_deposit", 0, 99, None, None, "seed").await.unwrap();
-    let mut cfg = test_config();
+    let cfg = test_config();
     let err = breakers::check_mint(&pool, &cfg, 1).await.unwrap_err();
     assert!(err.reason.contains("backing"));
     let (halted,): (bool,) = sqlx::query_as("SELECT minting_halted FROM breaker_state")

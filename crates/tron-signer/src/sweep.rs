@@ -53,6 +53,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::keys::Signer;
+pub(crate) use gasfree::abi_address;
 
 mod gasfree_rail;
 
@@ -388,21 +389,6 @@ fn payout_body(
         "call_value": 0,
         "visible": true,
     }))
-}
-
-/// ABI-encode a Tron address into the 32-byte word `transfer(address,uint256)` expects.
-///
-/// Decodes base58check with the version byte enforced, so a corrupted destination fails here rather
-/// than sending funds to whatever the malformed string happened to encode.
-pub fn abi_address(address: &str) -> Result<String, String> {
-    let bytes = bs58::decode(address)
-        .with_check(Some(0x41))
-        .into_vec()
-        .map_err(|e| format!("address {address} failed base58check: {e}"))?;
-    if bytes.len() != 21 {
-        return Err(format!("address {address} decoded to {} bytes, want 21", bytes.len()));
-    }
-    Ok(format!("{:0>64}", hex::encode(&bytes[1..])))
 }
 
 /// `transfer(address,uint256)` parameters: recipient then amount, each right-aligned in 32 bytes.

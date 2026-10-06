@@ -69,7 +69,7 @@ impl Signer {
             .map_err(|e| format!("invalid BIP39 mnemonic: {e}"))?;
         let seed = mnemonic.to_seed(passphrase);
         let path: DerivationPath = ACCOUNT_PATH.parse().map_err(|e| format!("bad account path: {e}"))?;
-        let account = XPrv::derive_from_path(&seed, &path).map_err(|e| format!("account derivation failed: {e}"))?;
+        let account = XPrv::derive_from_path(seed, &path).map_err(|e| format!("account derivation failed: {e}"))?;
         Ok(Self { account })
     }
 
@@ -97,7 +97,7 @@ impl Signer {
 
     /// The signing key for a deposit address.
     pub fn signing_key_at(&self, index: u32) -> Result<SigningKey, String> {
-        Ok(self.child(index)?.private_key().clone().into())
+        Ok(self.child(index)?.private_key().clone())
     }
 
     fn fee_child(&self) -> Result<XPrv, String> {
@@ -121,7 +121,7 @@ impl Signer {
     }
 
     pub fn fee_signing_key(&self) -> Result<SigningKey, String> {
-        Ok(self.fee_child()?.private_key().clone().into())
+        Ok(self.fee_child()?.private_key().clone())
     }
 
     fn payout_child(&self) -> Result<XPrv, String> {
@@ -145,7 +145,7 @@ impl Signer {
     }
 
     pub fn payout_signing_key(&self) -> Result<SigningKey, String> {
-        Ok(self.payout_child()?.private_key().clone().into())
+        Ok(self.payout_child()?.private_key().clone())
     }
 
     /// The address for `index` — MUST equal what the orchestrator derived from the xpub.

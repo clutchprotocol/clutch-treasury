@@ -6,6 +6,7 @@
 //! derivation.
 
 use crate::derive::AddressDeriver;
+use gasfree::abi_address;
 
 pub struct GasFreeChain {
     http: reqwest::Client,
@@ -140,18 +141,6 @@ impl GasFreeChain {
             Err(e) => SelfTest::Unreachable(e),
         }
     }
-}
-
-/// A TRON address as one 32-byte ABI word, after its base58check checksum is checked.
-fn abi_address(address: &str) -> Result<String, String> {
-    let bytes = bs58::decode(address)
-        .with_check(Some(0x41))
-        .into_vec()
-        .map_err(|e| format!("address {address} failed base58check: {e}"))?;
-    if bytes.len() != 21 {
-        return Err(format!("address {address} decoded to {} bytes, want 21", bytes.len()));
-    }
-    Ok(format!("{:0>64}", hex::encode(&bytes[1..])))
 }
 
 #[cfg(test)]

@@ -10,7 +10,6 @@ jwt_secret = ""
 # "*" for local dev; clutch-deploy overrides via APP_ALLOWED_ORIGINS for staging/production
 # (same ALLOWED_ORIGINS list as the hub API — both are called from the same demo-app origin).
 allowed_origins = "*"
-public_base_url = "http://localhost:8095"
 treasury_url = "http://localhost:8090"
 treasury_initiator_token = ""
 treasury_readonly_token = ""

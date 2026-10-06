@@ -89,25 +89,6 @@ pub fn fee_to_hold(activated: bool, activate_max_usdt: i64, transfer_max_usdt: i
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::fee_to_hold;
-
-    #[test]
-    fn the_fee_to_hold_includes_activation_only_before_it() {
-        assert_eq!(fee_to_hold(false, 1_500_000, 500_000), 2_000_000, "a first transfer also activates");
-        assert_eq!(fee_to_hold(true, 1_500_000, 500_000), 500_000, "an activated account pays one transfer fee");
-    }
-
-    /// Services print their config; 997 bytes of creation code in every such line helps nobody.
-    #[test]
-    fn a_chains_debug_form_names_it_without_its_creation_code() {
-        let shown = format!("{:?}", super::NILE);
-        assert!(shown.contains("THQGuFzL87ZqhxkgqYEryRAd7gqFqL5rdc"), "{shown}");
-        assert!(shown.len() < 300, "the creation code must not be printed: {shown}");
-    }
-}
-
 const TRON_ADDRESS_VERSION: u8 = 0x41;
 
 /// A TRON address's 20-byte body, after its base58check checksum and version byte are checked.
@@ -133,6 +114,13 @@ fn encode(body: &[u8; 20]) -> String {
     bs58::encode(payload).with_check().into_string()
 }
 
+/// A TRON address as one 32-byte ABI word in hex, after its base58check checksum and version byte
+/// are checked: the shape a contract call's `parameter` wants. The orchestrator and the signer
+/// both encode addresses for TronGrid calls with this one copy.
+pub fn abi_address(address: &str) -> Result<String, String> {
+    Ok(hex::encode(address_word(&decode(address)?)))
+}
+
 /// An address as one 32-byte ABI word: twelve zero bytes, then the 20-byte body.
 fn address_word(body: &[u8; 20]) -> [u8; 32] {
     let mut word = [0u8; 32];
@@ -149,4 +137,23 @@ fn uint_word(n: u64) -> [u8; 32] {
 
 fn keccak(data: &[u8]) -> [u8; 32] {
     Keccak256::digest(data).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fee_to_hold;
+
+    #[test]
+    fn the_fee_to_hold_includes_activation_only_before_it() {
+        assert_eq!(fee_to_hold(false, 1_500_000, 500_000), 2_000_000, "a first transfer also activates");
+        assert_eq!(fee_to_hold(true, 1_500_000, 500_000), 500_000, "an activated account pays one transfer fee");
+    }
+
+    /// Services print their config; 997 bytes of creation code in every such line helps nobody.
+    #[test]
+    fn a_chains_debug_form_names_it_without_its_creation_code() {
+        let shown = format!("{:?}", super::NILE);
+        assert!(shown.contains("THQGuFzL87ZqhxkgqYEryRAd7gqFqL5rdc"), "{shown}");
+        assert!(shown.len() < 300, "the creation code must not be printed: {shown}");
+    }
 }

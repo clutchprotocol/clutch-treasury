@@ -169,35 +169,3 @@ mod tests {
         assert_eq!(peer_clients("ws://a/ws, ws://b/ws").len(), 2);
     }
 }
-
-#[cfg(test)]
-mod self_report_tests {
-    use super::*;
-
-    /// A node that predates the sync fields sends neither, and must fall through to the peer
-    /// comparison rather than be read as healthy. Deleting the fallback would make this guard a
-    /// silent no-op against an older node — the exact failure it exists to catch.
-    #[test]
-    fn a_node_without_the_fields_is_not_assumed_healthy() {
-        // The decision is expressed by lag() plus the best_peer > 0 test in check(); this pins the
-        // ambiguity that makes the fallback necessary: 0 behind and 0 best-peer are what BOTH a
-        // healthy lone node and an unknowing node report.
-        assert_eq!(lag(500, &[]), 0, "no peer heights is not evidence of being at the tip");
-    }
-
-    /// The node applies its own small tolerance to `is_syncing`, but how much lag makes minting
-    /// unsafe is a treasury decision. A node reporting 30 blocks behind is in sync by the node's
-    /// 5-block rule and still well inside a 50-block treasury tolerance; at 60 it is not.
-    #[test]
-    fn the_treasury_tolerance_governs_not_the_nodes() {
-        let tolerance = 50u64;
-        assert!(30 <= tolerance, "30 behind is acceptable to the treasury");
-        assert!(60 > tolerance, "60 behind is not");
-    }
-
-    /// The stage failure, as the node would now report it rather than as a peer comparison.
-    #[test]
-    fn the_stage_lag_exceeds_any_sane_tolerance() {
-        assert!(115_165 > 50);
-    }
-}

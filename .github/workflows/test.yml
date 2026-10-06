@@ -50,10 +50,9 @@ jobs:
       APP_READONLY_TOKEN: test-readonly
       # wiremock stands in for TronGrid, but AppConfig::load still panics on an empty key.
       APP_TRONGRID_API_KEY: test-trongrid-key
-      # payment-orchestrator's own secrets: OrchConfig::load panics on an empty one, so all four
+      # payment-orchestrator's own secrets: OrchConfig::load panics on an empty one, so all three
       # must be present for `cargo test --workspace` to construct a config at all.
       APP_JWT_SECRET: test-jwt-secret
-      APP_BITCART_TOKEN: test-bitcart-token
       APP_TREASURY_INITIATOR_TOKEN: test-initiator
       APP_TREASURY_READONLY_TOKEN: test-readonly
 
