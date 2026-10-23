@@ -51,6 +51,10 @@ pub struct ObservedTransfer {
     /// directly against the intent's expected amount with no rate conversion.
     pub amount_usdt: i64,
     pub to: String,
+    /// Who paid. Per-user addresses never read it (the destination is the identity there); a
+    /// TronLink direct top-up is attributed by it (`direct.rs`). Empty when TronGrid omits it, which
+    /// matches no payer.
+    pub from: String,
     pub contract: String,
     /// Epoch MILLISECONDS, verified against the live endpoint.
     pub block_timestamp: i64,
@@ -119,6 +123,8 @@ impl TronGridWatcher {
 #[derive(Debug, Deserialize)]
 struct Trc20Row {
     transaction_id: String,
+    #[serde(default)]
+    from: String,
     to: String,
     /// Decimal STRING in base units — verified against the live endpoint. Parsed as an integer; a
     /// float here would reintroduce the precision loss the integer peg exists to eliminate.
@@ -238,6 +244,7 @@ fn rows_to_transfers(rows: Vec<Trc20Row>, expected_to: &str, contract: &str) -> 
             Some(ObservedTransfer {
                 tx_id: r.transaction_id,
                 amount_usdt: amount,
+                from: r.from,
                 to: r.to,
                 contract: r.token_info.address,
                 block_timestamp: r.block_timestamp,
@@ -257,6 +264,7 @@ mod tests {
     fn row(tx: &str, to: &str, contract: &str, value: &str, event: &str, ts: i64) -> Trc20Row {
         Trc20Row {
             transaction_id: tx.into(),
+            from: String::new(),
             to: to.into(),
             value: value.into(),
             token_info: TokenInfo { address: contract.into() },
@@ -266,7 +274,7 @@ mod tests {
     }
 
     fn t(tx: &str, amount: i64, ts: i64) -> ObservedTransfer {
-        ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: ADDR.into(), contract: USDT.into(), block_timestamp: ts }
+        ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, from: String::new(), to: ADDR.into(), contract: USDT.into(), block_timestamp: ts }
     }
 
     #[test]

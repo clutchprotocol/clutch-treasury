@@ -107,6 +107,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         signer_token: "s".into(),
         gasfree: None,
         service_fee: None,
+        direct_topups_enabled: false,
     }
 }
 
@@ -1529,4 +1530,209 @@ async fn the_operators_own_top_up_pays_no_service_fee() {
         let (amount, fee, children) = split_of(&pool, id).await;
         assert_eq!((amount, fee, children.len()), (50_000_000, None, 0));
     }
+}
+
+// ---- TronLink direct top-ups: paid from the user's own TRON address straight to the GasFree float.
+
+/// A user, and the TRON address of the same 20 bytes (the all-"abandon" index-0 account).
+const DIRECT_USER: &str = "0xc8599111f29c1e1e061265b4af93ea1f274ad78a";
+const DIRECT_USER_TRON: &str = "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH";
+/// The CLT twin of the payout float's plain address (`FLOAT`), to prove a treasury address is never
+/// counted as a top-up even when it is the beneficiary's own TRON address.
+const FLOAT_TWIN: &str = "0xbb1a70862e804bfe2885f6c7efc8fdf3f0148b00";
+
+fn direct_config(server: &MockServer) -> treasury_service::configuration::AppConfig {
+    let mut config = gasfree_config(server);
+    config.direct_topups_enabled = true;
+    config
+}
+
+fn pay_in(config: &treasury_service::configuration::AppConfig) -> String {
+    config.gasfree_float().expect("GasFree is on in these tests")
+}
+
+/// A confirmed USDT transfer `from` -> `to`, as TronGrid lists it.
+fn transfer_from(tx_id: &str, from: &str, to: &str, value: i64) -> serde_json::Value {
+    json!({"transaction_id": tx_id, "from": from, "to": to, "value": value.to_string(), "type": "Transfer",
+           "token_info": {"address": USDT}, "block_timestamp": chrono::Utc::now().timestamp_millis()})
+}
+
+async fn seed_direct_intent(pool: &PgPool, beneficiary: &str, from: &str, amount_clt: i64, expected: i64, tx_id: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt, direct_from)
+         VALUES ($1, $2, $3, $4, 'orchestrator', $5, $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(beneficiary)
+    .bind(amount_clt)
+    .bind(format!("ref-{id}"))
+    .bind(format!("client-{id}"))
+    .bind(tx_id)
+    .bind(expected)
+    .bind(from)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_direct_top_up_from_the_beneficiarys_own_tron_address_mints_what_arrived() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d1", DIRECT_USER_TRON, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d1", true).await;
+    let id = seed_direct_intent(&pool, DIRECT_USER, DIRECT_USER_TRON, 25_000_000, 25_000_000, "tx-d1").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(minted_and_held(&pool, id).await.0, 25_000_000, "no relay fee is held: nothing is swept");
+    assert_eq!(outbox_rows(&pool, id).await, 1);
+}
+
+#[tokio::test]
+async fn a_direct_top_up_never_mints_more_than_arrived() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d2", DIRECT_USER_TRON, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d2", true).await;
+    // The orchestrator asks for 30 against a 25 threshold; 25 arrived.
+    let id = seed_direct_intent(&pool, DIRECT_USER, DIRECT_USER_TRON, 30_000_000, 25_000_000, "tx-d2").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(minted_and_held(&pool, id).await.0, 25_000_000);
+}
+
+#[tokio::test]
+async fn a_direct_top_up_sent_by_someone_else_is_rejected() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    // The transaction exists and paid the float, but an exchange sent it, not the user.
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d3", REAL_UNSWEPT_A, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d3", true).await;
+    let id = seed_direct_intent(&pool, DIRECT_USER, DIRECT_USER_TRON, 25_000_000, 25_000_000, "tx-d3").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "rejected");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+}
+
+#[tokio::test]
+async fn a_direct_sender_that_is_not_the_beneficiarys_twin_is_rejected() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    // The orchestrator claims a real transfer from someone else's address for this beneficiary.
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d4", REAL_UNSWEPT_A, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d4", true).await;
+    let id = seed_direct_intent(&pool, DIRECT_USER, REAL_UNSWEPT_A, 25_000_000, 25_000_000, "tx-d4").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "rejected");
+}
+
+#[tokio::test]
+async fn a_transfer_from_a_treasury_address_is_never_a_top_up() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d5", FLOAT, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d5", true).await;
+    let id = seed_direct_intent(&pool, FLOAT_TWIN, FLOAT, 25_000_000, 25_000_000, "tx-d5").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "rejected");
+}
+
+#[tokio::test]
+async fn a_direct_top_up_below_the_minimum_is_held_for_a_human() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = direct_config(&server);
+    let float = pay_in(&config);
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d6", DIRECT_USER_TRON, &float, 500_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d6", true).await;
+    let id = seed_direct_intent(&pool, DIRECT_USER, DIRECT_USER_TRON, 500_000, 500_000, "tx-d6").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "needs_manual");
+    assert_eq!(outbox_rows(&pool, id).await, 0);
+}
+
+#[tokio::test]
+async fn with_direct_top_ups_off_nothing_is_decided() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let config = gasfree_config(&server); // direct_topups_enabled: false
+    let float = pay_in(&config);
+    mount_trc20_list_for(&server, &float, vec![transfer_from("tx-d7", DIRECT_USER_TRON, &float, 25_000_000)]).await;
+    mount_transaction_confirmed(&server, "tx-d7", true).await;
+    let id = seed_direct_intent(&pool, DIRECT_USER, DIRECT_USER_TRON, 25_000_000, 25_000_000, "tx-d7").await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "created");
+}
+
+async fn post_direct_intent(config: treasury_service::configuration::AppConfig, pool: &PgPool, body: serde_json::Value) -> StatusCode {
+    let mut config = config;
+    config.initiator_token = "test-initiator".to_string();
+    treasury_service::api::router(pool.clone(), config)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mint-intents")
+                .header("authorization", "Bearer test-initiator")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn the_create_route_takes_a_direct_top_up_only_in_its_one_shape() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let good = json!({
+        "beneficiary": DIRECT_USER, "amount_clt": 25_000_000, "expected_amount_usdt": 25_000_000,
+        "client_ref": "direct-1", "deposit_tx_id": "tx-api", "direct_from": DIRECT_USER_TRON,
+    });
+
+    // Off: refused.
+    assert_eq!(post_direct_intent(gasfree_config(&server), &pool, good.clone()).await, StatusCode::BAD_REQUEST);
+    // A sender that is not the beneficiary's twin: refused.
+    let mut wrong = good.clone();
+    wrong["direct_from"] = json!(REAL_UNSWEPT_A);
+    assert_eq!(post_direct_intent(direct_config(&server), &pool, wrong).await, StatusCode::BAD_REQUEST);
+    // With a deposit address too: refused.
+    let mut both = good.clone();
+    both["deposit_address"] = json!(DEPOSIT_ADDR);
+    assert_eq!(post_direct_intent(direct_config(&server), &pool, both).await, StatusCode::BAD_REQUEST);
+    // The one shape: accepted.
+    assert_eq!(post_direct_intent(direct_config(&server), &pool, good).await, StatusCode::CREATED);
+    let from: Option<String> = sqlx::query_scalar("SELECT direct_from FROM mint_intents WHERE client_ref = 'direct-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(from.as_deref(), Some(DIRECT_USER_TRON));
 }

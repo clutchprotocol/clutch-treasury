@@ -79,6 +79,8 @@ fn test_config(treasury_url: String) -> OrchConfig {
         gasfree: None,
         service_fee_bps: 0,
         service_fee_min_usdt: 0,
+        direct_topups_enabled: false,
+        payout_float_address: String::new(),
         pilot_allowed_addresses: None,
     }
 }
@@ -204,6 +206,52 @@ async fn post_sends_the_deposit_address_and_plain_amount_proven_on_the_wire() {
 
 /// `deposit_tx_id` may be NULL (Bitcart never returned a hash) — the POST must still succeed and
 /// send `null`, not omit the field or invent a value.
+/// A TronLink direct top-up (`direct.rs`) goes to the treasury with the sender and no deposit address
+/// or index: the verifier checks the transfer came from `direct_from`, and that `direct_from` is the
+/// TRON address of the beneficiary.
+#[tokio::test]
+async fn a_direct_top_up_sends_its_sender_and_no_deposit_address() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let treasury_id = Uuid::new_v4();
+    let deposit_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key, tron_tx_id,
+             received_usdt, expires_at, next_attempt_at, direct_from)
+         VALUES ($1, '0xc8599111f29c1e1e061265b4af93ea1f274ad78a', '0xc8599111f29c1e1e061265b4af93ea1f274ad78a',
+                 25000000, 25000000, 'confirmed', 'tx-direct', 'tx-direct', 25000000, now(),
+                 now() - interval '1 hour', 'TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH')",
+    )
+    .bind(deposit_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/internal/mint-intents"))
+        .and(body_json(json!({
+            "beneficiary": "0xc8599111f29c1e1e061265b4af93ea1f274ad78a",
+            "amount_clt": 25_000_000,
+            "expected_amount_usdt": 25_000_000,
+            "deposit_address": null,
+            "derivation_index": null,
+            "client_ref": deposit_id.to_string(),
+            "deposit_tx_id": "tx-direct",
+            "direct_from": "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH",
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mint_intent_response(treasury_id, "created")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    treasury_bridge::run_once(&pool, &test_config(server.uri())).await;
+
+    let row = deposits::find_by_id(&pool, deposit_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "mint_requested");
+    assert_eq!(row.treasury_intent_id, Some(treasury_id));
+}
+
 #[tokio::test]
 async fn post_sends_null_deposit_tx_id_when_not_yet_known() {
     let pool = pool().await;

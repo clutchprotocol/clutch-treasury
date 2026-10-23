@@ -67,7 +67,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, deposit_addresses RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, deposit_addresses, direct_payers RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -103,6 +103,8 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         gasfree: None,
         service_fee_bps: 0,
         service_fee_min_usdt: 0,
+        direct_topups_enabled: false,
+        payout_float_address: String::new(),
         // Everyone, as on stage: the pilot allowlist has its own tests below.
         pilot_allowed_addresses: None,
     }
@@ -939,4 +941,53 @@ async fn the_service_fee_is_shown_waived_on_a_first_top_up_and_charged_after() {
     seed_deposit(&pool, USER_A, 50_000_000, Some(50_000_000), "tx-minted", chrono::Utc::now(), "credited").await;
     let (_, after) = post_deposit(router_with(pool.clone(), config), USER_A).await;
     assert_eq!(after["service_fee_waived"], false);
+}
+
+// ---- TronLink direct top-ups (`direct.rs`).
+
+async fn post_direct(app: axum::Router, user: &str) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/direct-topups")
+        .header("authorization", bearer_for(user))
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn direct_top_ups_are_off_by_default() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let app = router_with(pool, test_config(treasury.uri(), true));
+    assert_eq!(post_direct(app, USER_A).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// On: the answer is the float's GasFree account (derived here exactly as the treasury derives it)
+/// and the caller's own TRON address, and the caller is now a payer.
+#[tokio::test]
+async fn a_direct_top_up_answers_the_float_and_the_callers_own_tron_address() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    config.gasfree = Some(nile());
+    config.direct_topups_enabled = true;
+    config.payout_float_address = "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY".into();
+    let float = gasfree::gasfree_address(&gasfree::NILE, "TT2X2yyubp7qpAWYYNE5JQWBtoZ7ikQFsY").unwrap();
+    let app = router_with(pool.clone(), config);
+
+    let user = "0xC8599111F29C1E1E061265B4AF93EA1F274AD78A";
+    let resp = post_direct(app, user).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["pay_to"], json!(float));
+    assert_eq!(body["from"], json!("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH"));
+    assert_eq!(body["min_deposit_usdt"], json!(1_000_000));
+
+    let payer: (String, String) = sqlx::query_as("SELECT tron_address, clt_address FROM direct_payers WHERE user_pk = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(payer, ("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into(), "0xc8599111f29c1e1e061265b4af93ea1f274ad78a".into()));
 }

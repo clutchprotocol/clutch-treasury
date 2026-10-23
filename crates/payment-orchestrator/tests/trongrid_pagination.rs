@@ -66,6 +66,7 @@ async fn the_second_page_is_fetched_when_the_first_is_full() {
         vec![ObservedTransfer {
             tx_id: "tx-real".into(),
             amount_usdt: 5_000_000,
+            from: String::new(),
             to: ADDR.into(),
             contract: USDT.into(),
             block_timestamp: 1_700_000_001_000,

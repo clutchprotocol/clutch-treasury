@@ -5,6 +5,7 @@ pub mod auth;
 pub mod configuration;
 pub mod custody;
 pub mod deposits;
+pub mod direct;
 pub mod metrics;
 pub mod derive;
 pub mod gasfree_chain;
