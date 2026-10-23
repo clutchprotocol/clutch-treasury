@@ -75,10 +75,25 @@ async fn main() {
     tokio::spawn(payment_orchestrator::poller::run(
         pool.clone(),
         tiered,
-        watcher,
+        watcher.clone(),
         config.usdt_contract.clone(),
         config.poll_interval_secs,
     ));
+
+    // TronLink direct top-ups (direct.rs): one read of the pay-in address per pass, credited by sender.
+    let pay_to = config.direct_topup_address.trim().to_string();
+    if pay_to.is_empty() {
+        tracing::info!("direct top-ups: off");
+    } else {
+        tracing::info!("direct top-ups: on, paid to {pay_to}");
+        tokio::spawn(payment_orchestrator::direct::run(
+            pool.clone(),
+            watcher.clone(),
+            pay_to,
+            config.usdt_contract.clone(),
+            config.poll_interval_secs,
+        ));
+    }
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
     // treasury's private zone. Same poll-interval convention as the poller above.

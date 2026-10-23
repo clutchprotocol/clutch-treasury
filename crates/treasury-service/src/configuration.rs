@@ -171,6 +171,11 @@ pub struct AppConfig {
     /// with `load_service_fee`, like GasFree. `None`, the default, charges nothing.
     #[serde(skip)]
     pub service_fee: Option<crate::service_fee::Settings>,
+    /// TronLink direct top-ups (`tron_verifier.rs`, `evaluate_direct`), `APP_DIRECT_TOPUPS_ENABLED`.
+    /// Off by default: the create route then refuses an intent that names a direct sender. Needs
+    /// GasFree on, because the float users pay into is the GasFree float.
+    #[serde(default)]
+    pub direct_topups_enabled: bool,
 }
 
 impl AppConfig {

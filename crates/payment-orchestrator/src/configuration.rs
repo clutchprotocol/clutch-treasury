@@ -109,6 +109,12 @@ pub struct OrchConfig {
     pub service_fee_bps: u32,
     #[serde(default)]
     pub service_fee_min_usdt: i64,
+    /// TronLink direct top-ups (`direct.rs`): the TRON address users pay into from their own wallet,
+    /// the treasury's GasFree float. Empty, the default, is off: the route answers 503 and nothing is
+    /// polled. The treasury checks the same address from its own settings before it mints, so a
+    /// wrong value here credits nothing rather than the wrong thing.
+    #[serde(default)]
+    pub direct_topup_address: String,
     /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
     /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
     /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see

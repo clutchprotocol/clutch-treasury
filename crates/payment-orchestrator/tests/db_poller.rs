@@ -97,13 +97,13 @@ impl DepositWatcher for FakeChain {
 }
 
 fn transfer(tx: &str, to: &str, amount: i64, ts: i64) -> ObservedTransfer {
-    ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, to: to.into(), contract: USDT.into(), block_timestamp: ts }
+    ObservedTransfer { tx_id: tx.into(), amount_usdt: amount, from: String::new(), to: to.into(), contract: USDT.into(), block_timestamp: ts }
 }
 
 /// Same shape as `transfer`, minus the timestamp: the four crediting tests below never depend on
 /// ordering, only on identity (`tx_id`) and amount.
 fn observed(tx_id: &str, to: &str, amount: i64) -> ObservedTransfer {
-    ObservedTransfer { tx_id: tx_id.into(), amount_usdt: amount, to: to.into(), contract: USDT.into(), block_timestamp: 1_700_000_000_000 }
+    ObservedTransfer { tx_id: tx_id.into(), amount_usdt: amount, from: String::new(), to: to.into(), contract: USDT.into(), block_timestamp: 1_700_000_000_000 }
 }
 
 /// Insert an intent directly, with its own address — the create path is covered elsewhere; these
@@ -675,6 +675,7 @@ async fn a_transfer_of_another_token_is_not_credited() {
     let wrong_token = ObservedTransfer {
         tx_id: "tx-wrong-token".into(),
         amount_usdt: 1_000_000,
+        from: String::new(),
         to: ADDR.into(),
         contract: "TWrongTokenContract111111111111111".into(),
         block_timestamp: 1_700_000_000_000,

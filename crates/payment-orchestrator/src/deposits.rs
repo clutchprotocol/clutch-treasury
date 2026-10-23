@@ -63,12 +63,15 @@ pub struct DepositIntent {
     /// caller with nothing here should say when it noticed rather than silently passing the row's
     /// age off as the transfer's.
     pub transfer_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The TRON address that paid a TronLink direct top-up (`direct.rs`). `None` on every deposit to
+    /// a per-user address.
+    pub direct_from: Option<String>,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
-    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at, transfer_at";
+    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at, transfer_at, direct_from";
 
 /// Claim the next BIP32 derivation index for a deposit address.
 ///

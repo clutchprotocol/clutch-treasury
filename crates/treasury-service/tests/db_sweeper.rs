@@ -95,6 +95,7 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         signer_token: "s".into(),
         gasfree: None,
         service_fee: None,
+        direct_topups_enabled: false,
     }
 }
 

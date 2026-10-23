@@ -27,7 +27,7 @@ async fn pool() -> PgPool {
 #[tokio::test]
 async fn watcher_credit_is_idempotent() {
     let pool = pool().await;
-    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None, None, None).await.unwrap();
+    let intent = create_mint_intent(&pool, "0x4444444444444444444444444444444444444444", 1_000_000, "alice", None, None, None, None, None, None).await.unwrap();
     approve_mint_intent(&pool, intent.id, "bob").await.unwrap();
 
     // Simulate the watcher seeing the tx twice (reorg replay / crash-restart).
@@ -143,6 +143,7 @@ fn test_config() -> treasury_service::configuration::AppConfig {
         signer_token: "s".into(),
         gasfree: None,
         service_fee: None,
+        direct_topups_enabled: false,
     }
 }
 
@@ -159,10 +160,10 @@ async fn a_deposit_backed_intent_denied_by_the_breaker_parks_instead_of_failing(
     let backed = create_mint_intent(
         &pool, "0x4444444444444444444444444444444444444444", 1_000_000, "orchestrator",
         Some("deposit-ref-1"), Some(deposit_tx.as_str()), Some(1_000_000),
-        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()), Some(7),
+        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()), Some(7), None,
     ).await.unwrap();
     let manual = create_mint_intent(
-        &pool, "0x5555555555555555555555555555555555555555", 1_000_000, "alice", None, None, None, None, None,
+        &pool, "0x5555555555555555555555555555555555555555", 1_000_000, "alice", None, None, None, None, None, None,
     ).await.unwrap();
     approve_mint_intent(&pool, backed.id, "bob").await.unwrap();
     approve_mint_intent(&pool, manual.id, "bob").await.unwrap();
@@ -217,6 +218,7 @@ async fn an_over_cap_intent_goes_to_needs_manual_instead_of_retrying() {
         Some(1_000_000),
         Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()),
         Some(9),
+        None,
     )
     .await
     .unwrap();
@@ -291,6 +293,7 @@ async fn raising_the_cap_and_re_approving_releases_a_needs_manual_intent() {
         Some(1_000_000),
         Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()),
         Some(11),
+        None,
     )
     .await
     .unwrap();

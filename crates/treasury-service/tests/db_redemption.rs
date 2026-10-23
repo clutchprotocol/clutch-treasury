@@ -255,6 +255,7 @@ fn config() -> treasury_service::configuration::AppConfig {
         signer_token: "s".into(),
         gasfree: None,
         service_fee: None,
+        direct_topups_enabled: false,
     }
 }
 

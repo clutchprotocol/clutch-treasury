@@ -656,6 +656,12 @@ struct DepositBackedIntent {
     /// is asked which of that index's two addresses the deposit was paid to.
     derivation_index: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Who the mint pays. Only a direct top-up reads it here: its sender must be this address's
+    /// TRON twin.
+    beneficiary: String,
+    /// The TRON address that paid a TronLink direct top-up (`evaluate_direct`). `None` for a deposit
+    /// to a per-user address.
+    direct_from: Option<String>,
 }
 
 /// Evaluate one intent's evidence. Two paths per the plan:
@@ -679,6 +685,10 @@ async fn evaluate(
             intent.id
         ));
     };
+
+    if let Some(from) = intent.direct_from.as_deref() {
+        return evaluate_direct(client, config, intent, expected_amount_usdt, from).await;
+    }
 
     // Same rule as expected_amount_usdt: deposit-backed with no address is unverifiable, and
     // Transient rather than HardMismatch because it is OUR data missing, not evidence against the
@@ -780,6 +790,117 @@ async fn evaluate(
             }
         }
     }
+}
+
+/// The TRON address made of the same 20 bytes as CLT address `clt_address` (`0x` + 40 hex), and so
+/// controlled by the same key. `None` for anything that is not a CLT address.
+pub(crate) fn tron_address_of(clt_address: &str) -> Option<String> {
+    let hex = clt_address.strip_prefix("0x").or_else(|| clt_address.strip_prefix("0X")).unwrap_or(clt_address);
+    if hex.len() != 40 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut payload = vec![TRON_ADDRESS_VERSION];
+    payload.extend_from_slice(&hex::decode(hex).ok()?);
+    Some(bs58::encode(payload).with_check().into_string())
+}
+
+/// The evidence for a TronLink direct top-up: the user paid from their own TRON address straight to
+/// the GasFree float, so there is no deposit address to look at.
+///
+/// Everything that decides the mint is this service's own: the float comes from its settings, never
+/// from the intent, and the sender must be the TRON address of the BENEFICIARY, derived here. A
+/// transfer from `tron(X)` can only have been signed by the holder of CLT address `X`'s key, so the
+/// orchestrator, which proposed the intent, can at worst ask to pay someone their own money back.
+/// Which transfers it may propose (only users who asked first) is its business, not a safety matter.
+async fn evaluate_direct(
+    client: &TronClient,
+    config: &AppConfig,
+    intent: &DepositBackedIntent,
+    expected_amount_usdt: i64,
+    from: &str,
+) -> Evidence {
+    // Off, or no float to check against: nothing is decided, and nothing mints. Our settings, not
+    // evidence against the user's money, so never a rejection.
+    if !config.direct_topups_enabled {
+        return Evidence::Transient(format!("intent {} is a direct top-up, and direct top-ups are off here", intent.id));
+    }
+    let Some(pay_to) = config.gasfree_float() else {
+        return Evidence::Transient(format!(
+            "intent {} is a direct top-up, but GasFree is off here, so there is no float to check it against",
+            intent.id
+        ));
+    };
+    if tron_address_of(&intent.beneficiary).as_deref() != Some(from) {
+        return Evidence::HardMismatch(format!(
+            "direct top-up sender {from} is not the TRON address of the beneficiary {}",
+            intent.beneficiary
+        ));
+    }
+    let Some(tx_id) = intent.deposit_tx_id.as_deref() else {
+        return Evidence::HardMismatch("a direct top-up names no transaction".to_string());
+    };
+    // Bounded like the fallback match: the float's history is everyone's, and only a recent transfer
+    // can back an intent the orchestrator has just proposed.
+    let earliest_ms =
+        (intent.created_at - chrono::Duration::hours(config.deposit_match_window_hours)).timestamp_millis();
+    let transfers = match client.trc20_transfers(&pay_to, &config.usdt_contract, Some(earliest_ms)).await {
+        Ok(t) => t,
+        Err(e) => return Evidence::Transient(format!("trongrid trc20 list: {e}")),
+    };
+    let Some(transfer) = transfers.iter().find(|t| t.transaction_id == tx_id) else {
+        return Evidence::Transient(format!("deposit_tx_id '{tx_id}' not found in the float's confirmed transfers yet"));
+    };
+    if transfer.from != from {
+        return Evidence::HardMismatch(format!(
+            "transfer {tx_id} was sent by '{}', not by the direct top-up sender {from}",
+            transfer.from
+        ));
+    }
+    let confirmed = match client.transaction_confirmed(tx_id).await {
+        Ok(c) => c,
+        Err(e) => return Evidence::Transient(format!("trongrid get_transaction: {e}")),
+    };
+    match check_transfer(transfer, confirmed, &pay_to, &config.usdt_contract, expected_amount_usdt) {
+        Ok(observed) => Evidence::Pass { tx_id: tx_id.to_string(), observed_amount_usdt: observed },
+        Err(reason) if reason == "not yet confirmed" => Evidence::Transient(reason),
+        Err(reason) => Evidence::HardMismatch(reason),
+    }
+}
+
+/// What a verified direct top-up may mint: what arrived, never more, and nothing if the sender is
+/// one of our own addresses (a sweep or a payout is not a top-up, and counting one would mint CLT the
+/// reserve already backs).
+async fn direct_verdict(pool: &PgPool, config: &AppConfig, from: &str, observed_amount_usdt: i64) -> Verdict {
+    let ours = [Some(config.custody_tron_address.clone()), Some(config.payout_float_address.clone()), config.gasfree_float()];
+    if ours.iter().flatten().any(|a| a == from) {
+        return Verdict::Reject(format!("direct top-up sender {from} is one of the treasury's own addresses"));
+    }
+    let known: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM mint_intents WHERE deposit_address = $1)
+             OR EXISTS (SELECT 1 FROM gasfree_accounts WHERE gasfree_address = $1 OR owner_address = $1)",
+    )
+    .bind(from)
+    .fetch_one(pool)
+    .await;
+    match known {
+        Ok(true) => return Verdict::Reject(format!("direct top-up sender {from} is one of our deposit addresses")),
+        Ok(false) => {}
+        Err(e) => return Verdict::Wait(format!("checking whether {from} is a deposit address: {e}")),
+    }
+    if let Some(settings) = &config.gasfree {
+        if observed_amount_usdt < settings.min_deposit_usdt {
+            return Verdict::Hold {
+                cap: observed_amount_usdt,
+                reason: format!(
+                    "a direct top-up of {observed_amount_usdt} micro-USDT from {from} is below the minimum deposit of {}, \
+                     so nothing was minted. The USDT is at the float, counted in the reserve. Approving this intent \
+                     (mint-intent-approve) mints at most what arrived.",
+                    settings.min_deposit_usdt
+                ),
+            };
+        }
+    }
+    Verdict::Approve { cap: Some(observed_amount_usdt) }
 }
 
 /// Approve (or hold for a human) + `verified_at` + outbox row + `ledger::append_event("custody_deposit", ...)`
@@ -1072,9 +1193,20 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
         base_url: config.signer_url.clone(),
         token: config.signer_token.clone(),
     };
-    let rows: Vec<(Uuid, Option<i64>, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>, Option<i64>)> =
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+        Option<i64>,
+        String,
+        Option<String>,
+    )> =
         sqlx::query_as(
-            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index
+            "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index,
+                    beneficiary, direct_from
              FROM mint_intents
              WHERE status = 'created' AND client_ref IS NOT NULL
              ORDER BY created_at",
@@ -1085,9 +1217,20 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
-        .map(|(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index)| {
-            DepositBackedIntent { id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index }
-        })
+        .map(
+            |(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index, beneficiary, direct_from)| {
+                DepositBackedIntent {
+                    id,
+                    expected_amount_usdt,
+                    deposit_address,
+                    deposit_tx_id,
+                    created_at,
+                    derivation_index,
+                    beneficiary,
+                    direct_from,
+                }
+            },
+        )
         .collect();
 
     stuck_intent_sweep(pool, &intents).await;
@@ -1131,10 +1274,12 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 if !may_approve {
                     continue;
                 }
-                let verdict = match &config.gasfree {
+                let verdict = match (&intent.direct_from, &config.gasfree) {
+                    // A direct top-up: paid to the float by the user, nothing to sweep and no relay fee.
+                    (Some(from), _) => direct_verdict(pool, config, from, observed_amount_usdt).await,
                     // The TRX rail: the whole deposit reaches custody, so the intent mints what it says.
-                    None => Verdict::Approve { cap: None },
-                    Some(settings) => gasfree_verdict(pool, settings, &signer, intent, observed_amount_usdt).await,
+                    (None, None) => Verdict::Approve { cap: None },
+                    (None, Some(settings)) => gasfree_verdict(pool, settings, &signer, intent, observed_amount_usdt).await,
                 };
                 match verdict {
                     Verdict::Approve { cap } => {

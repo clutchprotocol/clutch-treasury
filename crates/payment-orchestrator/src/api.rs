@@ -208,6 +208,58 @@ async fn create_deposit_handler(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// `POST /api/v1/direct-topups` — pay from your own TRON wallet instead of a deposit address.
+///
+/// No body. Records that the caller will pay from the TRON address of their own CLT address
+/// (`direct::register_payer`), which only their key controls, and answers where to pay. Transfers
+/// from that address to `pay_to` that land after this call are credited to the caller; see
+/// `direct.rs` for why that is sound and why the call must come first.
+///
+/// 503s while direct top-ups or deposits are off, before auth, like the deposit route.
+async fn create_direct_topup_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let pay_to = state.config.direct_topup_address.trim();
+    if pay_to.is_empty() || !state.config.permanent_deposit_addresses_enabled {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "direct top-ups are not available"})),
+        ));
+    }
+    let user_pk = authenticated_pk(&headers, &state.config)?;
+    if state.limiter.check(&user_pk).is_err() {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let Some(clt_address) = canonical_clt_address(&user_pk) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "direct top-ups require an address-form token (0x + 40 hex)"})),
+        ));
+    };
+    let from = crate::direct::register_payer(&state.pool, &user_pk, &clt_address).await.map_err(|e| {
+        tracing::error!("direct top-up for {user_pk}: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut body = json!({
+        "pay_to": pay_to,
+        "from": from,
+        "usdt_contract": state.config.usdt_contract,
+    });
+    if let Some(settings) = state.config.gasfree.as_ref() {
+        // The treasury holds a top-up below this for a human rather than minting it, on this path too.
+        body["min_deposit_usdt"] = json!(settings.min_deposit_usdt);
+    }
+    if state.config.service_fee_bps > 0 {
+        let first = !deposits::has_had_a_top_up(&state.pool, &user_pk).await.unwrap_or(true);
+        body["service_fee_bps"] = json!(state.config.service_fee_bps);
+        body["service_fee_min_usdt"] = json!(state.config.service_fee_min_usdt);
+        body["service_fee_waived"] = json!(first);
+    }
+    Ok((StatusCode::OK, Json(body)))
+}
+
 fn deposits_unavailable() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "deposits are temporarily unavailable"})))
 }
@@ -285,6 +337,8 @@ async fn list_deposits_handler(
                 // from `created_at` on purpose: a client that shows one as the other tells a user
                 // an old deposit is minutes old.
                 "transfer_at": d.transfer_at,
+                // True for a TronLink direct top-up, so the history can say how it was paid.
+                "direct": d.direct_from.is_some(),
             })
         })
         .collect();
@@ -470,6 +524,7 @@ pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) ->
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler).get(list_deposits_handler))
         .route("/api/v1/deposits/:id", get(get_deposit_handler))
+        .route("/api/v1/direct-topups", post(create_direct_topup_handler))
         .route("/api/v1/redemptions", post(create_redemption_handler))
         .route("/api/v1/redemptions/:id", get(get_redemption_handler))
         .layer(cors)

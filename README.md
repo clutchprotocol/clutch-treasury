@@ -47,6 +47,21 @@ the same address all count rather than just the first.
 **`POST /api/v1/deposits` takes no body.** The CLT beneficiary is always the caller's authenticated
 identity. There is deliberately no `clt_address` field; it was removed as a foot-gun, not forgotten.
 
+### TronLink direct top-ups
+
+A user can also pay from their own TRON wallet straight to the GasFree float, with no deposit
+address, no sweep and no relay fee (they pay TRON's network fee in TRX themselves).
+`POST /api/v1/direct-topups` (no body) records that the caller will pay from `tron(X)`, the TRON
+address made of the same 20 bytes as their CLT address `X`, and answers `pay_to` (the float) and
+`from`. Only the key of `X` can sign a transfer from `tron(X)`, so crediting such a transfer to `X`
+pays whoever paid. The orchestrator credits only senders that asked first and only transfers that
+landed after; anything else that reaches the float is recorded once in `direct_unattributed`, raises
+a p1 for a refund by hand, and is never credited later. The treasury mints only after it has checked
+on chain, from its own settings, that the transfer reached the float and came from the TRON address
+of the beneficiary, and never for a sender that is one of its own addresses. Both sides are off by
+default: `APP_DIRECT_TOPUP_ADDRESS` (orchestrator, the float's address) and
+`APP_DIRECT_TOPUPS_ENABLED=true` (treasury, GasFree on).
+
 ## Redemption
 
 Live on the testnet since 2026-09-04. On mainnet redemptions are switched on since 2026-10-05, but

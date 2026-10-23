@@ -66,7 +66,7 @@ pub async fn run_once(pool: &PgPool, config: &OrchConfig) {
 /// and moves the deposit to `mint_requested`. A treasury-unreachable failure records the
 /// attempt and backs off — the row stays `confirmed` for the next tick, never lost.
 async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: &DepositIntent) {
-    let body = json!({
+    let mut body = json!({
         "beneficiary": intent.clt_address,
         // What ARRIVED, not what was asked for. At par one micro-USDT is one CLT, so crediting the
         // observed total is what keeps the reserve equal to the liability — the invariant this whole
@@ -87,6 +87,12 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
         "client_ref": intent.id.to_string(),
         "deposit_tx_id": intent.tron_tx_id,
     });
+    // A TronLink direct top-up (`direct.rs`): the TRON address that paid, with no deposit address or
+    // index above. The treasury verifies the transfer came from it, and that it is the TRON address
+    // of `beneficiary`, before it mints. Absent for every other deposit, so their wire is unchanged.
+    if let Some(from) = &intent.direct_from {
+        body["direct_from"] = json!(from);
+    }
 
     let resp = http
         .post(format!("{}/internal/mint-intents", config.treasury_url))

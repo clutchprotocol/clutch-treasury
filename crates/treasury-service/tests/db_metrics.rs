@@ -48,7 +48,7 @@ async fn the_scrape_reports_what_the_database_holds() {
     let credited = create_mint_intent(
         &pool, "0x4444444444444444444444444444444444444444", 1_000_000, "orchestrator",
         Some("metrics-a"), Some(&"aa".repeat(32)), Some(1_000_000),
-        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()), Some(3),
+        Some("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into()), Some(3), None,
     ).await.unwrap();
     approve_mint_intent(&pool, credited.id, "bob").await.unwrap();
 

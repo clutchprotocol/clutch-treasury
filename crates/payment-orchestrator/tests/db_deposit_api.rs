@@ -103,6 +103,7 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         gasfree: None,
         service_fee_bps: 0,
         service_fee_min_usdt: 0,
+        direct_topup_address: String::new(),
         // Everyone, as on stage: the pilot allowlist has its own tests below.
         pilot_allowed_addresses: None,
     }

@@ -93,6 +93,10 @@ struct CreateMintIntentBody {
     expected_amount_usdt: Option<i64>,
     deposit_address: Option<String>,
     derivation_index: Option<i64>,
+    /// A TronLink direct top-up: the TRON address that paid the GasFree float, in place of a deposit
+    /// address. Refused unless direct top-ups are on, and unless it is the TRON address of
+    /// `beneficiary`; the verifier checks both again, on chain, before anything mints.
+    direct_from: Option<String>,
 }
 
 /// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
@@ -132,8 +136,26 @@ async fn create_mint_intent_handler(
         // this; failing here makes the reason legible instead of a 500.
         // A deposit-backed intent with no address is unverifiable, and unverifiable must never
         // be approvable — refuse at the door rather than let it age into manual review.
-        if body.deposit_address.as_deref().is_none_or(str::is_empty) {
-            return Err(StatusCode::BAD_REQUEST);
+        match body.direct_from.as_deref() {
+            Some(from) => {
+                // A direct top-up: no address to sweep, a known transaction, and a sender that is the
+                // beneficiary's own TRON address. Anything else is refused at the door.
+                if !state.config.direct_topups_enabled || state.config.gasfree_float().is_none() {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                if body.deposit_address.is_some()
+                    || body.derivation_index.is_some()
+                    || body.deposit_tx_id.as_deref().is_none_or(str::is_empty)
+                    || crate::tron_verifier::tron_address_of(&body.beneficiary).as_deref() != Some(from)
+                {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+            None => {
+                if body.deposit_address.as_deref().is_none_or(str::is_empty) {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
         }
         if body.expected_amount_usdt.is_none_or(|a| a <= 0) {
             return Err(StatusCode::BAD_REQUEST);
@@ -149,6 +171,7 @@ async fn create_mint_intent_handler(
         body.expected_amount_usdt,
         body.deposit_address.clone(),
         body.derivation_index,
+        body.direct_from.clone(),
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -588,6 +611,7 @@ fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
         "deposit_tx_id": intent.deposit_tx_id,
         "verified_at": intent.verified_at,
         "service_fee_clt": intent.service_fee_clt,
+        "direct_from": intent.direct_from,
     })
 }
 
