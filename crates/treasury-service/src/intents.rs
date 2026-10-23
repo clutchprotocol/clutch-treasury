@@ -25,10 +25,13 @@ pub struct MintIntent {
     pub deposit_address: Option<String>,
     /// BIP32 index the address was derived at — what the sweeper names the key by.
     pub derivation_index: Option<i64>,
+    /// The operator's service fee split off this deposit's mint (`service_fee.rs`), already taken
+    /// out of `amount_clt`. `None` when none was.
+    pub service_fee_clt: Option<i64>,
 }
 
 const MINT_COLS: &str = "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, \
-    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address, derivation_index";
+    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address, derivation_index, service_fee_clt";
 
 /// `client_ref` is the orchestrator's idempotency key (Plan C T5) — `None` for Plan B's
 /// direct/manual mint intents, `Some(deposit_intent_id)` for deposit-backed ones the

@@ -587,6 +587,7 @@ fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
         "client_ref": intent.client_ref,
         "deposit_tx_id": intent.deposit_tx_id,
         "verified_at": intent.verified_at,
+        "service_fee_clt": intent.service_fee_clt,
     })
 }
 

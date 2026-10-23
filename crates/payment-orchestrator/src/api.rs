@@ -197,6 +197,14 @@ async fn create_deposit_handler(
             json!(gasfree::fee_to_hold(activated, settings.activate_fee_max_usdt, settings.transfer_fee_max_usdt));
         body["min_deposit_usdt"] = json!(settings.min_deposit_usdt);
     }
+    if state.config.service_fee_bps > 0 {
+        // The treasury's fee, taken from the CLT minted (not from the USDT), never on a first top-up.
+        // Unreadable history shows the fee: better to warn of a fee that is then waived than the reverse.
+        let first = !deposits::has_had_a_top_up(&state.pool, &user_pk).await.unwrap_or(true);
+        body["service_fee_bps"] = json!(state.config.service_fee_bps);
+        body["service_fee_min_usdt"] = json!(state.config.service_fee_min_usdt);
+        body["service_fee_waived"] = json!(first);
+    }
     Ok((StatusCode::OK, Json(body)))
 }
 

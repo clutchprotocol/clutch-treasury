@@ -116,6 +116,17 @@ pub async fn recent_for_user(pool: &PgPool, user_pk: &str, limit: i64) -> Result
     .await
 }
 
+/// Whether `user_pk` has had a top-up minted or on its way to minting. The treasury takes no service
+/// fee on a user's first one (`service_fee.rs` there), and the deposit panel says so.
+pub async fn has_had_a_top_up(pool: &PgPool, user_pk: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM deposit_intents WHERE user_pk = $1 AND status IN ('mint_requested', 'credited'))",
+    )
+    .bind(user_pk)
+    .fetch_one(pool)
+    .await
+}
+
 /// Records the on-chain tx id once the custody poller matches a transfer to this intent.
 /// `WHERE tron_tx_id IS NULL` keeps the first-seen hash rather than letting a later refetch
 /// (e.g. the poller re-confirming an already-confirmed intent) overwrite it.

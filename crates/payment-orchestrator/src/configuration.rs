@@ -102,6 +102,13 @@ pub struct OrchConfig {
     /// the TRX rail exactly as before.
     #[serde(skip)]
     pub gasfree: Option<gasfree::Settings>,
+    /// The treasury's service fee on top-ups, in basis points, and its minimum in micro-USDT
+    /// (`APP_SERVICE_FEE_BPS`, `APP_SERVICE_FEE_MIN_USDT`, the same variables the treasury reads).
+    /// Only shown to the user here: the treasury is what charges it. 0, the default, is no fee.
+    #[serde(default)]
+    pub service_fee_bps: u32,
+    #[serde(default)]
+    pub service_fee_min_usdt: i64,
     /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
     /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
     /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see
