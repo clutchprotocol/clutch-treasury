@@ -220,13 +220,13 @@ async fn create_direct_topup_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let pay_to = state.config.direct_topup_address.trim();
-    if pay_to.is_empty() || !state.config.permanent_deposit_addresses_enabled {
+    let Some(pay_to) = state.config.direct_topup_address().filter(|_| state.config.permanent_deposit_addresses_enabled)
+    else {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "direct top-ups are not available"})),
         ));
-    }
+    };
     let user_pk = authenticated_pk(&headers, &state.config)?;
     if state.limiter.check(&user_pk).is_err() {
         return Err(StatusCode::TOO_MANY_REQUESTS);

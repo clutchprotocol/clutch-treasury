@@ -109,12 +109,16 @@ pub struct OrchConfig {
     pub service_fee_bps: u32,
     #[serde(default)]
     pub service_fee_min_usdt: i64,
-    /// TronLink direct top-ups (`direct.rs`): the TRON address users pay into from their own wallet,
-    /// the treasury's GasFree float. Empty, the default, is off: the route answers 503 and nothing is
-    /// polled. The treasury checks the same address from its own settings before it mints, so a
-    /// wrong value here credits nothing rather than the wrong thing.
+    /// TronLink direct top-ups (`direct.rs`), `APP_DIRECT_TOPUPS_ENABLED`, the same variable the
+    /// treasury reads. Off by default: the route answers 503 and nothing is polled.
     #[serde(default)]
-    pub direct_topup_address: String,
+    pub direct_topups_enabled: bool,
+    /// The plain payout float, `APP_PAYOUT_FLOAT_ADDRESS`, the same variable the treasury reads. Users
+    /// pay direct top-ups to its GasFree account (`direct_topup_address`), derived here the way the
+    /// treasury derives it, so the two services cannot name different floats. The treasury checks the
+    /// float from its own settings before it mints.
+    #[serde(default)]
+    pub payout_float_address: String,
     /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
     /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
     /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see
@@ -148,6 +152,16 @@ pub fn pilot_permits(allowed: &Option<Vec<String>>, pk: &str) -> bool {
 }
 
 impl OrchConfig {
+    /// Where direct top-ups are paid: the payout float's GasFree account, while direct top-ups and
+    /// GasFree are both on and the float address is valid. `None` is off.
+    pub fn direct_topup_address(&self) -> Option<String> {
+        if !self.direct_topups_enabled {
+            return None;
+        }
+        let settings = self.gasfree.as_ref()?;
+        gasfree::gasfree_address(settings.chain, self.payout_float_address.trim()).ok()
+    }
+
     pub fn load(env: &str) -> Result<Self, ConfigError> {
         dotenv().ok();
         let mut cfg: Self = Config::builder()
@@ -171,6 +185,11 @@ impl OrchConfig {
         // variables from one env file (spec §6), and a half-set rail stops the service here.
         cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         cfg.pilot_allowed_addresses = parse_pilot_allowed(std::env::var("APP_PILOT_ALLOWED_ADDRESSES").ok().as_deref());
+        // A switch that is on with nothing to pay into stops the service, rather than looking on.
+        assert!(
+            !cfg.direct_topups_enabled || cfg.direct_topup_address().is_some(),
+            "APP_DIRECT_TOPUPS_ENABLED needs GasFree on and APP_PAYOUT_FLOAT_ADDRESS set to a TRON address"
+        );
         Ok(cfg)
     }
 }

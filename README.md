@@ -58,9 +58,9 @@ pays whoever paid. The orchestrator credits only senders that asked first and on
 landed after; anything else that reaches the float is recorded once in `direct_unattributed`, raises
 a p1 for a refund by hand, and is never credited later. The treasury mints only after it has checked
 on chain, from its own settings, that the transfer reached the float and came from the TRON address
-of the beneficiary, and never for a sender that is one of its own addresses. Both sides are off by
-default: `APP_DIRECT_TOPUP_ADDRESS` (orchestrator, the float's address) and
-`APP_DIRECT_TOPUPS_ENABLED=true` (treasury, GasFree on).
+of the beneficiary, and never for a sender that is one of its own addresses. Off by default: both
+services read `APP_DIRECT_TOPUPS_ENABLED=true`, and both derive the float from `APP_PAYOUT_FLOAT_ADDRESS`
+with GasFree on.
 
 ## Redemption
 

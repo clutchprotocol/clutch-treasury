@@ -81,10 +81,7 @@ async fn main() {
     ));
 
     // TronLink direct top-ups (direct.rs): one read of the pay-in address per pass, credited by sender.
-    let pay_to = config.direct_topup_address.trim().to_string();
-    if pay_to.is_empty() {
-        tracing::info!("direct top-ups: off");
-    } else {
+    if let Some(pay_to) = config.direct_topup_address() {
         tracing::info!("direct top-ups: on, paid to {pay_to}");
         tokio::spawn(payment_orchestrator::direct::run(
             pool.clone(),
@@ -93,6 +90,8 @@ async fn main() {
             config.usdt_contract.clone(),
             config.poll_interval_secs,
         ));
+    } else {
+        tracing::info!("direct top-ups: off");
     }
 
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
