@@ -37,6 +37,8 @@ bip32 = "0.5"
 # GasFree addresses (addresses.rs, gasfree_chain.rs): G = gasfree(D), computed from public constants,
 # so this key-free service can hand one out. Pure: the same one copy the signer and the treasury use.
 gasfree = { path = "../gasfree" }
+# BEP-20 top-ups (bsc_watch.rs): the settings and the read-only client the treasury uses too.
+bsc = { path = "../bsc" }
 sha3 = "0.10.1"
 serde.workspace = true
 serde_json.workspace = true

@@ -2,6 +2,7 @@ pub mod addresses;
 pub mod alerts;
 pub mod api;
 pub mod auth;
+pub mod bsc_watch;
 pub mod configuration;
 pub mod custody;
 pub mod deposits;

@@ -97,6 +97,9 @@ struct CreateMintIntentBody {
     /// address. Refused unless direct top-ups are on, and unless it is the TRON address of
     /// `beneficiary`; the verifier checks both again, on chain, before anything mints.
     direct_from: Option<String>,
+    /// Where the USDT arrived: `tron` (the default, and every deposit before BSC) or `bsc`. A BSC
+    /// deposit is always a direct top-up from the beneficiary's own wallet (`bsc_verifier.rs`).
+    network: Option<String>,
 }
 
 /// `created_by` is derived from the AUTHENTICATED ROLE (`actor_name`), never from the request
@@ -136,8 +139,26 @@ async fn create_mint_intent_handler(
         // this; failing here makes the reason legible instead of a 500.
         // A deposit-backed intent with no address is unverifiable, and unverifiable must never
         // be approvable — refuse at the door rather than let it age into manual review.
-        match body.direct_from.as_deref() {
-            Some(from) => {
+        match (body.network.as_deref().unwrap_or("tron"), body.direct_from.as_deref()) {
+            ("bsc", from) => {
+                // A BSC top-up: the sender IS the beneficiary (one key, one 20-byte address on both
+                // chains), and the evidence is one BSC transaction. The verifier checks all of it again
+                // on chain, through its own node, before anything mints.
+                let Some(settings) = &state.config.bsc else {
+                    return Err(StatusCode::BAD_REQUEST);
+                };
+                let beneficiary = bsc::normalize_address(&body.beneficiary);
+                if beneficiary.is_none()
+                    || from.and_then(bsc::normalize_address) != beneficiary
+                    || beneficiary.as_deref() == Some(settings.pay_in_address.as_str())
+                    || body.deposit_address.is_some()
+                    || body.derivation_index.is_some()
+                    || body.deposit_tx_id.as_deref().and_then(bsc::normalize_tx_hash).is_none()
+                {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+            ("tron", Some(from)) => {
                 // A direct top-up: no address to sweep, a known transaction, and a sender that is the
                 // beneficiary's own TRON address. Anything else is refused at the door.
                 if !state.config.direct_topups_enabled || state.config.gasfree_float().is_none() {
@@ -151,27 +172,42 @@ async fn create_mint_intent_handler(
                     return Err(StatusCode::BAD_REQUEST);
                 }
             }
-            None => {
+            ("tron", None) => {
                 if body.deposit_address.as_deref().is_none_or(str::is_empty) {
                     return Err(StatusCode::BAD_REQUEST);
                 }
             }
+            _ => return Err(StatusCode::BAD_REQUEST),
         }
         if body.expected_amount_usdt.is_none_or(|a| a <= 0) {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
-    let intent = intents::create_mint_intent(
+    // A manual intent (no client_ref) is not a deposit, and names no network.
+    let network = match (&body.client_ref, body.network.as_deref()) {
+        (Some(_), Some("bsc")) => "bsc",
+        (None, Some(n)) if n != "tron" => return Err(StatusCode::BAD_REQUEST),
+        _ => "tron",
+    };
+    // BSC hashes and addresses are stored lowercase, so the unique index on the transaction sees one
+    // spelling.
+    let (deposit_tx_id, direct_from) = if network == "bsc" {
+        (body.deposit_tx_id.as_deref().and_then(bsc::normalize_tx_hash), body.direct_from.as_deref().and_then(bsc::normalize_address))
+    } else {
+        (body.deposit_tx_id.clone(), body.direct_from.clone())
+    };
+    let intent = intents::create_mint_intent_on(
         &state.pool,
         &body.beneficiary,
         body.amount_clt,
         actor_name(role),
         body.client_ref.as_deref(),
-        body.deposit_tx_id.as_deref(),
+        deposit_tx_id.as_deref(),
         body.expected_amount_usdt,
         body.deposit_address.clone(),
         body.derivation_index,
-        body.direct_from.clone(),
+        direct_from,
+        network,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -612,6 +648,7 @@ fn intent_json(intent: &intents::MintIntent) -> serde_json::Value {
         "verified_at": intent.verified_at,
         "service_fee_clt": intent.service_fee_clt,
         "direct_from": intent.direct_from,
+        "network": intent.network,
     })
 }
 

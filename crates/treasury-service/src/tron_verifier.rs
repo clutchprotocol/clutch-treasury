@@ -579,7 +579,7 @@ const TRC20_TRANSFER_EVENT: &str = "Transfer";
 /// Why a hard mismatch rejects and a transient failure never does (module doc's central
 /// distinction, made into a type so the worker can't blur the two in a match arm).
 #[derive(Debug)]
-enum Evidence {
+pub(crate) enum Evidence {
     /// All four conditions held: recipient, contract, amount, confirmed depth. Carries the
     /// OBSERVED amount (includes the discriminator + any overpay surplus) — the ledger must
     /// record this, not `amount_clt` (brief: ledgering the intended amount would corrupt the
@@ -662,6 +662,8 @@ struct DepositBackedIntent {
     /// The TRON address that paid a TronLink direct top-up (`evaluate_direct`). `None` for a deposit
     /// to a per-user address.
     direct_from: Option<String>,
+    /// `tron`, or `bsc` for a BEP-20 top-up (`bsc_verifier.rs`).
+    network: String,
 }
 
 /// Evaluate one intent's evidence. Two paths per the plan:
@@ -918,6 +920,7 @@ async fn direct_verdict(pool: &PgPool, config: &AppConfig, from: &str, observed_
 ///
 /// `service_fee`, when on, splits the operator's fee off an approved mint in the same transaction
 /// (`service_fee.rs`). It runs after the cap, so `fee_held_usdt` stays the relay's hold alone.
+#[allow(clippy::too_many_arguments)]
 async fn approve_and_ledger(
     pool: &PgPool,
     intent_id: Uuid,
@@ -926,6 +929,7 @@ async fn approve_and_ledger(
     status: &str,
     cap: Option<i64>,
     service_fee: Option<&crate::service_fee::Settings>,
+    network: &str,
 ) -> Result<bool, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
@@ -972,12 +976,13 @@ async fn approve_and_ledger(
     // is swept, and reconciliation judges the reserve on chain.
     sqlx::query(
         "INSERT INTO treasury_events (kind, amount_clt, amount_usdt, intent_id, chain_tx_hash, description)
-         VALUES ('custody_deposit', 0, $1, $2, $3, 'TronGrid-verified deposit')
+         VALUES ('custody_deposit', 0, $1, $2, $3, $4)
          ON CONFLICT (intent_id, kind) WHERE intent_id IS NOT NULL DO NOTHING",
     )
     .bind(observed_amount_usdt)
     .bind(intent_id)
     .bind(tx_id)
+    .bind(if network == "bsc" { "BSC-verified deposit" } else { "TronGrid-verified deposit" })
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
@@ -987,7 +992,7 @@ async fn approve_and_ledger(
 }
 
 /// What a verified deposit may do.
-enum Verdict {
+pub(crate) enum Verdict {
     /// Approve and mint. `cap`, for a GasFree account, is the most it may mint.
     Approve { cap: Option<i64> },
     /// Record the deposit, mint nothing, and page a human.
@@ -1203,10 +1208,11 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
         Option<i64>,
         String,
         Option<String>,
+        String,
     )> =
         sqlx::query_as(
             "SELECT id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index,
-                    beneficiary, direct_from
+                    beneficiary, direct_from, network
              FROM mint_intents
              WHERE status = 'created' AND client_ref IS NOT NULL
              ORDER BY created_at",
@@ -1218,7 +1224,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
     let intents: Vec<DepositBackedIntent> = rows
         .into_iter()
         .map(
-            |(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index, beneficiary, direct_from)| {
+            |(id, expected_amount_usdt, deposit_address, deposit_tx_id, created_at, derivation_index, beneficiary, direct_from, network)| {
                 DepositBackedIntent {
                     id,
                     expected_amount_usdt,
@@ -1228,6 +1234,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                     derivation_index,
                     beneficiary,
                     direct_from,
+                    network,
                 }
             },
         )
@@ -1235,9 +1242,29 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
 
     stuck_intent_sweep(pool, &intents).await;
 
+    // BSC evidence is read through the treasury's own node, once checked to be on the chain the
+    // settings name: a node of another chain must never be the witness for a mint.
+    let bsc = match &config.bsc {
+        Some(settings) if intents.iter().any(|i| i.network == "bsc") => Some(crate::bsc_verifier::Witness::new(settings).await),
+        _ => None,
+    };
+
     let mut approved = 0u32;
     for intent in &intents {
-        match evaluate(&client, config, intent).await {
+        let evidence = if intent.network == "bsc" {
+            crate::bsc_verifier::evaluate(
+                bsc.as_ref(),
+                intent.id,
+                &intent.beneficiary,
+                intent.direct_from.as_deref(),
+                intent.deposit_tx_id.as_deref(),
+                intent.expected_amount_usdt,
+            )
+            .await
+        } else {
+            evaluate(&client, config, intent).await
+        };
+        match evidence {
             Evidence::Pass { tx_id, observed_amount_usdt } => {
                 // Backfill first when this intent didn't already know its tx_id — losing the
                 // race here (brief's gap) must reject THIS intent, never approve on a transfer
@@ -1275,6 +1302,8 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                     continue;
                 }
                 let verdict = match (&intent.direct_from, &config.gasfree) {
+                    // A BEP-20 top-up from the user's own wallet: nothing to sweep, no relay fee.
+                    _ if intent.network == "bsc" => crate::bsc_verifier::verdict(config, intent.direct_from.as_deref(), observed_amount_usdt),
                     // A direct top-up: paid to the float by the user, nothing to sweep and no relay fee.
                     (Some(from), _) => direct_verdict(pool, config, from, observed_amount_usdt).await,
                     // The TRX rail: the whole deposit reaches custody, so the intent mints what it says.
@@ -1283,7 +1312,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 };
                 match verdict {
                     Verdict::Approve { cap } => {
-                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap, config.service_fee.as_ref()).await {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap, config.service_fee.as_ref(), &intent.network).await {
                             Ok(true) => approved += 1,
                             Ok(false) => {} // already approved by a prior run — rerun-safe no-op
                             Err(e) => {
@@ -1292,7 +1321,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                         }
                     }
                     Verdict::Hold { cap, reason } => {
-                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap), None).await {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap), None, &intent.network).await {
                             Ok(true) => {
                                 alert(pool, "p1", "tron_verifier", &format!("mint intent {} needs manual review: {reason}", intent.id)).await;
                             }

@@ -80,6 +80,7 @@ fn test_config(treasury_url: String) -> OrchConfig {
         service_fee_bps: 0,
         service_fee_min_usdt: 0,
         direct_topups_enabled: false,
+        bsc: None,
         payout_float_address: String::new(),
         pilot_allowed_addresses: None,
     }

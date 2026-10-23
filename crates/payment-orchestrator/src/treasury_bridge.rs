@@ -93,6 +93,10 @@ async fn create_step(pool: &PgPool, config: &OrchConfig, http: &Client, intent: 
     if let Some(from) = &intent.direct_from {
         body["direct_from"] = json!(from);
     }
+    // A BEP-20 top-up (`bsc_watch.rs`): the treasury reads its evidence on BSC, not TRON.
+    if intent.network == "bsc" {
+        body["network"] = json!("bsc");
+    }
 
     let resp = http
         .post(format!("{}/internal/mint-intents", config.treasury_url))

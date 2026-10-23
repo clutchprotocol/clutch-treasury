@@ -94,6 +94,21 @@ async fn main() {
         tracing::info!("direct top-ups: off");
     }
 
+    // BEP-20 top-ups on BNB Smart Chain (bsc_watch.rs): confirmed Transfer logs to the pay-in address,
+    // credited by sender. One fixed line either way, like the treasury's: an image from before BSC
+    // ignores APP_BSC_* silently.
+    if let Some(settings) = config.bsc.clone() {
+        tracing::info!(
+            "bsc top-ups: on, chain {}, USDT {}, paid to {}",
+            settings.chain_id,
+            settings.usdt_contract,
+            settings.pay_in_address
+        );
+        tokio::spawn(payment_orchestrator::bsc_watch::run(pool.clone(), settings, config.poll_interval_secs));
+    } else {
+        tracing::info!("bsc top-ups: off");
+    }
+
     // The deposit->mint bridge (Plan C 5b) — the only thing in this crate that crosses into the
     // treasury's private zone. Same poll-interval convention as the poller above.
     tokio::spawn(payment_orchestrator::treasury_bridge::run(pool.clone(), config.clone(), config.poll_interval_secs));

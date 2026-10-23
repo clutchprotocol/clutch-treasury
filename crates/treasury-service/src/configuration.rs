@@ -176,6 +176,10 @@ pub struct AppConfig {
     /// GasFree on, because the float users pay into is the GasFree float.
     #[serde(default)]
     pub direct_topups_enabled: bool,
+    /// BEP-20 USDT deposits on BNB Smart Chain (`bsc_verifier.rs`), read by `load` from the
+    /// environment with `bsc::load_settings`, like GasFree. `None`, the default, is TRON only.
+    #[serde(skip)]
+    pub bsc: Option<bsc::Settings>,
 }
 
 impl AppConfig {
@@ -285,6 +289,7 @@ impl AppConfig {
             cfg.gasfree.is_none() || cfg.gasfree_float().is_some(),
             "APP_PAYOUT_FLOAT_ADDRESS must be a TRON address while GasFree is on: the GasFree float is derived from it"
         );
+        cfg.bsc = bsc::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         cfg.service_fee = load_service_fee(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         // The fee's own intent is approved by the verifier alone. On a chain that wants several
         // signatures per Mint it would wait for approvers nobody asked, and park the operator's fee.
