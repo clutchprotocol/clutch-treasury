@@ -1051,4 +1051,12 @@ async fn a_bsc_top_up_answers_the_network_and_registers_the_caller() {
     let again: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT created_at FROM bsc_payers WHERE user_pk = $1").bind(user).fetch_one(&pool).await.unwrap();
     assert_eq!(first, again, "a second press keeps the first registration time");
+
+    // The deposit answer says the option is on, so the app can show it.
+    let mut config = test_config(treasury.uri(), true);
+    config.bsc = Some(bsc_testnet());
+    let deposit = body_json(post_deposit_response(router_with(pool.clone(), config), USER_A).await).await;
+    assert_eq!(deposit["bsc_chain_id"], json!(97));
+    let off = body_json(post_deposit_response(router_with(pool, test_config(treasury.uri(), true)), USER_A).await).await;
+    assert_eq!(off.get("bsc_chain_id"), None);
 }

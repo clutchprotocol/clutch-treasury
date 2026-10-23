@@ -197,6 +197,11 @@ async fn create_deposit_handler(
             json!(gasfree::fee_to_hold(activated, settings.activate_fee_max_usdt, settings.transfer_fee_max_usdt));
         body["min_deposit_usdt"] = json!(settings.min_deposit_usdt);
     }
+    // Which other ways to pay are on, so the app shows only those. Nothing is registered by this:
+    // a BNB Chain payer is recorded only when they press the button (`/api/v1/bsc-topups`).
+    if let Some(bsc) = &state.config.bsc {
+        body["bsc_chain_id"] = json!(bsc.chain_id);
+    }
     if state.config.service_fee_bps > 0 {
         // The treasury's fee, taken from the CLT minted (not from the USDT), never on a first top-up.
         // Unreadable history shows the fee: better to warn of a fee that is then waived than the reverse.
