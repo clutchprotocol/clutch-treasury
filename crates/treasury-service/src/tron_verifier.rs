@@ -794,6 +794,9 @@ async fn evaluate(
 ///
 /// `cap` is set for a deposit to a GasFree account (spec §2): the mint drops to it when the
 /// orchestrator proposed more, and what was held back is stored beside it.
+///
+/// `service_fee`, when on, splits the operator's fee off an approved mint in the same transaction
+/// (`service_fee.rs`). It runs after the cap, so `fee_held_usdt` stays the relay's hold alone.
 async fn approve_and_ledger(
     pool: &PgPool,
     intent_id: Uuid,
@@ -801,6 +804,7 @@ async fn approve_and_ledger(
     tx_id: &str,
     status: &str,
     cap: Option<i64>,
+    service_fee: Option<&crate::service_fee::Settings>,
 ) -> Result<bool, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
@@ -831,6 +835,9 @@ async fn approve_and_ledger(
     }
 
     if status == "approved" {
+        if let Some(settings) = service_fee {
+            crate::service_fee::split_off(&mut tx, settings, intent_id).await?;
+        }
         sqlx::query("INSERT INTO chain_outbox (intent_id) VALUES ($1)")
             .bind(intent_id)
             .execute(&mut *tx)
@@ -1131,7 +1138,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 };
                 match verdict {
                     Verdict::Approve { cap } => {
-                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap).await {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "approved", cap, config.service_fee.as_ref()).await {
                             Ok(true) => approved += 1,
                             Ok(false) => {} // already approved by a prior run — rerun-safe no-op
                             Err(e) => {
@@ -1140,7 +1147,7 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                         }
                     }
                     Verdict::Hold { cap, reason } => {
-                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap)).await {
+                        match approve_and_ledger(pool, intent.id, observed_amount_usdt, &tx_id, "needs_manual", Some(cap), None).await {
                             Ok(true) => {
                                 alert(pool, "p1", "tron_verifier", &format!("mint intent {} needs manual review: {reason}", intent.id)).await;
                             }

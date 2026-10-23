@@ -167,6 +167,10 @@ pub struct AppConfig {
     /// the TRX rail exactly as before.
     #[serde(skip)]
     pub gasfree: Option<gasfree::Settings>,
+    /// The operator's service fee on top-ups (`service_fee.rs`), read by `load` from the environment
+    /// with `load_service_fee`, like GasFree. `None`, the default, charges nothing.
+    #[serde(skip)]
+    pub service_fee: Option<crate::service_fee::Settings>,
 }
 
 impl AppConfig {
@@ -276,6 +280,91 @@ impl AppConfig {
             cfg.gasfree.is_none() || cfg.gasfree_float().is_some(),
             "APP_PAYOUT_FLOAT_ADDRESS must be a TRON address while GasFree is on: the GasFree float is derived from it"
         );
+        cfg.service_fee = load_service_fee(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+        // The fee's own intent is approved by the verifier alone. On a chain that wants several
+        // signatures per Mint it would wait for approvers nobody asked, and park the operator's fee.
+        assert!(
+            cfg.service_fee.is_none() || cfg.effective_mint_threshold() == 1,
+            "APP_SERVICE_FEE_BPS needs a single-signer chain (mint_threshold 0 or 1)"
+        );
         Ok(cfg)
+    }
+}
+
+/// The service fee's settings: `Ok(None)` while `APP_SERVICE_FEE_BPS` is unset, blank or 0.
+///
+/// A fee that is on needs a minimum (0 is allowed, never left out) and the address the fee is
+/// minted to; a half-set fee stops the service at boot, not at the first deposit. Capped at 10%,
+/// because a typo of 1000 for 100 should refuse to start rather than charge users ten times over.
+pub fn load_service_fee(var: impl Fn(&str) -> Option<String>) -> Result<Option<crate::service_fee::Settings>, String> {
+    let optional = |name: &str| var(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let bps = match optional("APP_SERVICE_FEE_BPS") {
+        None => return Ok(None),
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| format!("APP_SERVICE_FEE_BPS must be a whole number of basis points, got {raw:?}"))?,
+    };
+    if bps == 0 {
+        return Ok(None);
+    }
+    if bps > 1_000 {
+        return Err(format!("APP_SERVICE_FEE_BPS is {bps}, above 1000 (10%): refused as a likely typo"));
+    }
+    let min_raw = optional("APP_SERVICE_FEE_MIN_USDT")
+        .ok_or("APP_SERVICE_FEE_MIN_USDT must be set when APP_SERVICE_FEE_BPS is (0 for no minimum)")?;
+    let min_clt = min_raw
+        .parse::<i64>()
+        .ok()
+        .filter(|m| *m >= 0)
+        .ok_or_else(|| format!("APP_SERVICE_FEE_MIN_USDT must be a whole number of micro-USDT, got {min_raw:?}"))?;
+    let address = optional("APP_SERVICE_FEE_ADDRESS")
+        .ok_or("APP_SERVICE_FEE_ADDRESS must be set when APP_SERVICE_FEE_BPS is")?
+        .to_ascii_lowercase();
+    let hex = address.strip_prefix("0x").unwrap_or("");
+    if hex.len() != 40 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("APP_SERVICE_FEE_ADDRESS must be 0x and 40 hex characters, got {address:?}"));
+    }
+    Ok(Some(crate::service_fee::Settings { bps, min_clt, address }))
+}
+
+#[cfg(test)]
+mod service_fee_tests {
+    use super::load_service_fee;
+    use std::collections::HashMap;
+
+    fn load(pairs: &[(&str, &str)]) -> Result<Option<crate::service_fee::Settings>, String> {
+        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        load_service_fee(|name| map.get(name).cloned())
+    }
+
+    const ADDR: &str = "0x466E50FA1C0609744E0752A5B494511A5BB99006";
+
+    #[test]
+    fn unset_blank_or_zero_is_off() {
+        assert!(load(&[]).unwrap().is_none());
+        assert!(load(&[("APP_SERVICE_FEE_BPS", " ")]).unwrap().is_none());
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "0")]).unwrap().is_none());
+    }
+
+    #[test]
+    fn on_reads_all_three_and_lowercases_the_address() {
+        let s = load(&[("APP_SERVICE_FEE_BPS", "100"), ("APP_SERVICE_FEE_MIN_USDT", "500000"), ("APP_SERVICE_FEE_ADDRESS", ADDR)])
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.bps, s.min_clt), (100, 500_000));
+        assert_eq!(s.address, ADDR.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn half_set_or_wrong_values_refuse() {
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "100"), ("APP_SERVICE_FEE_ADDRESS", ADDR)]).is_err(), "no minimum");
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "100"), ("APP_SERVICE_FEE_MIN_USDT", "500000")]).is_err(), "no address");
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "1%"), ("APP_SERVICE_FEE_MIN_USDT", "0"), ("APP_SERVICE_FEE_ADDRESS", ADDR)]).is_err());
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "1001"), ("APP_SERVICE_FEE_MIN_USDT", "0"), ("APP_SERVICE_FEE_ADDRESS", ADDR)]).is_err());
+        assert!(load(&[("APP_SERVICE_FEE_BPS", "100"), ("APP_SERVICE_FEE_MIN_USDT", "-1"), ("APP_SERVICE_FEE_ADDRESS", ADDR)]).is_err());
+        assert!(
+            load(&[("APP_SERVICE_FEE_BPS", "100"), ("APP_SERVICE_FEE_MIN_USDT", "0"), ("APP_SERVICE_FEE_ADDRESS", "TLntW9Z59LYY5KEi9cmwk3PKjQga828ird")]).is_err(),
+            "a TRON address is not where CLT is minted"
+        );
     }
 }

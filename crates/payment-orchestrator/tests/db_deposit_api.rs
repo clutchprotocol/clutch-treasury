@@ -101,6 +101,8 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         // covered by unit tests in `ratelimit` and one route test in db_deposit_api.
         rate_limit_per_minute: 1_000,
         gasfree: None,
+        service_fee_bps: 0,
+        service_fee_min_usdt: 0,
         // Everyone, as on stage: the pilot allowlist has its own tests below.
         pilot_allowed_addresses: None,
     }
@@ -908,4 +910,33 @@ async fn a_user_with_a_plain_address_is_not_held_up_by_gasfree() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["address"], plain);
     assert!(body.get("fee_up_to_usdt").is_none());
+}
+
+/// The treasury's service fee is shown with the address: waived until the user's first top-up is
+/// minting, charged after. Off, nothing about it is shown.
+#[tokio::test]
+async fn the_service_fee_is_shown_waived_on_a_first_top_up_and_charged_after() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+
+    let (_, off) = post_deposit(router_with(pool.clone(), test_config(treasury.uri(), true)), USER_A).await;
+    assert!(off.get("service_fee_bps").is_none(), "off, nothing is shown");
+
+    let mut config = test_config(treasury.uri(), true);
+    config.service_fee_bps = 100;
+    config.service_fee_min_usdt = 500_000;
+
+    let (status, first) = post_deposit(router_with(pool.clone(), config.clone()), USER_A).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["service_fee_bps"], 100);
+    assert_eq!(first["service_fee_min_usdt"], 500_000);
+    assert_eq!(first["service_fee_waived"], true, "no top-up has minted yet");
+
+    // A deposit that is only waiting does not count; one that is minting does.
+    seed_deposit(&pool, USER_A, 50_000_000, None, "tx-wait", chrono::Utc::now(), "created").await;
+    let (_, still_first) = post_deposit(router_with(pool.clone(), config.clone()), USER_A).await;
+    assert_eq!(still_first["service_fee_waived"], true);
+    seed_deposit(&pool, USER_A, 50_000_000, Some(50_000_000), "tx-minted", chrono::Utc::now(), "credited").await;
+    let (_, after) = post_deposit(router_with(pool.clone(), config), USER_A).await;
+    assert_eq!(after["service_fee_waived"], false);
 }

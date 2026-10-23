@@ -106,6 +106,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         signer_url: "http://unused".into(),
         signer_token: "s".into(),
         gasfree: None,
+        service_fee: None,
     }
 }
 
@@ -1373,4 +1374,159 @@ async fn a_gasfree_deposit_waits_while_the_signer_disagrees_about_its_account() 
     .await
     .unwrap();
     assert_eq!(pages, 1, "paged once, not every pass");
+}
+
+/// The operator's service fee (`service_fee.rs`): 1%, at least $0.50, to this address.
+const FEE_ADDR: &str = "0x466e50fa1c0609744e0752a5b494511a5bb99006";
+
+fn fee_config(trongrid_url: String) -> treasury_service::configuration::AppConfig {
+    let mut config = test_config(trongrid_url);
+    config.service_fee = Some(treasury_service::service_fee::Settings {
+        bps: 100,
+        min_clt: 500_000,
+        address: FEE_ADDR.into(),
+    });
+    config
+}
+
+/// (amount_clt, service_fee_clt) of one intent, and every intent the fee split off it.
+async fn split_of(pool: &PgPool, id: Uuid) -> (i64, Option<i64>, Vec<(String, i64, String, String, String)>) {
+    let (amount, fee): (i64, Option<i64>) =
+        sqlx::query_as("SELECT amount_clt, service_fee_clt FROM mint_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let children: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+        "SELECT beneficiary, amount_clt, status, created_by, credit_ref FROM mint_intents WHERE service_fee_for = $1",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (amount, fee, children)
+}
+
+/// `mount_transaction_confirmed` answers every request with one hash; these tests confirm several.
+async fn mount_confirmed(server: &MockServer, tx_ids: &[&str]) {
+    for tx_id in tx_ids {
+        Mock::given(method("POST"))
+            .and(path("/walletsolidity/gettransactionbyid"))
+            .and(body_string_contains(*tx_id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"txID": tx_id})))
+            .mount(server)
+            .await;
+    }
+}
+
+async fn all_outbox_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM chain_outbox").fetch_one(pool).await.unwrap()
+}
+
+/// No fee on a user's first top-up; the second splits 1% off to the operator, in the same approval.
+/// What the two mint together is what the deposit alone would have minted.
+#[tokio::test]
+async fn the_service_fee_skips_the_first_top_up_and_splits_the_next() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(
+        &server,
+        vec![
+            trc20_transfer_json("tx-first", DEPOSIT_ADDR, USDT, "50000000"),
+            trc20_transfer_json("tx-second", DEPOSIT_ADDR, USDT, "98000000"),
+        ],
+    )
+    .await;
+    mount_confirmed(&server, &["tx-first", "tx-second"]).await;
+    let config = fee_config(server.uri());
+
+    let first = seed_deposit_intent(&pool, 50_000_000, 50_000_000, "client-first", Some("tx-first")).await;
+    assert_eq!(treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap(), 1);
+    let (amount, fee, children) = split_of(&pool, first).await;
+    assert_eq!((amount, fee), (50_000_000, None), "a first top-up mints in full");
+    assert!(children.is_empty());
+    assert_eq!(all_outbox_rows(&pool).await, 1);
+
+    let second = seed_deposit_intent(&pool, 98_000_000, 98_000_000, "client-second", Some("tx-second")).await;
+    assert_eq!(treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap(), 1);
+    let (amount, fee, children) = split_of(&pool, second).await;
+    assert_eq!((amount, fee), (97_020_000, Some(980_000)), "1% of $98 comes off the user's mint");
+    assert_eq!(children.len(), 1, "exactly one fee intent");
+    let (beneficiary, fee_amount, status, created_by, credit_ref) = &children[0];
+    assert_eq!((beneficiary.as_str(), *fee_amount, status.as_str()), (FEE_ADDR, 980_000, "approved"));
+    assert_eq!(created_by, "service-fee");
+    assert_eq!(credit_ref.len(), 64, "its own exactly-once reference, like any intent's");
+    assert_eq!(amount + fee_amount, 98_000_000, "together they mint what arrived");
+    assert_eq!(all_outbox_rows(&pool).await, 3, "the fee intent is queued with the deposit's");
+
+    // A rerun neither approves again nor splits twice.
+    assert_eq!(treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap(), 0);
+    let (amount_after, _, children_after) = split_of(&pool, second).await;
+    assert_eq!((amount_after, children_after.len()), (97_020_000, 1));
+    assert_eq!(all_outbox_rows(&pool).await, 3);
+
+    // The ledger records the whole deposit as reserve, once.
+    let custody: i64 = sqlx::query_scalar(
+        "SELECT amount_usdt FROM treasury_events WHERE intent_id = $1 AND kind = 'custody_deposit'",
+    )
+    .bind(second)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(custody, 98_000_000);
+}
+
+/// With the fee off, a second top-up mints in full exactly as before.
+#[tokio::test]
+async fn with_the_service_fee_off_nothing_is_split() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(
+        &server,
+        vec![
+            trc20_transfer_json("tx-a", DEPOSIT_ADDR, USDT, "50000000"),
+            trc20_transfer_json("tx-b", DEPOSIT_ADDR, USDT, "50000000"),
+        ],
+    )
+    .await;
+    mount_confirmed(&server, &["tx-a", "tx-b"]).await;
+    let config = test_config(server.uri());
+    seed_deposit_intent(&pool, 50_000_000, 50_000_000, "client-a", Some("tx-a")).await;
+    let b = seed_deposit_intent(&pool, 50_000_000, 50_000_000, "client-b", Some("tx-b")).await;
+    assert_eq!(treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap(), 2);
+    let (amount, fee, children) = split_of(&pool, b).await;
+    assert_eq!((amount, fee, children.len()), (50_000_000, None, 0));
+}
+
+/// The operator's own top-ups pay no fee to the operator.
+#[tokio::test]
+async fn the_operators_own_top_up_pays_no_service_fee() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    mount_trc20_list(
+        &server,
+        vec![
+            trc20_transfer_json("tx-op1", DEPOSIT_ADDR, USDT, "50000000"),
+            trc20_transfer_json("tx-op2", DEPOSIT_ADDR, USDT, "50000000"),
+        ],
+    )
+    .await;
+    mount_confirmed(&server, &["tx-op1", "tx-op2"]).await;
+    let config = fee_config(server.uri());
+    let mut ids = Vec::new();
+    for (client_ref, tx) in [("client-op1", "tx-op1"), ("client-op2", "tx-op2")] {
+        let id = seed_deposit_intent(&pool, 50_000_000, 50_000_000, client_ref, Some(tx)).await;
+        sqlx::query("UPDATE mint_intents SET beneficiary = $2 WHERE id = $1")
+            .bind(id)
+            .bind(FEE_ADDR.to_ascii_uppercase().replace("0X", "0x"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    assert_eq!(treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap(), 2);
+    for id in ids {
+        let (amount, fee, children) = split_of(&pool, id).await;
+        assert_eq!((amount, fee, children.len()), (50_000_000, None, 0));
+    }
 }
