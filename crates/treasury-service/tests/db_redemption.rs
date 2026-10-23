@@ -256,6 +256,7 @@ fn config() -> treasury_service::configuration::AppConfig {
         gasfree: None,
         service_fee: None,
         direct_topups_enabled: false,
+        bsc: None,
     }
 }
 

@@ -251,6 +251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsc"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,6 +1659,7 @@ dependencies = [
  "axum",
  "bip32",
  "bs58",
+ "bsc",
  "chrono",
  "config",
  "dotenv",
@@ -3038,6 +3051,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bs58",
+ "bsc",
  "chrono",
  "clutch-chain",
  "config",

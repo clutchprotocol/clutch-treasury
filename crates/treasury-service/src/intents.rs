@@ -31,10 +31,12 @@ pub struct MintIntent {
     /// The TRON address that paid a TronLink direct top-up, which has no deposit address. `None`
     /// for every other intent.
     pub direct_from: Option<String>,
+    /// Where the deposit's USDT arrived: `tron`, or `bsc` (`bsc_verifier.rs`).
+    pub network: String,
 }
 
 const MINT_COLS: &str = "id, beneficiary, amount_clt, status, credit_ref, created_by, approved_by, \
-    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address, derivation_index, service_fee_clt, direct_from";
+    chain_tx_hash, client_ref, deposit_tx_id, verified_at, expected_amount_usdt, deposit_address, derivation_index, service_fee_clt, direct_from, network";
 
 /// `client_ref` is the orchestrator's idempotency key (Plan C T5) — `None` for Plan B's
 /// direct/manual mint intents, `Some(deposit_intent_id)` for deposit-backed ones the
@@ -55,12 +57,34 @@ pub async fn create_mint_intent(
     derivation_index: Option<i64>,
     direct_from: Option<String>,
 ) -> Result<MintIntent, sqlx::Error> {
+    create_mint_intent_on(
+        pool, beneficiary, amount_clt, created_by, client_ref, deposit_tx_id, expected_amount_usdt, deposit_address,
+        derivation_index, direct_from, "tron",
+    )
+    .await
+}
+
+/// `create_mint_intent` for a deposit whose USDT arrived on `network` (`tron` or `bsc`).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_mint_intent_on(
+    pool: &PgPool,
+    beneficiary: &str,
+    amount_clt: i64,
+    created_by: &str,
+    client_ref: Option<&str>,
+    deposit_tx_id: Option<&str>,
+    expected_amount_usdt: Option<i64>,
+    deposit_address: Option<String>,
+    derivation_index: Option<i64>,
+    direct_from: Option<String>,
+    network: &str,
+) -> Result<MintIntent, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query_as::<_, MintIntent>(&format!(
         "INSERT INTO mint_intents
             (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
-             deposit_address, derivation_index, direct_from)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING {MINT_COLS}"
+             deposit_address, derivation_index, direct_from, network)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING {MINT_COLS}"
     ))
     .bind(id)
     .bind(beneficiary)
@@ -73,6 +97,7 @@ pub async fn create_mint_intent(
     .bind(deposit_address)
     .bind(derivation_index)
     .bind(direct_from)
+    .bind(network)
     .fetch_one(pool)
     .await
 }

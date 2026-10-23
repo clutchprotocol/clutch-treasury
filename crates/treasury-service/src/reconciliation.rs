@@ -223,6 +223,16 @@ pub async fn run_once(
         .get_reserve_balance(&config.custody_tron_address, &unswept, &floats, &config.usdt_contract)
         .await
         .map_err(|e| format!("reserve balance unreadable, not recording a run: {e}"))?;
+    // BEP-20 top-ups land at the BSC pay-in address and back CLT like any other deposit. Unreadable
+    // fails the run for the same reason as above.
+    let custody_reported = match &config.bsc {
+        Some(settings) => custody_reported.saturating_add(
+            crate::bsc_verifier::reserve_micro(settings)
+                .await
+                .map_err(|e| format!("BSC reserve balance unreadable, not recording a run: {e}"))?,
+        ),
+        None => custody_reported,
+    };
 
     record(
         pool,

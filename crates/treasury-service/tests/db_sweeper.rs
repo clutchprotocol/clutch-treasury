@@ -96,6 +96,7 @@ fn config(trongrid_url: String, threshold: i64) -> treasury_service::configurati
         gasfree: None,
         service_fee: None,
         direct_topups_enabled: false,
+        bsc: None,
     }
 }
 

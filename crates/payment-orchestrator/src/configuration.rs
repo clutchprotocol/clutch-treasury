@@ -119,6 +119,10 @@ pub struct OrchConfig {
     /// float from its own settings before it mints.
     #[serde(default)]
     pub payout_float_address: String,
+    /// BEP-20 top-ups on BNB Smart Chain (`bsc_watch.rs`), read by `load` from the environment with
+    /// `bsc::load_settings`, the same function and variables the treasury uses. `None` is off.
+    #[serde(skip)]
+    pub bsc: Option<bsc::Settings>,
     /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
     /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
     /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see
@@ -184,6 +188,7 @@ impl OrchConfig {
         // From the environment only, like the secrets above: the three services read the same
         // variables from one env file (spec §6), and a half-set rail stops the service here.
         cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+        cfg.bsc = bsc::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         cfg.pilot_allowed_addresses = parse_pilot_allowed(std::env::var("APP_PILOT_ALLOWED_ADDRESSES").ok().as_deref());
         // A switch that is on with nothing to pay into stops the service, rather than looking on.
         assert!(

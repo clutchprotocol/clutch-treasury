@@ -62,6 +62,18 @@ of the beneficiary, and never for a sender that is one of its own addresses. Off
 services read `APP_DIRECT_TOPUPS_ENABLED=true`, and both derive the float from `APP_PAYOUT_FLOAT_ADDRESS`
 with GasFree on.
 
+### BEP-20 top-ups on BNB Smart Chain
+
+Phase 1 of `docs/superpowers/specs/2026-10-23-bsc-usdt-design.md`: the same idea on BSC, for users
+with an Ethereum wallet. There the sending address IS the CLT address (same key, same 20 bytes, same
+`0x` spelling), so a USDT Transfer from `0xX` pays CLT to `0xX`. `POST /api/v1/bsc-topups` (no body)
+registers the caller and answers the chain id, the pay-in address and the USDT contract;
+`bsc_watch.rs` reads confirmed `Transfer(*, pay_in)` logs and credits only senders that asked first,
+and the treasury (`bsc_verifier.rs`) re-reads the receipt through its own node before it mints. 18
+decimals are floored to micro-USDT. The pay-in address's balance is part of the reserve. Deposits
+only: no sweeps, no BSC payouts, and no BSC key on the host. Off by default: both services read the
+`APP_BSC_*` settings with the shared `bsc` crate (`APP_BSC_TOPUPS_ENABLED=true` and the rest).
+
 ## Redemption
 
 Live on the testnet since 2026-09-04. On mainnet redemptions are switched on since 2026-10-05, but

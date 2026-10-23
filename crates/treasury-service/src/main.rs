@@ -344,6 +344,18 @@ async fn main() {
             fee.address
         ),
     }
+    // The same for BEP-20 top-ups: an image from before them ignores APP_BSC_* silently.
+    match &config.bsc {
+        None => tracing::info!("bsc top-ups: off"),
+        Some(bsc) => tracing::info!(
+            "bsc top-ups: on, chain {}, USDT {} ({} decimals), pay-in {}, {} confirmations",
+            bsc.chain_id,
+            bsc.usdt_contract,
+            bsc.usdt_decimals,
+            bsc.pay_in_address,
+            bsc.confirmations
+        ),
+    }
     tracing::info!("treasury-service listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");
 }

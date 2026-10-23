@@ -108,6 +108,7 @@ fn test_config(trongrid_url: String) -> treasury_service::configuration::AppConf
         gasfree: None,
         service_fee: None,
         direct_topups_enabled: false,
+        bsc: None,
     }
 }
 

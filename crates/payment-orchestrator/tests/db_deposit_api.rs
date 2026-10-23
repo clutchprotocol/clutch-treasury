@@ -67,7 +67,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, deposit_addresses, direct_payers RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, deposit_addresses, direct_payers, bsc_payers RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -104,6 +104,7 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         service_fee_bps: 0,
         service_fee_min_usdt: 0,
         direct_topups_enabled: false,
+        bsc: None,
         payout_float_address: String::new(),
         // Everyone, as on stage: the pilot allowlist has its own tests below.
         pilot_allowed_addresses: None,
@@ -990,4 +991,64 @@ async fn a_direct_top_up_answers_the_float_and_the_callers_own_tron_address() {
         .await
         .unwrap();
     assert_eq!(payer, ("TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH".into(), "0xc8599111f29c1e1e061265b4af93ea1f274ad78a".into()));
+}
+
+// ---- BEP-20 top-ups on BNB Smart Chain (`bsc_watch.rs`).
+
+fn bsc_testnet() -> bsc::Settings {
+    bsc::Settings {
+        chain_id: 97,
+        rpc_url: "http://unused".into(),
+        usdt_contract: "0x337610d27c682e347c9cd60bd4b3b107c9d34ddd".into(),
+        usdt_decimals: 18,
+        pay_in_address: "0x2222222222222222222222222222222222222222".into(),
+        confirmations: 15,
+    }
+}
+
+async fn post_bsc(app: axum::Router, user: &str) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/bsc-topups")
+        .header("authorization", bearer_for(user))
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn bsc_top_ups_are_off_by_default_and_with_deposits_off() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let app = router_with(pool.clone(), test_config(treasury.uri(), true));
+    assert_eq!(post_bsc(app, USER_A).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let mut config = test_config(treasury.uri(), false);
+    config.bsc = Some(bsc_testnet());
+    assert_eq!(post_bsc(router_with(pool, config), USER_A).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// On: the answer names the network and the pay-in address, the caller pays from their own CLT
+/// address, and is now a payer.
+#[tokio::test]
+async fn a_bsc_top_up_answers_the_network_and_registers_the_caller() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    config.bsc = Some(bsc_testnet());
+    let user = "0xC8599111F29C1E1E061265B4AF93EA1F274AD78A";
+
+    let body = body_json(post_bsc(router_with(pool.clone(), config.clone()), user).await).await;
+    assert_eq!(body["network"], json!("bsc"));
+    assert_eq!(body["chain_id"], json!(97));
+    assert_eq!(body["pay_to"], json!("0x2222222222222222222222222222222222222222"));
+    assert_eq!(body["from"], json!("0xc8599111f29c1e1e061265b4af93ea1f274ad78a"));
+    assert_eq!(body["usdt_decimals"], json!(18));
+
+    let first: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM bsc_payers WHERE user_pk = $1").bind(user).fetch_one(&pool).await.unwrap();
+    assert_eq!(post_bsc(router_with(pool.clone(), config), user).await.status(), StatusCode::OK);
+    let again: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM bsc_payers WHERE user_pk = $1").bind(user).fetch_one(&pool).await.unwrap();
+    assert_eq!(first, again, "a second press keeps the first registration time");
 }

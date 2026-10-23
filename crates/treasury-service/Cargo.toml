@@ -34,6 +34,8 @@ bs58 = { version = "0.5", features = ["check"] }
 # The GasFree rail (gasfree_rail.rs): the shared settings, the fee rule and the network constants.
 # Pure and key-free: the one copy the signer and the orchestrator use too.
 gasfree = { path = "../gasfree" }
+# BEP-20 USDT on BSC (bsc_verifier.rs): the shared settings and a read-only JSON-RPC client.
+bsc = { path = "../bsc" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

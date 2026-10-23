@@ -1,5 +1,6 @@
 pub mod api;
 pub mod breakers;
+pub mod bsc_verifier;
 pub mod chain_sync;
 pub mod configuration;
 pub mod gasfree_rail;

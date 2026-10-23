@@ -66,12 +66,15 @@ pub struct DepositIntent {
     /// The TRON address that paid a TronLink direct top-up (`direct.rs`). `None` on every deposit to
     /// a per-user address.
     pub direct_from: Option<String>,
+    /// Where the USDT arrived: `tron`, or `bsc` for a BEP-20 top-up (`bsc_watch.rs`), whose
+    /// `direct_from` is the BSC address that paid and `tron_tx_id` its BSC transaction hash.
+    pub network: String,
 }
 
 const INTENT_COLS: &str = "id, user_pk, clt_address, amount_usdt, amount_clt, \
     status, client_key, invoice_id, tron_tx_id, response_status, response_body, payment_window_closed, \
     derivation_index, deposit_address, expires_at, \
-    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at, transfer_at, direct_from";
+    treasury_intent_id, attempts, next_attempt_at, received_usdt, created_at, transfer_at, direct_from, network";
 
 /// Claim the next BIP32 derivation index for a deposit address.
 ///
