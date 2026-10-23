@@ -333,6 +333,17 @@ async fn main() {
     metrics::serve(pool.clone(), config.metrics_addr.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await.expect("bind");
+    // One fixed line that set-service-fee.sh looks for: an image from before the fee ignores
+    // APP_SERVICE_FEE_* without a word. The address is the operator's own, already public.
+    match &config.service_fee {
+        None => tracing::info!("service fee: off"),
+        Some(fee) => tracing::info!(
+            "service fee: on, {} bps, at least {} micro-USDT, to {}, never on a first top-up",
+            fee.bps,
+            fee.min_clt,
+            fee.address
+        ),
+    }
     tracing::info!("treasury-service listening on {}", config.http_addr);
     axum::serve(listener, app).await.expect("serve");
 }
