@@ -24,7 +24,7 @@ async fn pool() -> PgPool {
     }
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    sqlx::query("TRUNCATE deposit_intents, alerts, bsc_payers, bsc_watch, bsc_unattributed RESTART IDENTITY CASCADE")
+    sqlx::query("TRUNCATE deposit_intents, deposit_addresses, alerts, bsc_payers, bsc_watch, bsc_unattributed RESTART IDENTITY CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -69,7 +69,12 @@ impl BscChain for FakeChain {
         if self.fail {
             return Err("scripted node outage".into());
         }
-        Ok(self.transfers.iter().filter(|t| (from_block..=to_block).contains(&t.block_number)).cloned().collect())
+        Ok(self.transfers.iter().filter(|t| t.to == to && (from_block..=to_block).contains(&t.block_number)).cloned().collect())
+    }
+    async fn transfers_to_any(&self, contract: &str, tos: &[String], from_block: u64, to_block: u64) -> Result<Vec<bsc::Transfer>, String> {
+        assert_eq!(contract, USDT);
+        assert!(!tos.is_empty() && tos.len() <= 100);
+        Ok(self.transfers.iter().filter(|t| tos.contains(&t.to) && (from_block..=to_block).contains(&t.block_number)).cloned().collect())
     }
     async fn block_timestamp(&self, _number: u64) -> Result<u64, String> {
         Ok(self.block_seconds)
@@ -187,4 +192,74 @@ async fn ranges_are_bounded_and_an_outage_advances_nothing() {
     down.fail = true;
     assert!(bsc_watch::watch_once(&pool, &down, &settings()).await.is_err());
     assert_eq!(cursor(&pool).await, Some(600));
+}
+
+/// Two users' own BSC deposit addresses (spec 2026-10-29), at TRON indexes 7 and 8.
+const ADDR_A: &str = "0x9858effd232b4033e47d90003d41ec34ecaeda94";
+const ADDR_B: &str = "0x6fac4d18c912343bf86fa7049364dd4e424ab9c0";
+const USER_B: &str = "0x00000000000000000000000000000000000000b2";
+
+async fn give_addresses(pool: &PgPool) {
+    for (user, index, tron, bsc) in [(USER, 7i64, "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH", ADDR_A), (USER_B, 8, "TSeJkUh4Qv67VNFwY8LaAxERygNdy6NQZK", ADDR_B)] {
+        sqlx::query(
+            "INSERT INTO deposit_addresses (user_pk, derivation_index, address, clt_address, bsc_address) VALUES ($1, $2, $3, $1, $4)",
+        )
+        .bind(user)
+        .bind(index)
+        .bind(tron)
+        .bind(bsc)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+fn to(mut t: bsc::Transfer, address: &str) -> bsc::Transfer {
+    t.to = address.into();
+    t
+}
+
+async fn address_deposits(pool: &PgPool) -> Vec<(String, i64, Option<String>, Option<i64>, Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT clt_address, received_usdt, deposit_address, derivation_index, direct_from, network FROM deposit_intents ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn anything_sent_to_a_users_own_address_is_theirs_whoever_sent_it() {
+    let pool = pool().await;
+    give_addresses(&pool).await;
+    // An exchange withdrawal, in two Transfers of one transaction, nobody having asked first.
+    let chain = FakeChain::new(1000, later(), vec![to(transfer(9, 950, STRANGER, 3 * E18), ADDR_A), to(transfer(9, 950, STRANGER, 2 * E18), ADDR_A)]);
+    bsc_watch::watch_once(&pool, &chain, &settings()).await.unwrap();
+    bsc_watch::watch_once(&pool, &chain, &settings()).await.unwrap();
+    assert_eq!(
+        address_deposits(&pool).await,
+        vec![(USER.into(), 5_000_000, Some(ADDR_A.into()), Some(7), None, "bsc".into())]
+    );
+    assert_eq!(p1_alerts(&pool).await, 0);
+}
+
+#[tokio::test]
+async fn the_sweep_of_a_deposit_address_is_not_a_top_up() {
+    let pool = pool().await;
+    give_addresses(&pool).await;
+    let chain = FakeChain::new(1000, later(), vec![transfer(10, 950, ADDR_A, 5 * E18)]);
+    bsc_watch::watch_once(&pool, &chain, &settings()).await.unwrap();
+    assert!(address_deposits(&pool).await.is_empty());
+    assert_eq!(p1_alerts(&pool).await, 0, "no 'unknown sender' page for our own sweep");
+}
+
+#[tokio::test]
+async fn one_transaction_paying_two_users_credits_one_and_pages_for_the_other() {
+    let pool = pool().await;
+    give_addresses(&pool).await;
+    let chain = FakeChain::new(1000, later(), vec![to(transfer(11, 950, STRANGER, 4 * E18), ADDR_A), to(transfer(11, 950, STRANGER, 6 * E18), ADDR_B)]);
+    bsc_watch::watch_once(&pool, &chain, &settings()).await.unwrap();
+    bsc_watch::watch_once(&pool, &chain, &settings()).await.unwrap();
+    assert_eq!(address_deposits(&pool).await.len(), 1);
+    assert_eq!(p1_alerts(&pool).await, 1, "once");
 }

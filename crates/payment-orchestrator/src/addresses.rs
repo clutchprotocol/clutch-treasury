@@ -72,6 +72,37 @@ pub async fn existing(pool: &PgPool, user_pk: &str) -> Result<Option<(String, bo
         .map_err(|e| format!("reading the deposit address: {e}"))
 }
 
+/// The user's BNB Smart Chain deposit address, deriving and storing it on first call. It lives at the
+/// user's TRON `derivation_index` under the BSC xpub, so the user must have a TRON row first
+/// (`address_for_user`). Idempotent: the update only fills an empty column, then the stored value is
+/// read back.
+pub async fn bsc_address_for_user(pool: &PgPool, bsc_deriver: &AddressDeriver, user_pk: &str) -> Result<String, String> {
+    let (index, stored): (i64, Option<String>) =
+        sqlx::query_as("SELECT derivation_index, bsc_address FROM deposit_addresses WHERE user_pk = $1")
+            .bind(user_pk)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("reading the deposit address: {e}"))?
+            .ok_or_else(|| format!("{user_pk} has no deposit address yet"))?;
+    if let Some(address) = stored {
+        return Ok(address);
+    }
+    let index = u32::try_from(index).map_err(|_| format!("derivation index {index} is out of range"))?;
+    let address = bsc_deriver.evm_address_at(index)?;
+    sqlx::query("UPDATE deposit_addresses SET bsc_address = $2 WHERE user_pk = $1 AND bsc_address IS NULL")
+        .bind(user_pk)
+        .bind(&address)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("storing the BSC deposit address: {e}"))?;
+    sqlx::query_scalar::<_, Option<String>>("SELECT bsc_address FROM deposit_addresses WHERE user_pk = $1")
+        .bind(user_pk)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("reading the BSC deposit address: {e}"))?
+        .ok_or_else(|| "BSC deposit address vanished immediately after update".to_string())
+}
+
 /// Put a user's address on the fast poll tier, because they are about to send.
 pub async fn mark_hot(pool: &PgPool, user_pk: &str, window_hours: i64) -> Result<(), String> {
     sqlx::query(

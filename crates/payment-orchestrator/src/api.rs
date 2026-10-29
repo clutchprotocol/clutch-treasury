@@ -32,6 +32,8 @@ pub struct AppState {
     pub limiter: Arc<RateLimiter>,
     /// GasFree's reads: the tripwire and the activation record in front of a GasFree address.
     pub gasfree_chain: Arc<GasFreeChain>,
+    /// The BSC xpub, parsed once, while BSC deposit addresses are on.
+    pub bsc_deriver: Option<Arc<AddressDeriver>>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -201,6 +203,18 @@ async fn create_deposit_handler(
     // a BNB Chain payer is recorded only when they press the button (`/api/v1/bsc-topups`).
     if let Some(bsc) = &state.config.bsc {
         body["bsc_chain_id"] = json!(bsc.chain_id);
+        // The user's own BNB Chain address (spec 2026-10-29): anything sent to it, from any wallet or
+        // exchange, is theirs. Unavailable is not fatal: the TRON address above still works, and the
+        // app falls back to paying from the wallet.
+        if let Some(bsc_deriver) = &state.bsc_deriver {
+            match addresses::bsc_address_for_user(&state.pool, bsc_deriver, &user_pk).await {
+                Ok(a) => {
+                    body["bsc_address"] = json!(a);
+                    body["bsc_usdt_contract"] = json!(bsc.usdt_contract);
+                }
+                Err(e) => tracing::error!("BSC deposit address for {user_pk}: {e}"),
+            }
+        }
     }
     if state.config.service_fee_bps > 0 {
         // The treasury's fee, taken from the CLT minted (not from the USDT), never on a first top-up.
@@ -577,7 +591,14 @@ pub fn router(pool: PgPool, config: OrchConfig, deriver: Arc<AddressDeriver>) ->
     let cors = build_cors(&config.allowed_origins);
     let limiter = Arc::new(RateLimiter::per_minute(config.rate_limit_per_minute));
     let gasfree_chain = Arc::new(GasFreeChain::new(config.trongrid_url.clone(), config.trongrid_api_key.clone()));
-    let state = AppState { pool, config, deriver, limiter, gasfree_chain };
+    // Parsed here, so a malformed xpub stops the service at boot like the TRON one.
+    let bsc_deriver = config.bsc_deposit_account_xpub.as_deref().map(|x| {
+        Arc::new(
+            AddressDeriver::from_account_xpub(x)
+                .expect("APP_BSC_DEPOSIT_ACCOUNT_XPUB must be a valid account-level xpub (m/44'/60'/0')"),
+        )
+    });
+    let state = AppState { pool, config, deriver, limiter, gasfree_chain, bsc_deriver };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/deposits", post(create_deposit_handler).get(list_deposits_handler))

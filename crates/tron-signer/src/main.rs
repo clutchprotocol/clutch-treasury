@@ -30,6 +30,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use tron_signer::bsc_keys::BscKeys;
+use tron_signer::bsc_sweep::{bsc_sweep_response, BscSweepOutcome, BscSweeper};
 use tron_signer::keys::Signer;
 use tron_signer::sweep::{
     activate_float_response, fund_float_response, load_gasfree_config, payout_response, sweep_response, trace_response, validate_payout_cap, ActivateFloatOutcome, FundFloatOutcome,
@@ -40,6 +42,8 @@ use tron_signer::sweep::{
 struct AppState {
     signer: Arc<Signer>,
     sweeper: Arc<SweepClient>,
+    /// BNB Smart Chain deposit addresses, while `APP_BSC_DEPOSIT_MNEMONIC` is set. `None` answers 404.
+    bsc: Option<Arc<BscSweeper>>,
     token: String,
 }
 
@@ -217,6 +221,66 @@ async fn gasfree_trace(
     }
 }
 
+/// The BSC account xpub (for the orchestrator's `APP_BSC_DEPOSIT_ACCOUNT_XPUB`) and the gas account,
+/// where an operator sends the BNB that pays for sweeps. Public material; moves nothing.
+async fn bsc_xpub(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    let bsc = s.bsc.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let gas_address = bsc.keys.gas_address().map_err(|e| {
+        tracing::error!("BSC gas address derivation failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({
+        "account_xpub": bsc.keys.account_xpub(),
+        "gas_address": gas_address,
+        "sweep_to": bsc.settings.pay_in_address,
+        "chain_id": bsc.settings.chain_id,
+    })))
+}
+
+/// The BSC deposit address of `index`. The treasury asks here before it mints, so an address no sweep
+/// could move never backs CLT. Moves nothing.
+async fn bsc_address(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(index): Path<u32>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    let bsc = s.bsc.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    if index >= 0x8000_0000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let address = bsc.keys.address_at(index).map_err(|e| {
+        tracing::error!("BSC address derivation for index {index} failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({"index": index, "address": address})))
+}
+
+/// ONLY an index, like the TRON sweep: the destination, token and chain are this service's settings.
+async fn bsc_sweep(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SweepRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authed(&headers, &s.token)?;
+    let bsc = s.bsc.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    match bsc.sweep(req.index).await {
+        Ok(outcome) => {
+            match &outcome {
+                BscSweepOutcome::Swept { .. } | BscSweepOutcome::Funded { .. } => tracing::info!(index = req.index, ?outcome, "bsc sweep"),
+                BscSweepOutcome::NothingToSweep | BscSweepOutcome::Busy => tracing::debug!(index = req.index, ?outcome, "bsc sweep"),
+                _ => tracing::warn!(index = req.index, ?outcome, "bsc sweep"),
+            }
+            Ok(Json(bsc_sweep_response(&outcome)))
+        }
+        Err(e) => {
+            tracing::error!("bsc sweep of index {} failed: {e}", req.index);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// No request struct, deliberately: there is nothing to deserialize.
 ///
 /// A `to`, an `amount` or a `contract` here would each turn "move the fee account's misplaced USDT
@@ -312,7 +376,30 @@ async fn main() {
         ),
     }
 
-    let state = AppState { signer, sweeper, token: env("APP_SIGNER_TOKEN") };
+    // BNB Smart Chain deposit addresses: on with their own mnemonic, never a path on the TRON one. With
+    // it set the BSC settings are required, so a half-configured rail stops here.
+    let bsc = match std::env::var("APP_BSC_DEPOSIT_MNEMONIC").ok().filter(|m| !m.trim().is_empty()) {
+        None => {
+            tracing::info!("bsc deposit addresses: off");
+            None
+        }
+        Some(phrase) => {
+            let keys = BscKeys::from_mnemonic(&phrase, "").expect("APP_BSC_DEPOSIT_MNEMONIC must be a valid BIP39 mnemonic");
+            let settings = bsc::load_settings(|name| std::env::var(name).ok())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .expect("APP_BSC_DEPOSIT_MNEMONIC is set, so APP_BSC_TOPUPS_ENABLED and the APP_BSC_* settings must be too");
+            tracing::info!(
+                "bsc deposit addresses: on, chain {}, account xpub {}, gas account {}, swept to {}",
+                settings.chain_id,
+                keys.account_xpub(),
+                keys.gas_address().expect("BSC gas address"),
+                settings.pay_in_address
+            );
+            Some(Arc::new(BscSweeper::new(keys, settings)))
+        }
+    };
+
+    let state = AppState { signer, sweeper, bsc, token: env("APP_SIGNER_TOKEN") };
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/internal/xpub", get(xpub))
@@ -322,6 +409,9 @@ async fn main() {
         .route("/internal/gasfree/trace/:trace_id", get(gasfree_trace))
         .route("/internal/fund-float", post(fund_float))
         .route("/internal/activate-float", post(activate_float))
+        .route("/internal/bsc/xpub", get(bsc_xpub))
+        .route("/internal/bsc/addresses/:index", get(bsc_address))
+        .route("/internal/bsc/sweep", post(bsc_sweep))
         .with_state(state);
 
     let addr = std::env::var("APP_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8093".into());

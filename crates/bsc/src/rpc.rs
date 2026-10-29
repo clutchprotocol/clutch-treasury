@@ -1,10 +1,11 @@
-//! A read-only BSC JSON-RPC client: the six calls phase 1 needs, and nothing that sends.
+//! A BSC JSON-RPC client. It holds no key: the reads both services need, and `send_raw_transaction`,
+//! which broadcasts bytes the signer has already signed (`tron-signer`'s `bsc_sweep.rs`).
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::{address_word, decode_transfer, hex_u128, normalize_address, Transfer, TRANSFER_TOPIC};
+use crate::{address_word, decode_transfer, hex_u128, normalize_address, normalize_tx_hash, Transfer, TRANSFER_TOPIC};
 
 /// `decimals()` and `balanceOf(address)`.
 const DECIMALS_SELECTOR: &str = "0x313ce567";
@@ -100,6 +101,34 @@ impl Client {
         Ok(logs.iter().filter_map(decode_transfer).filter(|t| t.contract == contract && t.to == to).collect())
     }
 
+    /// Every Transfer of `contract` to any of `tos` in blocks `from_block..=to_block`: one
+    /// `eth_getLogs`, the recipients OR-ed in the third topic. Callers chunk `tos`; an empty list asks
+    /// nothing, because an empty OR would match every recipient.
+    pub async fn transfers_to_any(&self, contract: &str, tos: &[String], from_block: u64, to_block: u64) -> Result<Vec<Transfer>, String> {
+        if tos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<String> = tos.iter().filter_map(|t| normalize_address(t)).collect();
+        let topics: Vec<String> = wanted.iter().filter_map(|t| address_word(t)).collect();
+        if topics.len() != tos.len() {
+            return Err(format!("not every recipient is a BSC address: {tos:?}"));
+        }
+        let logs = self
+            .call(
+                "eth_getLogs",
+                json!([{
+                    "address": contract,
+                    "fromBlock": format!("0x{from_block:x}"),
+                    "toBlock": format!("0x{to_block:x}"),
+                    "topics": [TRANSFER_TOPIC, null, topics],
+                }]),
+            )
+            .await?;
+        let logs = logs.as_array().ok_or_else(|| format!("bsc eth_getLogs: not a list: {logs}"))?;
+        let contract = normalize_address(contract).unwrap_or_default();
+        Ok(logs.iter().filter_map(decode_transfer).filter(|t| t.contract == contract && wanted.contains(&t.to)).collect())
+    }
+
     /// A block's timestamp, in seconds.
     pub async fn block_timestamp(&self, number: u64) -> Result<u64, String> {
         let b = self.call("eth_getBlockByNumber", json!([format!("0x{number:x}"), false])).await?;
@@ -117,6 +146,35 @@ impl Client {
     pub async fn balance_of(&self, contract: &str, owner: &str) -> Result<u128, String> {
         let word = address_word(owner).ok_or_else(|| format!("{owner} is not a BSC address"))?;
         self.view(contract, format!("0x{BALANCE_OF_SELECTOR}{}", &word[2..])).await
+    }
+
+    /// BNB held by `address`, in wei.
+    pub async fn balance(&self, address: &str) -> Result<u128, String> {
+        let r = self.call("eth_getBalance", json!([address, "latest"])).await?;
+        r.as_str().and_then(hex_u128).ok_or_else(|| format!("bsc eth_getBalance: not a quantity: {r}"))
+    }
+
+    pub async fn gas_price(&self) -> Result<u128, String> {
+        let r = self.call("eth_gasPrice", json!([])).await?;
+        r.as_str().and_then(hex_u128).ok_or_else(|| format!("bsc eth_gasPrice: not a quantity: {r}"))
+    }
+
+    /// The next nonce of `address`, counting mined transactions only (`pending == false`) or the
+    /// node's pool too. The two differ while a transaction from `address` is waiting.
+    pub async fn nonce(&self, address: &str, pending: bool) -> Result<u64, String> {
+        let tag = if pending { "pending" } else { "latest" };
+        Self::quantity("eth_getTransactionCount", &self.call("eth_getTransactionCount", json!([address, tag])).await?)
+    }
+
+    /// The gas a call from `from` to `to` with `data` would use now.
+    pub async fn estimate_gas(&self, from: &str, to: &str, data: &str) -> Result<u64, String> {
+        Self::quantity("eth_estimateGas", &self.call("eth_estimateGas", json!([{"from": from, "to": to, "data": data}])).await?)
+    }
+
+    /// Broadcast a signed transaction (`0x` + its hex). Answers its hash as the node wrote it.
+    pub async fn send_raw_transaction(&self, raw: &str) -> Result<String, String> {
+        let r = self.call("eth_sendRawTransaction", json!([raw])).await?;
+        r.as_str().and_then(normalize_tx_hash).ok_or_else(|| format!("bsc eth_sendRawTransaction: not a hash: {r}"))
     }
 
     pub async fn decimals(&self, contract: &str) -> Result<u8, String> {
@@ -170,6 +228,34 @@ mod tests {
         let c = Client::new(&server.uri());
         assert!(c.balance_of("0x55d398326f99059ff775485246999027b3197955", "0x2222222222222222222222222222222222222222").await.is_err());
         assert!(c.block_number().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn transfers_to_any_filters_on_every_recipient_and_rechecks_them() {
+        let server = MockServer::start().await;
+        let usdt = "0x55d398326f99059ff775485246999027b3197955";
+        let a = "0x1111111111111111111111111111111111111111";
+        let b = "0x2222222222222222222222222222222222222222";
+        let stranger = "0x3333333333333333333333333333333333333333";
+        let log = |to: &str| {
+            json!({
+                "address": usdt,
+                "topics": [TRANSFER_TOPIC, address_word(stranger).unwrap(), address_word(to).unwrap()],
+                "data": format!("0x{:064x}", 5u128),
+                "transactionHash": format!("0x{}", "ab".repeat(32)),
+                "logIndex": "0x0",
+                "blockNumber": "0x10",
+            })
+        };
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "eth_getLogs", "params": [{"topics": [TRANSFER_TOPIC, null, [address_word(a).unwrap(), address_word(b).unwrap()]]}]})))
+            .respond_with(ok(json!([log(a), log(b), log(stranger)])))
+            .mount(&server)
+            .await;
+        let c = Client::new(&server.uri());
+        let got = c.transfers_to_any(usdt, &[a.to_string(), b.to_string()], 1, 20).await.unwrap();
+        assert_eq!(got.iter().map(|t| t.to.as_str()).collect::<Vec<_>>(), [a, b], "a node that ignored the filter credits nobody else");
+        assert!(c.transfers_to_any(usdt, &[], 1, 20).await.unwrap().is_empty(), "an empty list asks nothing");
     }
 
     #[tokio::test]

@@ -123,6 +123,11 @@ pub struct OrchConfig {
     /// `bsc::load_settings`, the same function and variables the treasury uses. `None` is off.
     #[serde(skip)]
     pub bsc: Option<bsc::Settings>,
+    /// The account xpub (`m/44'/60'/0'`) of the signer's BSC deposit mnemonic,
+    /// `APP_BSC_DEPOSIT_ACCOUNT_XPUB`. With it, and BSC on, every user is given their own BSC deposit
+    /// address (spec 2026-10-29); without it BNB Chain is pay-from-your-wallet only. Public material.
+    #[serde(default)]
+    pub bsc_deposit_account_xpub: Option<String>,
     /// Who may use this service during a pilot. `None`, the default, is everyone: stage, and mainnet
     /// once it is opened up. `Some(list)` is only the addresses in `list`, lower-case, and an empty
     /// list is nobody. Read by `load` from `APP_PILOT_ALLOWED_ADDRESSES`, never from TOML; see
@@ -189,6 +194,11 @@ impl OrchConfig {
         // variables from one env file (spec §6), and a half-set rail stops the service here.
         cfg.gasfree = gasfree::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
         cfg.bsc = bsc::load_settings(|name| std::env::var(name).ok()).unwrap_or_else(|e| panic!("{e}"));
+        cfg.bsc_deposit_account_xpub = cfg.bsc_deposit_account_xpub.take().map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+        assert!(
+            cfg.bsc_deposit_account_xpub.is_none() || cfg.bsc.is_some(),
+            "APP_BSC_DEPOSIT_ACCOUNT_XPUB needs APP_BSC_TOPUPS_ENABLED=true and the APP_BSC_* settings"
+        );
         cfg.pilot_allowed_addresses = parse_pilot_allowed(std::env::var("APP_PILOT_ALLOWED_ADDRESSES").ok().as_deref());
         // A switch that is on with nothing to pay into stops the service, rather than looking on.
         assert!(

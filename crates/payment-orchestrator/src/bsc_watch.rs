@@ -11,6 +11,12 @@
 //! has a `bsc_payers` row and landed after it; anything else is recorded once in `bsc_unattributed`,
 //! alerted, and left for a human. Nothing is swept: the money is already where it stays.
 //!
+//! Since 2026-10-29 the same pass also reads the users' own BSC deposit addresses
+//! (docs/superpowers/specs/2026-10-29-bsc-deposit-addresses-design.md): anything sent to one, from any
+//! wallet or exchange, is credited to the user it belongs to, like a TRON deposit address. No asking
+//! first is needed there, because the address, not the sender, says whose money it is. The treasury
+//! sweeps those addresses to the pay-in address, and those sweeps are not top-ups.
+//!
 //! Detection reads `Transfer(*, pay_in)` logs block range by block range, up to `confirmations` below
 //! the head, so a shallow reorg never reaches the ledger. The cursor advances only after a whole range
 //! was handled; a range read twice is harmless, because the transaction hash is the idempotency key.
@@ -35,11 +41,16 @@ const MAX_RANGE: u64 = 500;
 /// was starting, small enough not to replay old history into unattributed alerts.
 const INITIAL_LOOKBACK: u64 = 200;
 
-/// The three reads the watcher needs, so tests can script a chain.
+/// Deposit addresses per `eth_getLogs`, OR-ed in one topic. Public nodes take a list this long.
+const ADDRESSES_PER_QUERY: usize = 100;
+
+/// The reads the watcher needs, so tests can script a chain.
 #[async_trait]
 pub trait BscChain: Send + Sync {
     async fn head(&self) -> Result<u64, String>;
     async fn transfers_to(&self, contract: &str, to: &str, from_block: u64, to_block: u64) -> Result<Vec<bsc::Transfer>, String>;
+    /// Every Transfer of `contract` to any of `tos` (at most `ADDRESSES_PER_QUERY`).
+    async fn transfers_to_any(&self, contract: &str, tos: &[String], from_block: u64, to_block: u64) -> Result<Vec<bsc::Transfer>, String>;
     /// Seconds.
     async fn block_timestamp(&self, number: u64) -> Result<u64, String>;
 }
@@ -51,6 +62,9 @@ impl BscChain for bsc::Client {
     }
     async fn transfers_to(&self, contract: &str, to: &str, from_block: u64, to_block: u64) -> Result<Vec<bsc::Transfer>, String> {
         bsc::Client::transfers_to(self, contract, to, from_block, to_block).await
+    }
+    async fn transfers_to_any(&self, contract: &str, tos: &[String], from_block: u64, to_block: u64) -> Result<Vec<bsc::Transfer>, String> {
+        bsc::Client::transfers_to_any(self, contract, tos, from_block, to_block).await
     }
     async fn block_timestamp(&self, number: u64) -> Result<u64, String> {
         bsc::Client::block_timestamp(self, number).await
@@ -119,18 +133,29 @@ pub async fn watch_once(pool: &PgPool, chain: &dyn BscChain, settings: &bsc::Set
     }
     let to_block = safe.min(from_block + MAX_RANGE - 1);
 
+    // Read before the range, so an address handed out before a transfer is always in the list that
+    // reads the transfer's block.
+    let owners = deposit_addresses(pool).await?;
+
     let transfers = chain.transfers_to(&settings.usdt_contract, &settings.pay_in_address, from_block, to_block).await?;
     let mut timestamps: HashMap<u64, u64> = HashMap::new();
     for p in by_transaction(&transfers) {
-        let seconds = match timestamps.get(&p.block_number) {
-            Some(s) => *s,
-            None => {
-                let s = chain.block_timestamp(p.block_number).await?;
-                timestamps.insert(p.block_number, s);
-                s
-            }
-        };
+        // The treasury's sweep of a deposit address: money already credited, moving to where it stays.
+        if owners.contains_key(&p.from) {
+            continue;
+        }
+        let seconds = block_seconds(chain, &mut timestamps, p.block_number).await?;
         handle(pool, settings, &p, seconds).await?;
+    }
+
+    let addresses: Vec<String> = owners.keys().cloned().collect();
+    for chunk in addresses.chunks(ADDRESSES_PER_QUERY) {
+        let transfers = chain.transfers_to_any(&settings.usdt_contract, chunk, from_block, to_block).await?;
+        for d in by_deposit(&transfers) {
+            let Some(owner) = owners.get(&d.to) else { continue };
+            let seconds = block_seconds(chain, &mut timestamps, d.block_number).await?;
+            credit_address(pool, settings, owner, &d, seconds).await?;
+        }
     }
 
     sqlx::query(
@@ -142,6 +167,127 @@ pub async fn watch_once(pool: &PgPool, chain: &dyn BscChain, settings: &bsc::Set
     .execute(pool)
     .await
     .map_err(|e| format!("stamping bsc_watch: {e}"))?;
+    Ok(())
+}
+
+async fn block_seconds(chain: &dyn BscChain, cache: &mut HashMap<u64, u64>, number: u64) -> Result<u64, String> {
+    if let Some(s) = cache.get(&number) {
+        return Ok(*s);
+    }
+    let s = chain.block_timestamp(number).await?;
+    cache.insert(number, s);
+    Ok(s)
+}
+
+/// Whose a BSC deposit address is.
+struct Owner {
+    user_pk: String,
+    clt_address: String,
+    derivation_index: i64,
+}
+
+async fn deposit_addresses(pool: &PgPool) -> Result<HashMap<String, Owner>, String> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT bsc_address, user_pk, clt_address, derivation_index FROM deposit_addresses WHERE bsc_address IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("listing BSC deposit addresses: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(address, user_pk, clt_address, derivation_index)| (address, Owner { user_pk, clt_address, derivation_index }))
+        .collect())
+}
+
+/// One transaction's USDT to one deposit address, whoever sent it.
+struct AddressPayment {
+    tx_hash: String,
+    block_number: u64,
+    to: String,
+    /// Base units.
+    value: u128,
+}
+
+fn by_deposit(transfers: &[bsc::Transfer]) -> Vec<AddressPayment> {
+    let mut txs: BTreeMap<(u64, String, String), AddressPayment> = BTreeMap::new();
+    for t in transfers {
+        let d = txs.entry((t.block_number, t.tx_hash.clone(), t.to.clone())).or_insert_with(|| AddressPayment {
+            tx_hash: t.tx_hash.clone(),
+            block_number: t.block_number,
+            to: t.to.clone(),
+            value: 0,
+        });
+        d.value = d.value.saturating_add(t.value);
+    }
+    txs.into_values().collect()
+}
+
+/// A `confirmed` deposit at the user's own BSC address, which the bridge carries to the treasury with
+/// the address and index (so the treasury can check the address with the signer, and sweep it).
+async fn credit_address(pool: &PgPool, settings: &bsc::Settings, owner: &Owner, d: &AddressPayment, block_seconds: u64) -> Result<(), String> {
+    let amount = bsc::to_micro(d.value, settings.usdt_decimals).unwrap_or(0);
+    if amount <= 0 {
+        return Ok(());
+    }
+    let transfer_at = chrono::DateTime::from_timestamp(block_seconds as i64, 0).unwrap_or_else(chrono::Utc::now);
+    let done = sqlx::query(
+        "INSERT INTO deposit_intents
+            (id, user_pk, clt_address, amount_usdt, amount_clt, status, client_key,
+             tron_tx_id, received_usdt, expires_at, deposit_address, derivation_index, transfer_at, network)
+         VALUES ($1, $2, $3, $4, $4, 'confirmed', $5, $5, $4, now(), $6, $7, $8, 'bsc')
+         ON CONFLICT (tron_tx_id) WHERE tron_tx_id IS NOT NULL DO NOTHING",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&owner.user_pk)
+    .bind(&owner.clt_address)
+    .bind(amount)
+    .bind(&d.tx_hash)
+    .bind(&d.to)
+    .bind(owner.derivation_index)
+    .bind(transfer_at)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("crediting BSC deposit {} to {}: {e}", d.tx_hash, d.to))?;
+    if done.rows_affected() == 1 {
+        tracing::info!("bsc deposit {}: {amount} micro-USDT to {} credited", d.tx_hash, d.to);
+        return Ok(());
+    }
+    // Already credited, or the transaction is credited to someone else: one transaction that paid two
+    // users (an exchange's batch). The hash is the one key both services have, so the second is left
+    // for a human.
+    let same: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM deposit_intents WHERE tron_tx_id = $1 AND deposit_address = $2)")
+        .bind(&d.tx_hash)
+        .bind(&d.to)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("reading deposit {}: {e}", d.tx_hash))?;
+    if same {
+        return Ok(());
+    }
+    let key = format!("{}:{}", d.tx_hash, d.to);
+    let inserted = sqlx::query(
+        "INSERT INTO bsc_unattributed (tx_hash, from_address, amount_usdt) VALUES ($1, $2, $3) ON CONFLICT (tx_hash) DO NOTHING",
+    )
+    .bind(&key)
+    .bind("one transaction to two deposit addresses")
+    .bind(amount)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("recording BSC deposit {key}: {e}"))?
+    .rows_affected()
+        == 1;
+    if inserted {
+        alert(
+            pool,
+            "p1",
+            "bsc_topup",
+            &format!(
+                "{amount} micro-USDT arrived at the BSC deposit address {} in {}, a transaction already credited to                  another deposit address. Nothing was minted for this one and it is not swept: credit the user by hand                  (Create and Approve mint intent) and sweep it with their next deposit.",
+                d.to, d.tx_hash
+            ),
+        )
+        .await;
+    }
     Ok(())
 }
 

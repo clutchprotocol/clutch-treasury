@@ -118,6 +118,7 @@ fn test_config(treasury_url: String, redemptions_enabled: bool) -> OrchConfig {
         service_fee_min_usdt: 0,
         direct_topups_enabled: false,
         bsc: None,
+        bsc_deposit_account_xpub: None,
         payout_float_address: String::new(),
         pilot_allowed_addresses: None,
     }

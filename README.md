@@ -74,6 +74,15 @@ decimals are floored to micro-USDT. The pay-in address's balance is part of the 
 only: no sweeps, no BSC payouts, and no BSC key on the host. Off by default: both services read the
 `APP_BSC_*` settings with the shared `bsc` crate (`APP_BSC_TOPUPS_ENABLED=true` and the rest).
 
+**Each user's own BSC address** (`docs/superpowers/specs/2026-10-29-bsc-deposit-addresses-design.md`):
+with `APP_BSC_DEPOSIT_ACCOUNT_XPUB` set in the orchestrator, the deposit answer also carries
+`bsc_address`, derived at the user's TRON index from a SEPARATE mnemonic (`APP_BSC_DEPOSIT_MNEMONIC`,
+signer only, MetaMask's path `m/44'/60'/0'/0/i`). Anything sent to it, from any wallet or exchange, is
+credited to that user. The treasury checks the address with the signer before it mints, then sweeps it
+to the pay-in address (`/internal/bsc/sweep`, an index and nothing else); the gas comes from the gas
+account `m/44'/60'/0'/1/0`, which an operator tops up with a little BNB (`/internal/bsc/xpub` names it).
+The reserve counts the pay-in address plus every unswept BSC deposit address.
+
 ## Redemption
 
 Live on the testnet since 2026-09-04. On mainnet redemptions are switched on since 2026-10-05, but

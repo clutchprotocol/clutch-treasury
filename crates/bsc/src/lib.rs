@@ -62,6 +62,12 @@ pub fn sum_transfers(transfers: &[Transfer], contract: &str, from: &str, to: &st
         .try_fold(0u128, |sum, t| sum.checked_add(t.value))
 }
 
+/// The calldata of an ERC-20 `transfer(to, value)`: its selector `a9059cbb`, then the two words.
+pub fn transfer_calldata(to: &str, value: u128) -> Option<String> {
+    let word = address_word(to)?;
+    Some(format!("0xa9059cbb{}{value:064x}", &word[2..]))
+}
+
 /// An address as a 32-byte log topic or ABI word: 12 zero bytes, then the 20.
 pub fn address_word(address: &str) -> Option<String> {
     let a = normalize_address(address)?;
@@ -184,6 +190,16 @@ mod tests {
             .collect();
         assert_eq!(sum_transfers(&ts, USDT, ALICE, PAY_IN), Some(12));
         assert_eq!(sum_transfers(&ts, "0x0000000000000000000000000000000000000001", ALICE, PAY_IN), Some(0));
+    }
+
+    #[test]
+    fn transfer_calldata_is_the_erc20_call() {
+        // The same bytes ethers' `interface.encodeFunctionData("transfer", [PAY_IN, 25e18])` writes.
+        assert_eq!(
+            transfer_calldata(PAY_IN, 25 * 10u128.pow(18)).unwrap(),
+            "0xa9059cbb00000000000000000000000022222222222222222222222222222222222222220000000000000000000000000000000000000000000000015af1d78b58c40000"
+        );
+        assert_eq!(transfer_calldata("not an address", 1), None);
     }
 
     #[test]

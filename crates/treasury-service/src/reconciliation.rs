@@ -177,10 +177,22 @@ pub async fn unswept_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error
         // already in the ledger, and its USDT is still at the address. Leaving it out would read the
         // reserve short and halt minting over money that is present.
         "SELECT deposit_address FROM mint_intents
-         WHERE deposit_address IS NOT NULL AND swept_at IS NULL
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND network = 'tron'
            AND status IN ('approved', 'submitted', 'credited', 'needs_manual')
          UNION
          SELECT gasfree_address FROM gasfree_accounts",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// The BSC deposit addresses still holding a verified deposit, each once (spec 2026-10-29). Read on
+/// BSC, not TronGrid, and for the same reasons as `unswept_addresses`.
+pub async fn unswept_bsc_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT deposit_address FROM mint_intents
+         WHERE deposit_address IS NOT NULL AND swept_at IS NULL AND network = 'bsc'
+           AND status IN ('approved', 'submitted', 'credited', 'needs_manual')",
     )
     .fetch_all(pool)
     .await
@@ -223,14 +235,18 @@ pub async fn run_once(
         .get_reserve_balance(&config.custody_tron_address, &unswept, &floats, &config.usdt_contract)
         .await
         .map_err(|e| format!("reserve balance unreadable, not recording a run: {e}"))?;
-    // BEP-20 top-ups land at the BSC pay-in address and back CLT like any other deposit. Unreadable
-    // fails the run for the same reason as above.
+    // BEP-20 top-ups land at the BSC pay-in address, or wait at a user's BSC deposit address until
+    // swept there, and back CLT like any other deposit. Unreadable fails the run for the same reason
+    // as above; so does an unlistable address set, because leaving it out reads the reserve short.
     let custody_reported = match &config.bsc {
-        Some(settings) => custody_reported.saturating_add(
-            crate::bsc_verifier::reserve_micro(settings)
-                .await
-                .map_err(|e| format!("BSC reserve balance unreadable, not recording a run: {e}"))?,
-        ),
+        Some(settings) => {
+            let unswept_bsc = unswept_bsc_addresses(pool).await.map_err(|e| format!("listing unswept BSC addresses: {e}"))?;
+            custody_reported.saturating_add(
+                crate::bsc_verifier::reserve_micro(settings, &unswept_bsc)
+                    .await
+                    .map_err(|e| format!("BSC reserve balance unreadable, not recording a run: {e}"))?,
+            )
+        }
         None => custody_reported,
     };
 

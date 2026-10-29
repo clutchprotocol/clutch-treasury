@@ -105,6 +105,7 @@ fn test_config(treasury_url: String, permanent_deposit_addresses_enabled: bool) 
         service_fee_min_usdt: 0,
         direct_topups_enabled: false,
         bsc: None,
+        bsc_deposit_account_xpub: None,
         payout_float_address: String::new(),
         // Everyone, as on stage: the pilot allowlist has its own tests below.
         pilot_allowed_addresses: None,
@@ -1059,4 +1060,35 @@ async fn a_bsc_top_up_answers_the_network_and_registers_the_caller() {
     assert_eq!(deposit["bsc_chain_id"], json!(97));
     let off = body_json(post_deposit_response(router_with(pool, test_config(treasury.uri(), true)), USER_A).await).await;
     assert_eq!(off.get("bsc_chain_id"), None);
+}
+
+/// BNB Chain deposit addresses (spec 2026-10-29): with the BSC xpub set, the deposit answer carries the
+/// user's own BSC address, the same one every time, at their TRON index under the BSC xpub.
+#[tokio::test]
+async fn the_deposit_answer_carries_the_users_own_bsc_address() {
+    let pool = pool().await;
+    let treasury = mock_treasury_with_generous_headroom().await;
+    let mut config = test_config(treasury.uri(), true);
+    config.bsc = Some(bsc_testnet());
+    let off = body_json(post_deposit_response(router_with(pool.clone(), config.clone()), USER_A).await).await;
+    assert!(off.get("bsc_address").is_none(), "no xpub, no address");
+
+    // The xpub of m/44'/60'/0' for the public all-"abandon" mnemonic.
+    config.bsc_deposit_account_xpub = Some(
+        "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt".into(),
+    );
+    let first = body_json(post_deposit_response(router_with(pool.clone(), config.clone()), USER_A).await).await;
+    let index: i64 = sqlx::query_scalar("SELECT derivation_index FROM deposit_addresses WHERE user_pk = $1")
+        .bind(USER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let want = payment_orchestrator::derive::AddressDeriver::from_account_xpub(config.bsc_deposit_account_xpub.as_deref().unwrap())
+        .unwrap()
+        .evm_address_at(index as u32)
+        .unwrap();
+    assert_eq!(first["bsc_address"], json!(want));
+    assert_eq!(first["bsc_usdt_contract"], json!("0x337610d27c682e347c9cd60bd4b3b107c9d34ddd"));
+    let again = body_json(post_deposit_response(router_with(pool.clone(), config), USER_A).await).await;
+    assert_eq!(again["bsc_address"], first["bsc_address"]);
 }
