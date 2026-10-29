@@ -1254,11 +1254,16 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
         let evidence = if intent.network == "bsc" {
             crate::bsc_verifier::evaluate(
                 bsc.as_ref(),
-                intent.id,
-                &intent.beneficiary,
-                intent.direct_from.as_deref(),
-                intent.deposit_tx_id.as_deref(),
-                intent.expected_amount_usdt,
+                &signer,
+                &crate::bsc_verifier::BscIntent {
+                    id: intent.id,
+                    beneficiary: &intent.beneficiary,
+                    direct_from: intent.direct_from.as_deref(),
+                    deposit_address: intent.deposit_address.as_deref(),
+                    derivation_index: intent.derivation_index,
+                    deposit_tx_id: intent.deposit_tx_id.as_deref(),
+                    expected_amount_usdt: intent.expected_amount_usdt,
+                },
             )
             .await
         } else {
@@ -1303,7 +1308,12 @@ pub async fn verify_once(pool: &PgPool, config: &AppConfig) -> Result<u32, Strin
                 }
                 let verdict = match (&intent.direct_from, &config.gasfree) {
                     // A BEP-20 top-up from the user's own wallet: nothing to sweep, no relay fee.
-                    _ if intent.network == "bsc" => crate::bsc_verifier::verdict(config, intent.direct_from.as_deref(), observed_amount_usdt),
+                    _ if intent.network == "bsc" => crate::bsc_verifier::verdict(
+                        config,
+                        intent.direct_from.as_deref(),
+                        intent.deposit_address.as_deref(),
+                        observed_amount_usdt,
+                    ),
                     // A direct top-up: paid to the float by the user, nothing to sweep and no relay fee.
                     (Some(from), _) => direct_verdict(pool, config, from, observed_amount_usdt).await,
                     // The TRX rail: the whole deposit reaches custody, so the intent mints what it says.

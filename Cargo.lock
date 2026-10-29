@@ -3074,11 +3074,13 @@ dependencies = [
 name = "tron-signer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bip32",
  "bip39",
  "bs58",
+ "bsc",
  "dotenv",
  "gasfree",
  "hex",

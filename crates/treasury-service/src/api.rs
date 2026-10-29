@@ -98,7 +98,8 @@ struct CreateMintIntentBody {
     /// `beneficiary`; the verifier checks both again, on chain, before anything mints.
     direct_from: Option<String>,
     /// Where the USDT arrived: `tron` (the default, and every deposit before BSC) or `bsc`. A BSC
-    /// deposit is always a direct top-up from the beneficiary's own wallet (`bsc_verifier.rs`).
+    /// deposit is a direct top-up from the beneficiary's own wallet, or a deposit at their own BSC
+    /// address (`bsc_verifier.rs`).
     network: Option<String>,
 }
 
@@ -141,18 +142,29 @@ async fn create_mint_intent_handler(
         // be approvable — refuse at the door rather than let it age into manual review.
         match (body.network.as_deref().unwrap_or("tron"), body.direct_from.as_deref()) {
             ("bsc", from) => {
-                // A BSC top-up: the sender IS the beneficiary (one key, one 20-byte address on both
-                // chains), and the evidence is one BSC transaction. The verifier checks all of it again
+                // A BSC top-up, in one of two shapes. From the user's own wallet: the sender IS the
+                // beneficiary (one key, one 20-byte address on both chains). Or at the user's own BSC
+                // deposit address: an address and its index, which the verifier checks with the signer.
+                // Either way the evidence is one BSC transaction, and the verifier checks all of it again
                 // on chain, through its own node, before anything mints.
                 let Some(settings) = &state.config.bsc else {
                     return Err(StatusCode::BAD_REQUEST);
                 };
                 let beneficiary = bsc::normalize_address(&body.beneficiary);
+                let shape_ok = match from {
+                    Some(from) => {
+                        bsc::normalize_address(from) == beneficiary && body.deposit_address.is_none() && body.derivation_index.is_none()
+                    }
+                    None => {
+                        let address = body.deposit_address.as_deref().and_then(bsc::normalize_address);
+                        address.is_some()
+                            && address.as_deref() != Some(settings.pay_in_address.as_str())
+                            && body.derivation_index.is_some_and(|i| (0..0x8000_0000).contains(&i))
+                    }
+                };
                 if beneficiary.is_none()
-                    || from.and_then(bsc::normalize_address) != beneficiary
+                    || !shape_ok
                     || beneficiary.as_deref() == Some(settings.pay_in_address.as_str())
-                    || body.deposit_address.is_some()
-                    || body.derivation_index.is_some()
                     || body.deposit_tx_id.as_deref().and_then(bsc::normalize_tx_hash).is_none()
                 {
                     return Err(StatusCode::BAD_REQUEST);
@@ -191,10 +203,14 @@ async fn create_mint_intent_handler(
     };
     // BSC hashes and addresses are stored lowercase, so the unique index on the transaction sees one
     // spelling.
-    let (deposit_tx_id, direct_from) = if network == "bsc" {
-        (body.deposit_tx_id.as_deref().and_then(bsc::normalize_tx_hash), body.direct_from.as_deref().and_then(bsc::normalize_address))
+    let (deposit_tx_id, direct_from, deposit_address) = if network == "bsc" {
+        (
+            body.deposit_tx_id.as_deref().and_then(bsc::normalize_tx_hash),
+            body.direct_from.as_deref().and_then(bsc::normalize_address),
+            body.deposit_address.as_deref().and_then(bsc::normalize_address),
+        )
     } else {
-        (body.deposit_tx_id.clone(), body.direct_from.clone())
+        (body.deposit_tx_id.clone(), body.direct_from.clone(), body.deposit_address.clone())
     };
     let intent = intents::create_mint_intent_on(
         &state.pool,
@@ -204,7 +220,7 @@ async fn create_mint_intent_handler(
         body.client_ref.as_deref(),
         deposit_tx_id.as_deref(),
         body.expected_amount_usdt,
-        body.deposit_address.clone(),
+        deposit_address,
         body.derivation_index,
         direct_from,
         network,

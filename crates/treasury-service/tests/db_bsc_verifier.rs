@@ -221,7 +221,7 @@ async fn a_sender_that_is_not_the_beneficiary_is_rejected_before_any_read() {
     let server = MockServer::start().await;
     node(&server, 97, 200, "0x1", vec![transfer_log(&tx(4), USDT, STRANGER, PAY_IN, 25 * E18)]).await;
     // The CHECK refuses this shape, so it is written past it to prove the verifier holds on its own.
-    sqlx::query("ALTER TABLE mint_intents DROP CONSTRAINT bsc_is_direct").execute(&pool).await.unwrap();
+    sqlx::query("ALTER TABLE mint_intents DROP CONSTRAINT bsc_shape").execute(&pool).await.unwrap();
     let id = seed(&pool, STRANGER, 25_000_000, &tx(4)).await;
 
     treasury_service::tron_verifier::verify_once(&pool, &bsc_config(&server)).await.unwrap();
@@ -229,8 +229,10 @@ async fn a_sender_that_is_not_the_beneficiary_is_rejected_before_any_read() {
     assert_eq!(status_of(&pool, id).await, "rejected");
     sqlx::query("DELETE FROM mint_intents WHERE id = $1").bind(id).execute(&pool).await.unwrap();
     sqlx::query(
-        "ALTER TABLE mint_intents ADD CONSTRAINT bsc_is_direct
-         CHECK (network <> 'bsc' OR (direct_from IS NOT NULL AND lower(direct_from) = lower(beneficiary)))",
+        "ALTER TABLE mint_intents ADD CONSTRAINT bsc_shape
+         CHECK (network <> 'bsc'
+                OR (direct_from IS NOT NULL AND lower(direct_from) = lower(beneficiary) AND deposit_address IS NULL)
+                OR (direct_from IS NULL AND deposit_address IS NOT NULL AND derivation_index IS NOT NULL))",
     )
     .execute(&pool)
     .await
@@ -336,11 +338,151 @@ async fn the_reserve_counts_the_pay_in_balance_floored_and_refuses_another_chain
     rpc(&server, "eth_call", json!(format!("0x{:064x}", 40 * E18 + 123))).await;
     let config = bsc_config(&server);
     let settings = config.bsc.as_ref().unwrap();
-    assert_eq!(treasury_service::bsc_verifier::reserve_micro(settings).await.unwrap(), 40_000_000);
+    assert_eq!(treasury_service::bsc_verifier::reserve_micro(settings, &[]).await.unwrap(), 40_000_000);
 
     let wrong = MockServer::start().await;
     rpc(&wrong, "eth_chainId", json!("0x38")).await;
     rpc(&wrong, "eth_call", json!(format!("0x{:064x}", 40 * E18))).await;
     let config = bsc_config(&wrong);
-    assert!(treasury_service::bsc_verifier::reserve_micro(config.bsc.as_ref().unwrap()).await.is_err());
+    assert!(treasury_service::bsc_verifier::reserve_micro(config.bsc.as_ref().unwrap(), &[]).await.is_err());
+}
+
+// ---- Deposits at the user's own BSC address (spec 2026-10-29).
+
+/// A user's BSC deposit address, at index 3.
+const DEPOSIT: &str = "0x8e9f2f0d4b7cd8aa9ba8b7d5e2f1f9b6f1c0e2a3";
+
+async fn signer_answering(address: &str) -> MockServer {
+    let signer = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/internal/bsc/addresses/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"index": 3, "address": address})))
+        .mount(&signer)
+        .await;
+    signer
+}
+
+async fn seed_at_address(pool: &PgPool, address: &str, amount: i64, tx_hash: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mint_intents
+            (id, beneficiary, amount_clt, credit_ref, created_by, client_ref, deposit_tx_id, expected_amount_usdt,
+             deposit_address, derivation_index, network)
+         VALUES ($1, $2, $3, $4, 'orchestrator', $5, $6, $3, $7, 3, 'bsc')",
+    )
+    .bind(id)
+    .bind(USER)
+    .bind(amount)
+    .bind(format!("ref-{id}"))
+    .bind(format!("client-{id}"))
+    .bind(tx_hash)
+    .bind(address)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_deposit_at_the_users_own_address_mints_what_arrived_from_anyone() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    // An exchange's withdrawal, in two Transfers, plus a Transfer to someone else that must not count.
+    node(
+        &server,
+        97,
+        200,
+        "0x1",
+        vec![
+            transfer_log(&tx(20), USDT, STRANGER, DEPOSIT, 7 * E18),
+            transfer_log(&tx(20), USDT, STRANGER, DEPOSIT, 3 * E18),
+            transfer_log(&tx(20), USDT, STRANGER, PAY_IN, 100 * E18),
+        ],
+    )
+    .await;
+    let signer = signer_answering(DEPOSIT).await;
+    let mut config = bsc_config(&server);
+    config.signer_url = signer.uri();
+    let id = seed_at_address(&pool, DEPOSIT, 10_000_000, &tx(20)).await;
+
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "approved");
+    assert_eq!(amount_of(&pool, id).await, 10_000_000);
+}
+
+#[tokio::test]
+async fn an_address_the_signer_does_not_derive_at_that_index_is_rejected_and_an_unreachable_signer_decides_nothing() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    node(&server, 97, 200, "0x1", vec![transfer_log(&tx(21), USDT, STRANGER, DEPOSIT, 10 * E18)]).await;
+
+    let mut config = bsc_config(&server);
+    config.signer_url = "http://127.0.0.1:9".into();
+    let id = seed_at_address(&pool, DEPOSIT, 10_000_000, &tx(21)).await;
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(status_of(&pool, id).await, "created", "signer unreachable");
+
+    let signer = signer_answering(STRANGER).await;
+    config.signer_url = signer.uri();
+    treasury_service::tron_verifier::verify_once(&pool, &config).await.unwrap();
+    assert_eq!(status_of(&pool, id).await, "rejected");
+}
+
+#[tokio::test]
+async fn the_create_route_takes_a_deposit_at_an_address_with_its_index() {
+    let pool = pool().await;
+    let server = MockServer::start().await;
+    let good = json!({
+        "beneficiary": USER, "amount_clt": 10_000_000, "expected_amount_usdt": 10_000_000, "network": "bsc",
+        "client_ref": "bsc-addr-1", "deposit_tx_id": tx(22), "deposit_address": DEPOSIT.to_ascii_uppercase().replace("0X", "0x"),
+        "derivation_index": 3,
+    });
+    let with = |k: &str, v: Value| {
+        let mut b = good.clone();
+        b[k] = v;
+        b
+    };
+    assert_eq!(post(bsc_config(&server), &pool, with("derivation_index", Value::Null)).await, StatusCode::BAD_REQUEST);
+    assert_eq!(post(bsc_config(&server), &pool, with("deposit_address", json!(PAY_IN))).await, StatusCode::BAD_REQUEST);
+    assert_eq!(post(bsc_config(&server), &pool, with("direct_from", json!(USER))).await, StatusCode::BAD_REQUEST, "one shape at a time");
+    assert_eq!(post(bsc_config(&server), &pool, good).await, StatusCode::CREATED);
+    let address: String = sqlx::query_scalar("SELECT deposit_address FROM mint_intents WHERE client_ref = 'bsc-addr-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(address, DEPOSIT, "stored lowercase");
+}
+
+#[tokio::test]
+async fn the_reserve_adds_each_unswept_deposit_address_once() {
+    let server = MockServer::start().await;
+    rpc(&server, "eth_chainId", json!("0x61")).await;
+    rpc(&server, "eth_call", json!(format!("0x{:064x}", 4 * E18))).await;
+    let config = bsc_config(&server);
+    let unswept = vec![DEPOSIT.to_string(), STRANGER.to_string()];
+    assert_eq!(treasury_service::bsc_verifier::reserve_micro(config.bsc.as_ref().unwrap(), &unswept).await.unwrap(), 12_000_000);
+}
+
+#[tokio::test]
+async fn the_sweeper_sweeps_credited_bsc_addresses_and_records_it() {
+    let pool = pool().await;
+    let id = seed_at_address(&pool, DEPOSIT, 10_000_000, &tx(23)).await;
+    sqlx::query("UPDATE mint_intents SET status = 'credited' WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+    let signer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/internal/bsc/sweep"))
+        .and(body_partial_json(json!({"index": 3})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "swept", "tx_id": tx(24), "amount_usdt": 10_000_000})))
+        .expect(1)
+        .mount(&signer)
+        .await;
+    let mut config = test_config("http://unused".into());
+    config.signer_url = signer.uri();
+    let http = treasury_service::sweeper::HttpSigner { http: reqwest::Client::new(), base_url: signer.uri(), token: "s".into() };
+    let client = treasury_service::tron_verifier::TronClient::new("http://unused".into(), String::new());
+    treasury_service::sweeper::sweep_once(&pool, &config, &client, &http).await;
+    let swept: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT swept_at FROM mint_intents WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert!(swept.is_some());
 }

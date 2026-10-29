@@ -67,6 +67,24 @@ impl AddressDeriver {
             .map_err(|e| format!("deriving index {index} failed: {e}"))?;
         Ok(tron_address_from_uncompressed(&uncompressed_pubkey(&child)))
     }
+
+    /// The BNB Smart Chain address for `index`: the same `0/index` child, written the Ethereum way
+    /// (`0x` + 40 lowercase hex). Used with the xpub of `m/44'/60'/0'` from the signer's separate BSC
+    /// mnemonic (spec 2026-10-29), never with the TRON one.
+    pub fn evm_address_at(&self, index: u32) -> Result<String, String> {
+        if index >= 0x8000_0000 {
+            return Err(format!("index {index} is in the hardened range; cannot derive from an xpub"));
+        }
+        let change = ChildNumber::new(CHANGE_LEVEL, false).map_err(|e| e.to_string())?;
+        let idx = ChildNumber::new(index, false).map_err(|e| e.to_string())?;
+        let child = self
+            .account_xpub
+            .derive_child(change)
+            .and_then(|c| c.derive_child(idx))
+            .map_err(|e| format!("deriving index {index} failed: {e}"))?;
+        let pubkey = uncompressed_pubkey(&child);
+        Ok(format!("0x{}", hex::encode(&Keccak256::digest(&pubkey[1..])[12..])))
+    }
 }
 
 /// SEC1 uncompressed encoding (65 bytes, `0x04`-prefixed) — Tron hashes this form, not the
@@ -150,6 +168,23 @@ mod tests {
             assert_eq!(bytes.len(), 21, "version byte + 20 address bytes");
             assert!(addr.starts_with('T'), "Tron mainnet-format addresses start with T, got {addr}");
         }
+    }
+
+    /// The xpub of `m/44'/60'/0'` for the same public mnemonic, and MetaMask's first three accounts
+    /// for it: what every Ethereum wallet shows, and what the signer's `bsc_keys.rs` derives.
+    const BSC_ACCOUNT_XPUB: &str = "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt";
+
+    #[test]
+    fn bsc_addresses_are_metamasks_accounts() {
+        let d = AddressDeriver::from_account_xpub(BSC_ACCOUNT_XPUB).unwrap();
+        for (index, want) in [
+            (0, "0x9858effd232b4033e47d90003d41ec34ecaeda94"),
+            (1, "0x6fac4d18c912343bf86fa7049364dd4e424ab9c0"),
+            (2, "0xb6716976a3ebe8d39aceb04372f22ff8e6802d7a"),
+        ] {
+            assert_eq!(d.evm_address_at(index).unwrap(), want);
+        }
+        assert!(d.evm_address_at(0x8000_0000).is_err());
     }
 
     /// Hardened indices cannot be derived from public material. Refuse rather than let the crate

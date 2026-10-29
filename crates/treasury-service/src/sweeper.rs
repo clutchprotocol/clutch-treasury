@@ -109,6 +109,11 @@ pub trait SweepSigner: Send + Sync {
     async fn trace(&self, _trace_id: &str) -> Result<Trace, String> {
         Err("this signer cannot read GasFree traces".into())
     }
+
+    /// Sweep the BSC deposit address at `index` to the pay-in address. Only an index, like `sweep`.
+    async fn bsc_sweep(&self, _index: i64) -> BscReply {
+        BscReply::Failed("this signer cannot sweep BSC".into())
+    }
 }
 
 /// One pass: settle GasFree permits in flight, then for every index with unswept deposits decide,
@@ -125,6 +130,9 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
         None => false,
     };
 
+    // BNB Smart Chain deposit addresses first: their sweeps are quick and independent of TRON.
+    bsc_sweep_pass(pool, signer).await;
+
     let rows: Vec<(Uuid, String, i64, f64, bool)> = match sqlx::query_as(
         // `credited` and later only. Sweeping an address whose deposit has not yet been credited
         // would move the evidence out from under the verifier before it has finished with it.
@@ -135,6 +143,7 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
          WHERE deposit_address IS NOT NULL
            AND derivation_index IS NOT NULL
            AND swept_at IS NULL
+           AND network = 'tron'
            AND status IN ('credited', 'submitted')
          ORDER BY created_at",
     )
@@ -331,6 +340,82 @@ pub async fn sweep_once(pool: &PgPool, config: &AppConfig, client: &TronClient, 
     }
 
     missing_count
+}
+
+/// Every credited, unswept BSC deposit address, swept to the pay-in address by the signer
+/// (spec 2026-10-29). Any balance is worth it: a BSC sweep costs a fraction of a cent, paid in BNB
+/// from the gas account, and nothing is charged to the user. Like the TRON sweep, this writes
+/// `swept_at` and nothing else: the reserve counts the pay-in address and the unswept addresses alike.
+async fn bsc_sweep_pass(pool: &PgPool, signer: &dyn SweepSigner) {
+    let rows: Vec<(Uuid, String, i64)> = match sqlx::query_as(
+        "SELECT id, deposit_address, derivation_index FROM mint_intents
+         WHERE network = 'bsc' AND deposit_address IS NOT NULL AND derivation_index IS NOT NULL
+           AND swept_at IS NULL AND status IN ('credited', 'submitted')
+         ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("sweeper: could not list unswept BSC addresses: {e}");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    tracing::info!("sweeper: pass over {} unswept BSC deposit(s)", rows.len());
+    let mut groups: Vec<(i64, String, Vec<Uuid>)> = Vec::new();
+    for (id, address, index) in rows {
+        match groups.iter_mut().find(|g| g.0 == index) {
+            Some(g) => g.2.push(id),
+            None => groups.push((index, address, vec![id])),
+        }
+    }
+    for (index, address, ids) in groups {
+        match signer.bsc_sweep(index).await {
+            BscReply::Swept { tx_id } => match mark_swept(pool, &ids).await {
+                Ok(()) => tracing::info!("swept BSC deposit address {address} (index {index}) in {tx_id}"),
+                Err(e) => {
+                    alert(pool, "p1", "sweeper", &format!("swept BSC address {address} in {tx_id} but failed to record swept_at for {ids:?}: {e}"))
+                        .await
+                }
+            },
+            BscReply::NothingToSweep => {
+                if let Err(e) = mark_swept(pool, &ids).await {
+                    tracing::error!("sweeper: failed to mark empty BSC address {address} swept: {e}");
+                }
+            }
+            BscReply::Waiting(why) => tracing::info!("sweeper: BSC address {address} (index {index}): {why}"),
+            // Nothing else moves until someone sends BNB; the deposits are credited and counted meanwhile.
+            BscReply::GasAccountDry { gas_address, have_wei, need_wei } => {
+                alert_once(
+                    pool,
+                    "warn",
+                    "sweeper",
+                    &format!(
+                        "BSC gas account {gas_address} holds {have_wei} wei of BNB, a sweep needs {need_wei}. Send it a little \
+                         BNB (0.01 covers about a thousand sweeps). Until then BSC deposits are credited and counted but not swept."
+                    ),
+                    chrono::Duration::hours(1),
+                )
+                .await;
+                return;
+            }
+            BscReply::Failed(e) => {
+                tracing::warn!("sweeper: BSC sweep of {address} (index {index}) failed: {e}");
+                alert_once(
+                    pool,
+                    "warn",
+                    "sweeper",
+                    &format!("BSC sweep of {address} (index {index}) keeps failing; the log has the reason. It is retried every pass."),
+                    chrono::Duration::hours(1),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// A sweep that failed. On the TRX rail passes are an hour apart and each failure is alerted. With
@@ -542,6 +627,10 @@ impl SweepSigner for HttpSigner {
     async fn trace(&self, trace_id: &str) -> Result<Trace, String> {
         crate::gasfree_rail::fetch_trace(&self.http, &self.base_url, &self.token, trace_id).await
     }
+
+    async fn bsc_sweep(&self, index: i64) -> BscReply {
+        HttpSigner::bsc_sweep(self, index).await
+    }
 }
 
 /// Both deposit addresses of an index, as the signer derives them.
@@ -583,6 +672,80 @@ impl HttpSigner {
         };
         Ok(IndexAddresses { plain: plain.to_string(), gasfree })
     }
+}
+
+impl HttpSigner {
+    /// `GET /internal/bsc/addresses/:index`: the BSC deposit address of an index. Moves nothing.
+    pub async fn bsc_address(&self, index: i64) -> Result<String, String> {
+        let resp = self
+            .http
+            .get(format!("{}/internal/bsc/addresses/{index}", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("signer unreachable: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err("the signer has no BSC deposit mnemonic (APP_BSC_DEPOSIT_MNEMONIC)".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("signer returned {}", resp.status()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| format!("unreadable signer response: {e}"))?;
+        if body["index"].as_i64() != Some(index) {
+            return Err(format!("asked for index {index}, the signer answered for {}", body["index"]));
+        }
+        body["address"]
+            .as_str()
+            .and_then(bsc::normalize_address)
+            .ok_or_else(|| format!("the signer named no BSC address: {body}"))
+    }
+
+    /// `POST /internal/bsc/sweep {index}`: ONLY the index, like the TRON sweep.
+    pub async fn bsc_sweep(&self, index: i64) -> BscReply {
+        let resp = self
+            .http
+            .post(format!("{}/internal/bsc/sweep", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "index": index }))
+            .send()
+            .await;
+        let body: serde_json::Value = match resp {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(e) => return BscReply::Failed(format!("unreadable signer response: {e}")),
+            },
+            Ok(r) => return BscReply::Failed(format!("signer returned {}", r.status())),
+            Err(e) => return BscReply::Failed(format!("signer unreachable: {e}")),
+        };
+        let tx = || body["tx_id"].as_str().map(str::to_string);
+        match (body["status"].as_str(), tx()) {
+            (Some("swept"), Some(tx_id)) => BscReply::Swept { tx_id },
+            (Some("nothing_to_sweep"), _) => BscReply::NothingToSweep,
+            (Some("funded"), Some(tx_id)) => BscReply::Waiting(format!("sent the address its gas in {tx_id}; sweeping on a later pass")),
+            (Some("not_mined"), Some(tx_id)) => BscReply::Waiting(format!("sweep {tx_id} not mined yet")),
+            (Some("busy"), _) => BscReply::Waiting("a transaction from the address or the gas account is pending".into()),
+            (Some("gas_account_dry"), _) => BscReply::GasAccountDry {
+                gas_address: body["gas_address"].as_str().unwrap_or("unknown").to_string(),
+                have_wei: body["have_wei"].as_str().unwrap_or("?").to_string(),
+                need_wei: body["need_wei"].as_str().unwrap_or("?").to_string(),
+            },
+            (Some("refused"), _) => BscReply::Failed(format!("refused: {}", body["reason"].as_str().unwrap_or("no reason given"))),
+            (Some("reverted"), Some(tx_id)) => BscReply::Failed(format!("{tx_id} reverted")),
+            // Never benign: a newer signer may have moved money in a way this version cannot read.
+            _ => BscReply::Failed(format!("unrecognised signer answer {body}")),
+        }
+    }
+}
+
+/// What the signer reported for one BSC deposit address.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BscReply {
+    Swept { tx_id: String },
+    NothingToSweep,
+    /// Gas sent, a sweep not mined yet, or a pending transaction: a later pass finishes it.
+    Waiting(String),
+    GasAccountDry { gas_address: String, have_wei: String, need_wei: String },
+    Failed(String),
 }
 
 /// Spawned once from `main.rs`.

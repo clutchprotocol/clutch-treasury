@@ -1,6 +1,7 @@
 # BEP-20 USDT on BNB Smart Chain — design
 
-Status: phase 1 (deposits from a wallet, stage only) being built; phases 2 and 3 are proposals
+Status: phase 1 (deposits from a wallet) built; phase 3 (per-user addresses) being built, see
+`2026-10-29-bsc-deposit-addresses-design.md`; phase 2 is a proposal
 Date: 2026-10-23
 Scope: `clutch-treasury` (`treasury-service`, `payment-orchestrator`), `clutch-hub` (the deposit
 panel), `clutch-deploy` (settings, probe). Not touched: `clutch-node`, the CLT genesis, the mint key.
